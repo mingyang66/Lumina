@@ -290,6 +290,13 @@ class Database:
             "SELECT * FROM clipboard WHERE id=?", (clip_id,)
         ).fetchone()
 
+    def get_text(self, clip_id):
+        """文本类记录的轻量读取：不含 image blob，供预览/回贴使用。"""
+        return self.conn.execute(
+            "SELECT id, kind, category, source, pinned, tags, created_at, content "
+            "FROM clipboard WHERE id=?", (clip_id,)
+        ).fetchone()
+
     def stats(self):
         rows = self.conn.execute(
             "SELECT CASE WHEN category IS NULL OR category='' THEN kind "

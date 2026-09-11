@@ -782,6 +782,8 @@ class HistoryPanel:
         self._tile_cache = {}
         self._cardbg_cache = {}
         self._marker_cache = {}
+        self._preview_cache = {}
+        self._fileicon_cache = {}
         self._drag_off = None
         self._shot_anchor = None
         self._sel_id = None
@@ -797,6 +799,7 @@ class HistoryPanel:
         self._hover_poll_id = None
         self._hover_pop = None
         self._hover_miss = 0
+        self._hover_sticky = False
         self._flat_menu = None
 
         self.win = tk.Toplevel(root)
@@ -885,7 +888,8 @@ class HistoryPanel:
         except Exception:
             pass
         for cache in (self._thumb_cache, self._tile_cache,
-                      self._cardbg_cache, self._marker_cache):
+                      self._cardbg_cache, self._marker_cache,
+                      self._preview_cache, self._fileicon_cache):
             cache.clear()
         self.__init__(root, tk, ui)
         self._sel_id = sel
@@ -1822,7 +1826,7 @@ class HistoryPanel:
                                     bg=win_bg, fg=T["label2"], font=self._font(8))
         self._cmp_status.pack(side="right")
         tk.Label(footer, bg=win_bg, fg=T["label3"], font=self._font(8),
-                 text="Enter 回贴 · Ctrl+1-9 快速").pack(side="right", padx=(0, 8))
+                 text="Enter 回贴 · 空格 预览 · Ctrl+1-9 快速").pack(side="right", padx=(0, 8))
 
     # ---------- Apple 风格控件绘制助手 ----------
     def _font_path(self):
@@ -2088,6 +2092,41 @@ class HistoryPanel:
             self.cards_canvas.bind(f"<Key-{i}>",
                                    lambda e, n=i - 1: self._paste_index(n))
         self.win.bind("<MouseWheel>", self._on_panel_wheel)
+        self.win.bind("<space>", self._quick_look)
+        self.cards_canvas.bind("<space>", self._quick_look)
+
+    def _quick_look(self, event=None):
+        """空格键 Quick Look：对当前选中行弹出/收起悬停浮窗（不自动关闭）。
+
+        搜索框已有查询词时空格照常输入（支持多词搜索）；查询为空则触发预览。
+        """
+        if not self.is_visible():
+            return None
+        try:
+            w = self.win.focus_get()
+        except Exception:
+            w = None
+        if isinstance(w, self.tk.Button):
+            return None
+        if w is getattr(self, "search_entry_c", None):
+            try:
+                if self.search_var.get().strip():
+                    return None
+            except Exception:
+                return None
+        if self._hover_pop is not None and self._hover_sticky:
+            self._close_hover()
+            return "break"
+        iid = str(self._sel_id) if self._sel_id is not None else None
+        if iid is None or iid not in self._rows:
+            return "break"
+        self._close_hover()
+        self._ensure_visible(iid)
+        self._hover_iid = iid
+        self._show_hover(iid)
+        if self._hover_pop is not None:
+            self._hover_sticky = True
+        return "break"
 
     def _paste_index(self, n):
         if not self.is_visible():
@@ -2211,6 +2250,7 @@ class HistoryPanel:
             self._hover_poll_id = None
         self._close_hover_popup()
         self._hover_iid = None
+        self._hover_sticky = False
 
     def _start_hover_poll(self):
         if self._hover_poll_id is None:
@@ -2224,6 +2264,7 @@ class HistoryPanel:
         if iid == self._hover_iid:
             return
         self._hover_iid = iid
+        self._hover_sticky = False
         self._cancel_hover_timer()
         if self._hover_pop is not None:
             self._show_hover(iid)
@@ -2235,7 +2276,11 @@ class HistoryPanel:
         self._hover_after = None
         if not self.is_visible() or iid not in self._rows:
             return
-        full = self.db.get(self._rows[iid]["id"])
+        row = self._rows[iid]
+        if row["kind"] == "image":
+            full = self.db.get(row["id"])
+        else:
+            full = self.db.get_text(row["id"])
         if not full:
             return
         self._close_hover_popup()
@@ -2271,7 +2316,7 @@ class HistoryPanel:
         if not self.is_visible():
             self._close_hover()
             return
-        if getattr(pop, "_in_menu", False):
+        if getattr(pop, "_in_menu", False) or self._hover_sticky:
             self._hover_miss = 0
             self._start_hover_poll()
             return
@@ -2484,6 +2529,32 @@ class HoverPopup:
     BORDER_W = 2
     PAD = 8           # 内容内边距
     GAP = 6           # 与面板的间距
+    FILE_MAX_ROWS = 10
+    IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+                ".ico", ".tif", ".tiff")
+    URL_RE = re.compile(r"https?://[^\s<>\"'，。；、）】》」』]+")
+    URL_RSTRIP = ".,;:!?)]}>。，；：！？、》」』"
+    CODE_TOKEN_RE = re.compile(
+        r"(?P<com>#[^\n]*|//[^\n]*|/\*.*?\*/)"
+        r"|(?P<str>\"\"\".*?\"\"\"|'''.*?'''|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*')"
+        r"|(?P<num>\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)"
+        r"|(?P<kw>\b(?:def|class|return|if|elif|else|for|while|import|from|as"
+        r"|try|except|finally|with|lambda|yield|pass|break|continue|and|or|not"
+        r"|in|is|None|True|False|global|nonlocal|raise|assert|del|async|await"
+        r"|function|var|let|const|new|delete|typeof|instanceof|this|null|true"
+        r"|false|switch|case|default|do|throw|catch|of|export|extends|super)\b)",
+        re.S)
+    EXT_COLORS = {
+        "folder": "gray",
+        ".zip": "orange", ".rar": "orange", ".7z": "orange", ".gz": "orange",
+        ".tar": "orange", ".doc": "blue", ".docx": "blue", ".txt": "gray",
+        ".md": "gray", ".xls": "green", ".xlsx": "green", ".csv": "green",
+        ".ppt": "red", ".pptx": "red", ".pdf": "red", ".exe": "purple",
+        ".msi": "purple", ".bat": "purple", ".ps1": "purple", ".py": "blue",
+        ".js": "orange", ".ts": "blue", ".json": "orange", ".html": "orange",
+        ".css": "blue", ".sql": "indigo", ".mp3": "pink", ".wav": "pink",
+        ".mp4": "pink", ".avi": "pink", ".mkv": "pink",
+    }
 
     def __init__(self, panel, row, anchor=None):
         self.panel = panel
@@ -2493,6 +2564,9 @@ class HoverPopup:
         self._photo = None
         self._in_menu = False
         self._flat_menu = None
+        self._urls = []
+        self._url_down = None
+        self._file_photos = []
         T, _dark = panel._theme()
         self.T = T
         self.BG = T["card_bg"]
@@ -2534,51 +2608,20 @@ class HoverPopup:
         self._meta.bind("<B1-Motion>", self._move)
 
         if kind == "image" and row["image"]:
-            from PIL import Image, ImageTk
-            img = Image.open(io.BytesIO(row["image"]))
-            img.thumbnail(self.IMG_MAX)
-            self._photo = ImageTk.PhotoImage(img)
-            self._body = tk.Label(outer, image=self._photo, bg=self.BG,
-                                  cursor="fleur")
-            self._body.pack(padx=6, pady=6)
-            self._body.bind("<ButtonPress-1>", self._press)
-            self._body.bind("<B1-Motion>", self._move)
+            self._build_image_body(outer, row, tk)
+        elif self.cat == "file":
+            self._build_file_body(outer, row, tk)
         else:
-            content = (row["content"] or "")[:self.TEXT_MAX]
-
-            def _wlen(s):
-                # CJK 等宽字符按 2 列估算，避免中文行被折得过窄
-                return sum(2 if ord(ch) > 0x2E80 else 1 for ch in s)
-
-            longest = max((_wlen(s) for s in content.split("\n")), default=10)
-            width = max(28, min(longest + 2, 64))
-            self._body = tk.Text(outer, wrap="word", relief="flat", bd=0,
-                                 bg=self.BG, fg=T["label"], padx=8, pady=6,
-                                 insertbackground=T["label"],
-                                 selectbackground=T["accent_soft"],
-                                 selectforeground=T["label"],
-                                 font=("Microsoft YaHei UI", 10),
-                                 width=width,
-                                 height=2,
-                                 highlightthickness=0, cursor="xterm",
-                                 undo=False, autoseparators=False,
-                                 exportselection=0)
-            self._body.insert("1.0", content)
-            # 只读但可选中：保持 normal 才能鼠标拖选/建立 sel 标签，
-            # 通过拦截按键阻止编辑（复制走右键菜单或 Ctrl+C）。
-            # exportselection=0：选区纯本地——不抢占系统剪贴板，
-            # 也不会因外部剪贴板变动收到"选区丢失"而被清空。
-            self._body.bind("<Key>", self._readonly_key)
-            self._body.pack(padx=6, pady=6)
-            # 高度按换行后的实际显示行数自适应（长单行折行也能撑开）。
-            # Text.count(-displaylines) 需控件真实映射绘制后才准确，
-            # 浮窗构建阶段尚未显示，故用字体度量离线估算。
-            nlines = self._estimate_display_lines(content, width)
-            self._body.configure(height=max(1, min(nlines, 18)))
+            self._build_text_body(outer, row, tk)
 
         self.win.bind("<Escape>", lambda e: self.panel._close_hover())
+        self.win.bind("<Return>", self._paste_key)
+        self.win.bind("<MouseWheel>", self._popup_wheel)
         self._body.bind("<Button-3>", self._menu)
         self._meta.bind("<Button-3>", self._menu)
+        self._meta.bind("<Double-Button-1>", lambda e: self._paste_this())
+        self._meta.bind("<MouseWheel>", self._popup_wheel)
+        outer.bind("<MouseWheel>", self._popup_wheel)
 
         # ---------- 气泡几何：箭头对准对应卡片行的垂直中心 ----------
         self.win.update_idletasks()
@@ -2608,11 +2651,350 @@ class HoverPopup:
         self.canvas = tk.Canvas(self.win, width=bw, height=bh,
                                 bg=panel.TRANS_COLOR, highlightthickness=0, bd=0)
         self.canvas.pack()
+        self.canvas.bind("<MouseWheel>", self._popup_wheel)
         self.canvas.create_image(0, 0, image=self._bg_photo, anchor="nw")
         cx = A + PAD if side == "left" else PAD
         outer.place(x=cx, y=PAD, width=w0, height=h0)
         outer.lift()
         self.win.geometry(f"{bw}x{bh}+{x}+{y}")
+
+    # ---------- 正文构建 ----------
+    def _build_image_body(self, outer, row, tk):
+        from PIL import Image, ImageTk
+        cache = self.panel._preview_cache
+        key = (row["id"], self.IMG_MAX)
+        photo = cache.get(key)
+        if photo is None:
+            img = Image.open(io.BytesIO(row["image"]))
+            img.thumbnail(self.IMG_MAX)
+            photo = ImageTk.PhotoImage(img)
+            if len(cache) > 8:
+                cache.pop(next(iter(cache)))
+            cache[key] = photo
+        self._photo = photo
+        self._body = tk.Label(outer, image=photo, bg=self.BG, cursor="fleur")
+        self._body.pack(padx=6, pady=6)
+        self._body.bind("<ButtonPress-1>", self._press)
+        self._body.bind("<B1-Motion>", self._move)
+        self._body.bind("<Double-Button-1>", lambda e: self._paste_this())
+        self._body.bind("<MouseWheel>", self._popup_wheel)
+
+    def _build_text_body(self, outer, row, tk):
+        T = self.T
+        full_text = row["content"] or ""
+        truncated = len(full_text) > self.TEXT_MAX
+        content = full_text[:self.TEXT_MAX]
+        is_code = self.cat == "code"
+
+        def _wlen(s):
+            # CJK 等宽字符按 2 列估算，避免中文行被折得过窄
+            return sum(2 if ord(ch) > 0x2E80 else 1 for ch in s)
+
+        longest = max((_wlen(s) for s in content.split("\n")), default=10)
+        width = max(28, min(longest + 2, 64))
+        font = ("Consolas", 10) if is_code else ("Microsoft YaHei UI", 10)
+        self._body = tk.Text(outer, wrap="word", relief="flat", bd=0,
+                             bg=self.BG, fg=T["label"], padx=8, pady=6,
+                             insertbackground=T["label"],
+                             selectbackground=T["accent_soft"],
+                             selectforeground=T["label"],
+                             font=font,
+                             width=width,
+                             height=2,
+                             highlightthickness=0, cursor="xterm",
+                             undo=False, autoseparators=False,
+                             exportselection=0)
+        self._body.insert("1.0", content)
+        shown = content
+        if truncated:
+            notice = (f"\n────\n… 已截断，共 {len(full_text)} 字符，"
+                      f"仅显示前 {self.TEXT_MAX}")
+            start = self._body.index("end-1c")
+            self._body.insert("end", notice)
+            self._body.tag_add("dim", start, "end-1c")
+            shown = content + notice
+        self._body.tag_configure("dim", foreground=T["label3"])
+        # 只读但可选中：保持 normal 才能鼠标拖选/建立 sel 标签，
+        # 通过拦截按键阻止编辑（复制走右键菜单或 Ctrl+C）。
+        # exportselection=0：选区纯本地——不抢占系统剪贴板，
+        # 也不会因外部剪贴板变动收到"选区丢失"而被清空。
+        self._body.bind("<Key>", self._readonly_key)
+        self._body.bind("<Return>", self._paste_key)
+        self._body.bind("<MouseWheel>", self._popup_wheel)
+        self._body.pack(padx=6, pady=6)
+        if is_code:
+            self._highlight_code(content)
+        self._linkify(content)
+        # 高度按换行后的实际显示行数自适应（长单行折行也能撑开）。
+        # Text.count(-displaylines) 需控件真实映射绘制后才准确，
+        # 浮窗构建阶段尚未显示，故用字体度量离线估算。
+        nlines = self._estimate_display_lines(shown, width, mono=is_code)
+        self._body.configure(height=max(1, min(nlines, 18)))
+
+    def _build_file_body(self, outer, row, tk):
+        T = self.T
+        paths = [ln.strip() for ln in (row["content"] or "").splitlines()
+                 if ln.strip()]
+        body = tk.Frame(outer, bg=self.BG)
+        self._body = body
+        shown = paths[:self.FILE_MAX_ROWS]
+        for path in shown:
+            self._file_row(body, tk, path, T)
+        if len(paths) > len(shown):
+            tk.Label(body, text=f"+ 其余 {len(paths) - len(shown)} 项",
+                     bg=self.BG, fg=T["label3"],
+                     font=("Microsoft YaHei UI", 9),
+                     anchor="w").pack(fill="x", padx=6, pady=(0, 4))
+        body.pack(padx=6, pady=4, fill="x")
+        body.bind("<MouseWheel>", self._popup_wheel)
+
+    def _file_row(self, parent, tk, path, T):
+        exists = os.path.exists(path)
+        is_dir = os.path.isdir(path)
+        fr = tk.Frame(parent, bg=self.BG,
+                      cursor="hand2" if exists else "arrow")
+        fr.pack(fill="x", padx=2, pady=1)
+        icon = self._file_icon(path, is_dir, exists)
+        il = tk.Label(fr, image=icon, bg=self.BG)
+        il.pack(side="left", padx=(4, 6), pady=2)
+        name = os.path.basename(path.rstrip("\\/")) or path
+        nl = tk.Label(fr,
+                      text=self.panel._fit_text(
+                          name, ("Microsoft YaHei UI", 10),
+                          int(240 * self.panel._dpi)),
+                      bg=self.BG, fg=T["label"] if exists else T["label3"],
+                      font=("Microsoft YaHei UI", 10), anchor="w")
+        nl.pack(side="left", fill="x", expand=True, pady=2)
+        info = ""
+        if not exists:
+            info = "(已失效)"
+        elif not is_dir:
+            try:
+                n = os.path.getsize(path)
+                info = f"{n // 1024} KB" if n >= 1024 else f"{n} B"
+            except OSError:
+                info = ""
+        if info:
+            tk.Label(fr, text=info, bg=self.BG, fg=T["label3"],
+                     font=("Microsoft YaHei UI", 8)).pack(side="right", padx=4)
+        for w in (fr, il, nl):
+            w.bind("<Double-Button-1>", lambda e, p=path: self._open_path(p))
+            w.bind("<Button-3>", lambda e, p=path: self._file_menu(p, e))
+            w.bind("<MouseWheel>", self._popup_wheel)
+
+    def _file_icon(self, path, is_dir, exists):
+        from PIL import ImageTk
+        p = self.panel
+        size = max(16, int(round(20 * p._dpi)))
+        ext = "" if is_dir else os.path.splitext(path)[1].lower()
+        try:
+            mt = os.path.getmtime(path) if exists else 0
+        except OSError:
+            mt = 0
+        cache = p._fileicon_cache
+        key = (path, size, mt)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        img = None
+        if exists and not is_dir and ext in self.IMG_EXTS:
+            try:
+                from PIL import Image
+                img = Image.open(path)
+                img.thumbnail((size, size))
+                img = img.convert("RGBA")
+            except Exception:
+                img = None
+        if img is None:
+            img = self._ext_tile("folder" if is_dir else ext, size, exists)
+        photo = ImageTk.PhotoImage(img)
+        if len(cache) > 64:
+            cache.pop(next(iter(cache)))
+        cache[key] = photo
+        self._file_photos.append(photo)
+        return photo
+
+    def _ext_tile(self, ext, size, exists=True):
+        from PIL import Image, ImageDraw
+        p = self.panel
+        color = ("gray" if not exists or not ext
+                 else self.EXT_COLORS.get(ext, "teal"))
+        rgb = p._hex_to_rgb(p._sys(color))
+        ss = 2
+        s = size * ss
+        im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(im)
+        dr.rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.22),
+                             fill=rgb + (255,))
+        if ext == "folder":
+            p._draw_glyph(dr, "folder", s, (255, 255, 255, 255))
+        else:
+            label = ext.lstrip(".").upper()[:4] or "?"
+            font = p._load_font(int(s * 0.40))
+            bb = dr.textbbox((0, 0), label, font=font)
+            dr.text(((s - (bb[2] - bb[0])) / 2 - bb[0],
+                     (s - (bb[3] - bb[1])) / 2 - bb[1]),
+                    label, font=font, fill=(255, 255, 255, 255))
+        return im.resize((size, size), Image.LANCZOS)
+
+    # ---------- 代码着色 / 链接 ----------
+    def _highlight_code(self, content):
+        body = self._body
+        T = self.T
+        p = self.panel
+        body.tag_configure("kw", foreground=T["accent"],
+                           font=("Consolas", 10, "bold"))
+        body.tag_configure("str", foreground=p._sys("green"))
+        body.tag_configure("num", foreground=p._sys("orange"))
+        body.tag_configure("com", foreground=T["label3"])
+        st = [0, 1, 0]  # pos, line, col
+
+        def _idx(off):
+            seg = content[st[0]:off]
+            nl = seg.count("\n")
+            if nl:
+                st[1] += nl
+                st[2] = len(seg) - seg.rfind("\n") - 1
+            else:
+                st[2] += len(seg)
+            st[0] = off
+            return f"{st[1]}.{st[2]}"
+
+        try:
+            for m in self.CODE_TOKEN_RE.finditer(content):
+                kind = m.lastgroup
+                if not kind:
+                    continue
+                body.tag_add(kind, _idx(m.start()), _idx(m.end()))
+        except Exception:
+            traceback.print_exc()
+
+    def _linkify(self, content):
+        body = self._body
+        T = self.T
+        body.tag_configure("url", foreground=T["accent"], underline=True)
+        st = [0, 1, 0]
+
+        def _idx(off):
+            seg = content[st[0]:off]
+            nl = seg.count("\n")
+            if nl:
+                st[1] += nl
+                st[2] = len(seg) - seg.rfind("\n") - 1
+            else:
+                st[2] += len(seg)
+            st[0] = off
+            return f"{st[1]}.{st[2]}"
+
+        try:
+            for m in self.URL_RE.finditer(content):
+                url = m.group(0).rstrip(self.URL_RSTRIP)
+                if not url:
+                    continue
+                start = _idx(m.start())
+                end = _idx(m.start() + len(url))
+                body.tag_add("url", start, end)
+                self._urls.append(url)
+        except Exception:
+            traceback.print_exc()
+        if self._urls:
+            body.tag_raise("url")
+            body.tag_bind("url", "<ButtonPress-1>", self._url_press)
+            body.tag_bind("url", "<ButtonRelease-1>", self._url_release)
+
+    def _url_press(self, e):
+        self._url_down = (e.x_root, e.y_root)
+
+    def _url_release(self, e):
+        down, self._url_down = self._url_down, None
+        if down and (abs(e.x_root - down[0]) > 4
+                     or abs(e.y_root - down[1]) > 4):
+            return
+        try:
+            idx = self._body.index(f"@{e.x},{e.y}")
+            ranges = self._body.tag_ranges("url")
+            for i in range(0, len(ranges), 2):
+                if (self._body.compare(ranges[i], "<=", idx)
+                        and self._body.compare(idx, "<=", ranges[i + 1])):
+                    self._open_url(self._body.get(ranges[i], ranges[i + 1]))
+                    return "break"
+        except Exception:
+            traceback.print_exc()
+
+    def _open_url(self, url):
+        try:
+            import webbrowser
+            webbrowser.open(url)
+            self.panel.status_var.set(f"已打开 {url[:60]}")
+        except Exception:
+            traceback.print_exc()
+
+    # ---------- 滚轮 / 回贴 ----------
+    def _popup_wheel(self, e):
+        try:
+            body = self._body
+            if body is not None and body.winfo_class() == "Text":
+                body.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _paste_key(self, e):
+        self._paste_this()
+        return "break"
+
+    def _paste_this(self):
+        try:
+            panel = self.panel
+            full = self.row
+            prev = panel._prev_hwnd
+            panel._close_hover()
+            panel.hide()
+            threading.Thread(target=panel._do_paste_back, args=(full, prev),
+                             daemon=True).start()
+        except Exception:
+            traceback.print_exc()
+
+    def _open_path(self, path):
+        if not os.path.exists(path):
+            self.panel.status_var.set("文件不存在")
+            return
+        try:
+            os.startfile(path)
+        except OSError:
+            traceback.print_exc()
+            self.panel.status_var.set("无法打开文件")
+
+    def _reveal_path(self, path):
+        try:
+            import subprocess
+            subprocess.Popen(["explorer", "/select," + path])
+        except OSError:
+            traceback.print_exc()
+
+    def _copy_text(self, text):
+        try:
+            self.ui.actions.copy_to_clipboard(
+                {"id": self.row["id"], "kind": "text", "content": text,
+                 "image": None})
+            self.panel.status_var.set("已复制路径")
+        except Exception:
+            traceback.print_exc()
+
+    def _file_menu(self, path, e):
+        items = []
+        if os.path.exists(path):
+            items += [("打开", lambda: self._open_path(path)),
+                      ("在资源管理器中显示", lambda: self._reveal_path(path))]
+        items += [("复制路径", lambda: self._copy_text(path)),
+                  ("复制全部路径", self._copy),
+                  ("回贴  (Enter)", self._paste_this), None,
+                  ("导出…", self._save_as)]
+        self._in_menu = True
+        self._flat_menu = FlatMenu(self.panel.tk, self.win, items,
+                                   theme=self.panel._theme()[0])
+        self._flat_menu.popup(e.x_root, e.y_root, on_close=self._menu_closed)
+        return "break"
 
     def _bubble_bg(self, wb, hb, side, ay):
         """圆角气泡 + 侧边小箭头一体绘制：外层描边色，内层卡片填充色。
@@ -2652,9 +3034,10 @@ class HoverPopup:
 
     # ---------- 交互 ----------
     _measure_font = None
+    _measure_font_mono = None
 
     @classmethod
-    def _estimate_display_lines(cls, text, width_chars):
+    def _estimate_display_lines(cls, text, width_chars, mono=False):
         """按字体度量估算 word-wrap 后的显示行数（近似 Tk wrap=word）。
 
         规则：按空白切词贪心填行；超宽 token（如连续中文）按字符折行；
@@ -2662,10 +3045,16 @@ class HoverPopup:
         """
         try:
             from tkinter import font as tkfont
-            if cls._measure_font is None:
-                cls._measure_font = tkfont.Font(family="Microsoft YaHei UI",
-                                                size=10)
-            fnt = cls._measure_font
+            if mono:
+                if cls._measure_font_mono is None:
+                    cls._measure_font_mono = tkfont.Font(family="Consolas",
+                                                         size=10)
+                fnt = cls._measure_font_mono
+            else:
+                if cls._measure_font is None:
+                    cls._measure_font = tkfont.Font(family="Microsoft YaHei UI",
+                                                    size=10)
+                fnt = cls._measure_font
             budget = max(40, width_chars * fnt.measure("0"))
             total = 0
             for para in text.split("\n"):
@@ -2722,15 +3111,23 @@ class HoverPopup:
 
     def _menu(self, e):
         if self.cat == "image":
-            items = [("复制图片", self._copy), ("钉图", self._pin_it),
+            items = [("复制图片", self._copy),
+                     ("回贴  (Enter)", self._paste_this),
+                     ("钉图", self._pin_it),
                      ("另存为…", self._save_as)]
         elif self.cat == "file":
             items = [("打开", self._open_file),
                      ("在资源管理器中显示", self._reveal_file),
-                     ("复制路径", self._copy), None, ("导出…", self._save_as)]
+                     ("复制路径", self._copy),
+                     ("回贴  (Enter)", self._paste_this), None,
+                     ("导出…", self._save_as)]
         else:
-            items = [("复制选中", self._copy_sel), ("复制全部", self._copy),
-                     None, ("导出…", self._save_as)]
+            items = []
+            if self._urls:
+                items.append(("打开链接", lambda: self._open_url(self._urls[0])))
+            items += [("复制选中", self._copy_sel), ("复制全部", self._copy),
+                      ("回贴  (Enter)", self._paste_this), None,
+                      ("导出…", self._save_as)]
         self._in_menu = True
         self._flat_menu = FlatMenu(self.panel.tk, self.win, items,
                                    theme=self.panel._theme()[0])
