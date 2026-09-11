@@ -16,7 +16,6 @@ DEFAULTS = {
     "popup_enabled": True,
     "popup_seconds": 3,
     "panel_enabled": True,
-    "panel_compact": True,
     "hide_panel_on_capture": True,
     "download_dir": "",
 }

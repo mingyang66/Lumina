@@ -165,14 +165,6 @@ class MyClipApp:
             except OSError:
                 traceback.print_exc()
 
-    def set_panel_compact(self, value):
-        self.config["panel_compact"] = bool(value)
-        if self.config_path:
-            try:
-                save_config(self.config, self.config_path)
-            except OSError:
-                traceback.print_exc()
-
     def copy_to_clipboard(self, row):
         """面板回贴/复制：写入剪贴板并抑制自身监听（内容已在库中）。
 

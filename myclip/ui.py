@@ -14,7 +14,6 @@ import traceback
 from datetime import datetime, timedelta
 
 from . import win32clip
-from .imaging import image_to_dib
 
 
 class UiServer:
@@ -135,12 +134,11 @@ class UiServer:
     def _run(self):
         try:
             import tkinter as tk
-            from tkinter import ttk
         except ImportError:
             print("[myclip] UI disabled: tkinter unavailable", flush=True)
             self.toast_enabled = self.panel_enabled = False
             return
-        self._tk, self._ttk = tk, ttk
+        self._tk = tk
         try:
             root = tk.Tk()
         except Exception as e:
@@ -286,7 +284,7 @@ class UiServer:
         if not self.panel_enabled:
             return
         try:
-            self._panel = HistoryPanel(self._root, self._tk, self._ttk, self)
+            self._panel = HistoryPanel(self._root, self._tk, self)
         except Exception:
             traceback.print_exc()
             self._panel = None
@@ -722,28 +720,6 @@ class RegionSelector:
 
 
 class HistoryPanel:
-    CARD_HEIGHT = 72
-    CARD_GAP = 6
-    CARD_RADIUS = 10
-    CARD_PADDING = 10
-    DARK_BG = "#1c1c1e"
-    DARK_CARD = "#ffffff"
-    DARK_SHADOW = "#000000"
-    LIGHT_BG = "#f0f0f0"
-    LIGHT_CARD = "#ffffff"
-    LIGHT_SHADOW = "#c9cdd6"
-    DARK_TEXT = "#202124"
-    LIGHT_TEXT = "#202124"
-    DARK_META = "#86868b"
-    LIGHT_META = "#86868b"
-    DARK_SECTION = "#3a3a3c"
-    LIGHT_SECTION = "#e5e5ea"
-    COLS = ("id", "pin", "kind", "size", "tags", "source", "created_at", "preview")
-    HEADINGS = {"id": "ID", "pin": "钉", "kind": "类型", "size": "大小",
-                "tags": "标签", "source": "来源", "created_at": "时间",
-                "preview": "预览"}
-    WIDTHS = {"id": 48, "pin": 30, "kind": 48, "size": 70, "tags": 90,
-              "source": 130, "created_at": 140, "preview": 320}
     COMPACT_W = 460
     COMPACT_H = 640
     TRANS_COLOR = "#010203"
@@ -752,13 +728,6 @@ class HistoryPanel:
                ("pinned", "钉住"))
     CATEGORY_LABELS = {"text": "文本", "code": "代码", "link": "链接",
                         "image": "图片", "file": "文件"}
-    SECTION_COLORS = {
-        "今天": ("#1a73e8", "#e8f0fe"),
-        "昨天": ("#188038", "#e6f4ea"),
-        "本周": ("#b06000", "#fef7e0"),
-        "更早": ("#5f6368", "#eceef1"),
-    }
-    SECTION_FONT = ("Microsoft YaHei UI", 10, "bold")
 
     # ---------- Apple 设计令牌 ----------
     # 系统色板：(浅色, 深色)，取自 iOS/macOS system colors
@@ -800,21 +769,17 @@ class HistoryPanel:
     }
     FONT_FAMILY = "Microsoft YaHei UI"
 
-    def __init__(self, root, tk, ttk, ui):
+    def __init__(self, root, tk, ui):
         self.ui = ui
         self.db = ui.db
-        self.tk, self.ttk = tk, ttk
+        self.tk = tk
         self._root = root
         self._dark = self._is_dark_mode()
-        self._photo = None
         self._prev_hwnd = None
         self._rows = {}
-        self._compact = bool(ui.config.get("panel_compact", True))
         self._filter = "all"
         self._thumb_cache = {}
-        self._badge_cache = {}
         self._tile_cache = {}
-        self._glyph_photo_cache = {}
         self._cardbg_cache = {}
         self._marker_cache = {}
         self._drag_off = None
@@ -842,98 +807,14 @@ class HistoryPanel:
         self.win.withdraw()
 
     def _build_widgets(self):
-        tk, ttk = self.tk, self.ttk
-        T, _dark = self._theme()
-        self._exp_root = ttk.Frame(self.win)
-        top = ttk.Frame(self._exp_root, padding=6)
-        top.pack(fill="x")
-        ttk.Label(top, text="搜索:").pack(side="left")
+        tk = self.tk
         self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(top, textvariable=self.search_var, width=34)
-        self.search_entry.pack(side="left", padx=6)
-        self.search_entry.bind("<Return>", self._on_enter)
-        self.search_entry.bind("<KeyRelease>", lambda e: self._debounce_refresh())
-        windir = os.environ.get("WINDIR", r"C:\Windows")
-        self._apply_ttk_style()
+        self.status_var = tk.StringVar(value="就绪")
         self._hide_on_capture = tk.BooleanVar(
             value=bool(self.ui.config.get("hide_panel_on_capture", True)))
         self._shot_popup = None
         self._shot_open = False
         self._shot_focus_check = None
-        # ✂ 用 PIL 从 Segoe UI Symbol 绘制成图片：避免 Tk9 把 U+2702 回退成
-        # 超大彩色 emoji 字形（实测按钮被撑到 171px 宽）。
-        # 尺寸随 DPI 缩放（winfo_fpixels 在系统缩放 150% 时返回 144），
-        # 图标画布 20 逻辑像素，与工具栏其他控件同高。
-        self._shot_icon = None
-        self._shot_icon_img = None
-        try:
-            dpi = self.win.winfo_fpixels("1i") / 96.0
-        except Exception:
-            dpi = 1.0
-        dpi = max(0.8, min(dpi, 3.0))
-        icon_box = max(16, int(round(20 * dpi)))
-        glyph_px = max(12, int(round(15 * dpi)))
-        try:
-            from PIL import Image, ImageDraw, ImageFont, ImageTk
-            sym = os.path.join(windir, "Fonts", "seguisym.ttf")
-            if os.path.exists(sym):
-                scale = 2  # 超采样后缩小，边缘更平滑
-                fnt = ImageFont.truetype(sym, glyph_px * scale)
-                big = Image.new("RGBA", (icon_box * scale, icon_box * scale),
-                                (0, 0, 0, 0))
-                dr = ImageDraw.Draw(big)
-                bb = dr.textbbox((0, 0), "\u2702", font=fnt)
-                dr.text(((icon_box * scale - bb[2] + bb[0]) / 2 - bb[0],
-                         (icon_box * scale - bb[3] + bb[1]) / 2 - bb[1]),
-                        "\u2702", font=fnt, fill=(55, 55, 85, 255))
-                self._shot_icon_img = big.resize((icon_box, icon_box), Image.LANCZOS)
-                self._shot_icon = ImageTk.PhotoImage(self._shot_icon_img)
-        except Exception:
-            traceback.print_exc()
-            self._shot_icon = None
-        if self._shot_icon is not None:
-            self._shot_btn = ttk.Button(top, image=self._shot_icon,
-                                        style="Shot.TButton",
-                                        command=lambda: self._toggle_shot_menu(
-                                            self._shot_btn))
-            self._shot_btn.image = self._shot_icon
-        else:
-            self._shot_btn = ttk.Button(top, text="\u2702", style="Shot.TButton",
-                                        command=lambda: self._toggle_shot_menu(
-                                            self._shot_btn))
-        self._shot_btn.pack(side="left", padx=3)
-        ttk.Button(top, text="刷新(F5)", command=self.refresh).pack(side="left", padx=3)
-        ttk.Button(top, text="紧凑视图",
-                   command=lambda: self.set_compact(True)).pack(side="left", padx=3)
-
-        body = ttk.Frame(self._exp_root)
-        body.pack(fill="both", expand=True, padx=6, pady=4)
-
-        # 卡片画布（替代 Treeview）
-        card_frame = ttk.Frame(body)
-        card_frame.pack(fill="both", expand=True, padx=2, pady=2)
-        self.canvas = tk.Canvas(card_frame, bg=self._canvas_bg(),
-                                 highlightthickness=0, bd=0)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self._card_scrollbar = ttk.Scrollbar(card_frame, orient="vertical",
-                                                command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self._card_scrollbar.set)
-        self._card_scrollbar.pack(side="right", fill="y")
-        self._card_container = None  # 将由 _refresh_cards 设置
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.canvas.bind("<Button-1>", self._on_canvas_click)
-        self.canvas.bind("<Motion>", self._on_canvas_motion)
-        self.canvas.bind("<Button-3>", self._on_canvas_rightclick)
-        self.canvas.bind("<MouseWheel>", self._on_canvas_wheel)
-        self.canvas.configure(cursor="hand2")
-
-        # 右侧预览面板
-        prev_frame = ttk.LabelFrame(body, text="预览", padding=6)
-        prev_frame.pack(side="right", fill="y", padx=(6, 0))
-        self.preview_label = ttk.Label(prev_frame, text="", anchor="nw",
-                                       justify="left")
-        self.preview_label.pack(side="left", fill="both", expand=True)
-        self.preview_frame = prev_frame
 
         self.win.bind("<F5>", lambda e: self.refresh())
         self.win.bind("<Escape>", lambda e: self.hide())
@@ -945,20 +826,6 @@ class HistoryPanel:
         self.win.bind("<Down>", lambda e: (self._move_selection(1), "break")[1])
         self.win.bind("<Home>", lambda e: (self._move_selection(-len(self._rows_displayed)), "break")[1])
         self.win.bind("<End>", lambda e: (self._move_selection(len(self._rows_displayed)), "break")[1])
-
-        bottom = ttk.Frame(self._exp_root, padding=(6, 0, 6, 6))
-        bottom.pack(fill="x")
-        ttk.Button(bottom, text="粘贴到原窗口(Enter)",
-                   command=self.paste_back).pack(side="left", padx=3)
-        ttk.Button(bottom, text="仅复制(Ctrl+C)",
-                   command=self.copy_only).pack(side="left", padx=3)
-        ttk.Button(bottom, text="钉住/取消(Ctrl+P)",
-                   command=self.toggle_pin).pack(side="left", padx=3)
-        ttk.Button(bottom, text="删除(Del)",
-                   command=self.delete_selected).pack(side="left", padx=3)
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(bottom, textvariable=self.status_var,
-                  foreground=T["label2"]).pack(side="right")
 
         self._debounce_id = None
         self._build_compact()
@@ -1001,53 +868,15 @@ class HistoryPanel:
         h = h.lstrip("#")
         return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
-    def _bg_color(self):
-        return self._c("window_bg")
-
     def _canvas_bg(self):
         return self._c("window_bg")
-
-    def _apply_ttk_style(self):
-        """展开视图的原生 ttk 控件按主题着色（vista 主题不可配色，切 clam）。"""
-        T, _dark = self._theme()
-        try:
-            style = self.ttk.Style(self.win)
-            style.theme_use("clam")
-            style.configure(".", background=T["window_bg"], foreground=T["label"],
-                            bordercolor=T["hairline"], focuscolor=T["accent"],
-                            insertcolor=T["label"], lightcolor=T["hairline"],
-                            darkcolor=T["hairline"], troughcolor=T["window_bg"],
-                            fieldbackground=T["field"], relief="flat")
-            style.configure("TFrame", background=T["window_bg"])
-            style.configure("TLabel", background=T["window_bg"],
-                            foreground=T["label"])
-            style.configure("TButton", background=T["fill"], foreground=T["label"],
-                            bordercolor=T["hairline"], padding=(8, 3))
-            style.map("TButton",
-                      background=[("active", T["fill_hover"]),
-                                  ("pressed", T["fill_hover"])],
-                      foreground=[("active", T["label"])])
-            style.configure("TEntry", fieldbackground=T["field"],
-                            foreground=T["label"], bordercolor=T["hairline"],
-                            insertcolor=T["label"], padding=(6, 3))
-            style.configure("TLabelframe", background=T["window_bg"],
-                            bordercolor=T["hairline"])
-            style.configure("TLabelframe.Label", background=T["window_bg"],
-                            foreground=T["label2"])
-            style.configure("Vertical.TScrollbar", background=T["fill"],
-                            troughcolor=T["window_bg"],
-                            bordercolor=T["window_bg"], arrowcolor=T["label2"],
-                            gripcolor=T["label3"])
-            style.configure("Shot.TButton", padding=(3, 1))
-        except Exception:
-            traceback.print_exc()
 
     def _sync_theme(self):
         """系统明暗切换后整窗重建：颜色/图标/位图缓存都与主题绑定，
         逐个控件改色易漏，直接销毁重建最稳妥。"""
         if self._dark == self._is_dark_mode():
             return False
-        root, tk, ttk, ui = self._root, self.tk, self.ttk, self.ui
+        root, tk, ui = self._root, self.tk, self.ui
         sel = self._sel_id
         self._close_shot_menu()
         self._close_hover()
@@ -1055,11 +884,10 @@ class HistoryPanel:
             self.win.destroy()
         except Exception:
             pass
-        for cache in (self._thumb_cache, self._badge_cache, self._tile_cache,
-                      self._glyph_photo_cache, self._cardbg_cache,
-                      self._marker_cache, self._CARD_CACHE):
+        for cache in (self._thumb_cache, self._tile_cache,
+                      self._cardbg_cache, self._marker_cache):
             cache.clear()
-        self.__init__(root, tk, ttk, ui)
+        self.__init__(root, tk, ui)
         self._sel_id = sel
         return True
 
@@ -1199,10 +1027,6 @@ class HistoryPanel:
         except Exception:
             pass
 
-    def _refresh_hover_highlight(self):
-        """悬停高亮改由三态卡片背景交换实现（见 _apply_row_bg），保留空实现兼容。"""
-        return
-
     def _paste_row(self, row):
         try:
             full = self._load_full(row) or row
@@ -1285,11 +1109,11 @@ class HistoryPanel:
     def show(self, prev_hwnd=None):
         self._sync_theme()
         self._prev_hwnd = prev_hwnd
-        self.apply_mode()  # 按模式重设边框/尺寸/位置（紧凑=光标附近）并刷新
+        self.apply_mode()  # 重设边框/尺寸/位置（光标附近）并刷新
         self.win.deiconify()
         self.win.lift()
         self.win.focus_force()
-        (self.search_entry_c if self._compact else self.search_entry).focus_set()
+        self.search_entry_c.focus_set()
         self.ui.panel_visible = True
 
     def hide(self):
@@ -1450,7 +1274,7 @@ class HistoryPanel:
     def refresh(self):
         self._close_hover()
         q = self.search_var.get().strip()
-        limit = 60 if self._compact else 300
+        limit = 60
         rows = self.db.search(q, limit) if q else self.db.list_recent(limit)
         rows = self._apply_filter(rows)
         self._rows = {str(r["id"]): r for r in rows}
@@ -1473,11 +1297,8 @@ class HistoryPanel:
         return cat or ("image" if r["kind"] == "image" else "text")
 
     def _active_canvas(self):
-        if (self._compact and hasattr(self, "cards_canvas")
-                and self.cards_canvas.winfo_exists()):
+        if hasattr(self, "cards_canvas") and self.cards_canvas.winfo_exists():
             return self.cards_canvas
-        if hasattr(self, "canvas") and self.canvas.winfo_exists():
-            return self.canvas
         return None
 
     def _refresh_cards(self, rows):
@@ -1489,21 +1310,9 @@ class HistoryPanel:
         self._row_bg_items = {}
         self._row_rects = []
         self._card_photos = []
-        if self._compact:
-            self._render_compact(canvas, rows, now)
-        else:
-            self._render_expanded(canvas, rows, now)
-
-    def _render_compact(self, canvas, rows, now):
         d = self._dpi
         self._render_list(canvas, rows, now, row_h=int(round(58 * d)),
                           tile_size=int(round(38 * d)), margin=int(round(12 * d)),
-                          title_size=11, meta_size=9)
-
-    def _render_expanded(self, canvas, rows, now):
-        d = self._dpi
-        self._render_list(canvas, rows, now, row_h=int(round(52 * d)),
-                          tile_size=int(round(34 * d)), margin=int(round(14 * d)),
                           title_size=11, meta_size=9)
 
     def _render_list(self, canvas, rows, now, row_h, tile_size, margin,
@@ -1512,7 +1321,7 @@ class HistoryPanel:
         T, dark = self._theme()
         cw = canvas.winfo_width()
         if cw <= 1:
-            cw = max(200, (self._cw if self._compact else 880) - 20)
+            cw = max(200, self._cw - 20)
         card_w = max(80, cw - 2 * margin)
         gap = int(round(8 * self._dpi))
         self._card_w, self._row_h = card_w, row_h
@@ -1819,56 +1628,10 @@ class HistoryPanel:
             n = 0
         return f"{n // 1024} KB" if n >= 1024 else f"{n} B"
 
-    def _get_icon_photo(self, cat):
-        """返回类别图标 PhotoImage（图片类返回 None，由卡片另行绘制缩略图）。"""
-        if cat == "image":
-            return None
-        key = f"cat:{cat}"
-        hit = self._thumb_cache.get(key)
-        if hit is not None:
-            return hit
-        from PIL import ImageTk
-        base = {"code": self._code_icon_pil,
-                "link": self._link_icon_pil,
-                "file": self._file_icon_pil}.get(cat, self._text_icon_pil)
-        photo = ImageTk.PhotoImage(base)
-        self._thumb_cache[key] = photo
-        return photo
-
-    def _active_list(self):
-        if self._compact and hasattr(self, 'cards_canvas'):
-            return self.cards_canvas
-        return self.canvas if hasattr(self, 'canvas') else None
-
     def _selected_row(self):
         if self._sel_id is None:
             return None
         return self._rows.get(str(self._sel_id))
-
-    def _on_select(self):
-        row = self._selected_row()
-        self._photo = None
-        if not row:
-            self.preview_label.configure(image="", text="")
-            return
-        if not row:
-            self.preview_label.configure(image="", text="")
-            return
-        full = self.db.get(row["id"])
-        if not full:
-            return
-        if full["kind"] == "image" and full["image"]:
-            try:
-                from PIL import Image, ImageTk
-                img = Image.open(io.BytesIO(full["image"]))
-                img.thumbnail((360, 200))
-                self._photo = ImageTk.PhotoImage(img)
-                self.preview_label.configure(image=self._photo, text="")
-                return
-            except Exception:
-                pass
-        text = full["content"] or ""
-        self.preview_label.configure(image="", text=text[:2000])
 
     # ---------- 动作 ----------
     def _load_full(self, row):
@@ -1932,7 +1695,7 @@ class HistoryPanel:
         self.refresh()
         self.status_var.set(f"#{row['id']} 已删除")
 
-    # ---------- 紧凑模式（Ditto 风格卡片拾取器） ----------
+    # ---------- 面板 UI 构建（Ditto 风格卡片拾取器） ----------
     def _build_compact(self):
         tk = self.tk
         try:
@@ -1964,10 +1727,6 @@ class HistoryPanel:
         close_b = self._icon_button(header, self._hdr_icons["close"], self.hide,
                                     win_bg, T["fill_hover"])
         close_b.pack(side="right")
-        exp_b = self._icon_button(header, self._hdr_icons["expand"],
-                                  lambda: self.set_compact(False), win_bg,
-                                  T["fill_hover"])
-        exp_b.pack(side="right", padx=(0, 2))
         self._shot_btn_c = self._icon_button(
             header, self._hdr_icons["shot"],
             lambda: self._toggle_shot_menu(self._shot_btn_c), win_bg, T["fill_hover"])
@@ -2022,8 +1781,6 @@ class HistoryPanel:
         self.cards_canvas.bind("<Motion>", self._on_canvas_motion)
         self.cards_canvas.bind("<MouseWheel>", self._on_canvas_wheel)
         self.cards_canvas.bind("<Configure>", self._on_canvas_configure)
-        self._make_kind_icons()
-        self._make_text_icon()
 
         # ---------- 底部：动作图标 + 提示 + 状态 ----------
         footer = tk.Frame(self._cmp_root, bg=win_bg)
@@ -2085,13 +1842,6 @@ class HistoryPanel:
             dr.line([(m, m), (s - m, s - m)], fill=c, width=w)
             dr.line([(s - m, m), (m, s - m)], fill=c, width=w)
 
-        def expand(dr, s, c, w):
-            dr.line([(s * 0.34, s * 0.66), (s * 0.66, s * 0.34)], fill=c, width=w)
-            dr.line([(s * 0.52, s * 0.34), (s * 0.66, s * 0.34), (s * 0.66, s * 0.48)],
-                    fill=c, width=w, joint="curve")
-            dr.line([(s * 0.48, s * 0.66), (s * 0.34, s * 0.66), (s * 0.34, s * 0.52)],
-                    fill=c, width=w, joint="curve")
-
         def shot(dr, s, c, w):
             dr.rounded_rectangle([s * 0.22, s * 0.37, s * 0.78, s * 0.73],
                                  radius=s * 0.07, outline=c, width=w)
@@ -2100,7 +1850,6 @@ class HistoryPanel:
             dr.ellipse([s * 0.43, s * 0.46, s * 0.57, s * 0.60], outline=c, width=w)
 
         return {"close": self._mono_icon(close, box, color_hex),
-                "expand": self._mono_icon(expand, box, color_hex),
                 "shot": self._mono_icon(shot, box, color_hex)}
 
     def _make_search_icon(self, dpi, color_hex):
@@ -2222,66 +1971,6 @@ class HistoryPanel:
                                              fill=win_bg, outline=hair, width=1)
         return ImageTk.PhotoImage(im)
 
-    def _make_text_icon(self):
-        from PIL import Image, ImageDraw, ImageTk
-        size = max(28, int(round(40 * self._dpi)))
-        ss = 2
-        s = size * ss
-        im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        dr = ImageDraw.Draw(im)
-        c1 = (120, 126, 138, 255)
-        c2 = (158, 164, 174, 255)
-        w = max(2, s // 24)
-        dr.rounded_rectangle([s * 0.26, s * 0.16, s * 0.74, s * 0.84],
-                             radius=s * 0.08, outline=c1, width=w)
-        for yy in (0.36, 0.50, 0.64):
-            dr.line([(s * 0.36, s * yy), (s * 0.64, s * yy)], fill=c2, width=w)
-        self._text_icon_pil = im.resize((size, size), Image.LANCZOS)
-        return ImageTk.PhotoImage(self._text_icon_pil)
-
-    def _pin_badge(self, size):
-        """行图标右下角的钉徽章：白底圆 + 灰色 📌 字形（缺字体回退简笔钉）。"""
-        hit = self._badge_cache.get(size)
-        if hit is not None:
-            return hit
-        from PIL import Image, ImageDraw, ImageFont
-        ss = 2
-        s = size * ss
-        im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        dr = ImageDraw.Draw(im)
-        gray = (95, 99, 104, 255)
-        dr.ellipse([ss, ss, s - ss - 1, s - ss - 1],
-                   fill=(255, 255, 255, 240), outline=gray, width=max(1, ss))
-        sym = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
-                           "Fonts", "seguisym.ttf")
-        drawn = False
-        if os.path.exists(sym):
-            try:
-                fnt = ImageFont.truetype(sym, int(s * 0.56))
-                bb = dr.textbbox((0, 0), "\U0001F4CC", font=fnt)
-                if bb[2] - bb[0] > 4:
-                    dr.text(((s - bb[2] + bb[0]) / 2 - bb[0],
-                             (s - bb[3] + bb[1]) / 2 - bb[1]),
-                            "\U0001F4CC", font=fnt, fill=gray)
-                    drawn = True
-            except Exception:
-                drawn = False
-        if not drawn:
-            cx, cy, r = s / 2, s * 0.42, s * 0.15
-            dr.ellipse([cx - r, cy - r, cx + r, cy + r], fill=gray)
-            dr.line([(cx, cy + r), (cx + r * 1.1, cy + r * 2.4)], fill=gray,
-                    width=max(2, s // 12))
-        out = im.resize((size, size), Image.LANCZOS)
-        self._badge_cache[size] = out
-        return out
-
-    def _with_pin_badge(self, img):
-        im = img.copy().convert("RGBA")
-        bsize = max(12, int(round(im.width * 0.44)))
-        badge = self._pin_badge(bsize)
-        im.paste(badge, (im.width - bsize, im.height - bsize), badge)
-        return im
-
     def _make_footer_icons(self):
         from PIL import Image, ImageDraw, ImageTk
         size = max(20, int(round(26 * self._dpi)))
@@ -2369,8 +2058,8 @@ class HistoryPanel:
         for i in range(1, 10):
             self.win.bind(f"<Control-Key-{i}>",
                           lambda e, n=i - 1: self._paste_index(n))
-            if self._compact and hasattr(self, 'cards_canvas'):
-                self.cards_canvas.bind(f"<Key-{i}>", lambda e, n=i - 1: self._paste_index(n))
+            self.cards_canvas.bind(f"<Key-{i}>",
+                                   lambda e, n=i - 1: self._paste_index(n))
         self.win.bind("<MouseWheel>", self._on_panel_wheel)
 
     def _paste_index(self, n):
@@ -2389,10 +2078,7 @@ class HistoryPanel:
         if not self.is_visible():
             return
         try:
-            if self._compact and hasattr(self, 'cards_canvas'):
-                self.cards_canvas.yview_scroll(-1 * (e.delta / 120), "units")
-            elif hasattr(self, 'canvas'):
-                self.canvas.yview_scroll(-1 * (e.delta / 120), "units")
+            self.cards_canvas.yview_scroll(-1 * (e.delta / 120), "units")
         except Exception:
             pass
 
@@ -2423,32 +2109,6 @@ class HistoryPanel:
         except OSError:
             traceback.print_exc()
             self.status_var.set("导出失败")
-
-    def _list_menu(self, clip_id, x, y):
-        self._context_menu(clip_id, x, y)
-
-    def _card_text(self, r, group, now):
-        cat = self._cat_of(r)
-        preview = (r["preview"] or "").strip()
-        if cat == "image":
-            main = f"[图片 {self._fmt_size(r)}]"
-        elif cat == "file":
-            main = "[文件] " + (preview or "")
-        elif cat == "code":
-            main = "[代码] " + (preview or "")
-        elif cat == "link":
-            main = preview or "[链接]"
-        else:
-            main = preview or "(空)"
-        if len(main) > 32:
-            main = main[:32] + "…"
-        src = r["source"] or "?"
-        if src.lower().endswith(".exe"):
-            src = src[:-4]
-        meta = f"{self._fmt_row_time(r['created_at'], group, now)} · {src[:12]}"
-        if r["tags"]:
-            meta = f"#{r['tags'].split(',')[0][:6]} · {meta}"
-        return f"{main}   {meta}"
 
     @staticmethod
     def _parse_ts(ts):
@@ -2491,207 +2151,6 @@ class HistoryPanel:
             return dt.strftime("%m-%d")
         return dt.strftime("%Y-%m-%d")
 
-    def _row_image(self, r):
-        from PIL import Image, ImageTk
-        cat = self._cat_of(r)
-        pinned = 1 if r["pinned"] else 0
-        if cat != "image":
-            # 非图片按类别共用图标（缓存键含钉住状态，用于叠加徽章）
-            key = f"icon:{cat}:{pinned}"
-            hit = self._thumb_cache.get(key)
-            if hit is not None:
-                return hit
-            base = {"code": self._code_icon_pil,
-                    "link": self._link_icon_pil,
-                    "file": self._file_icon_pil}.get(cat, self._text_icon_pil)
-            img = self._with_pin_badge(base) if pinned else base
-            photo = ImageTk.PhotoImage(img)
-            self._thumb_cache[key] = photo
-            return photo
-        key = f"{r['id']}:{pinned}"
-        hit = self._thumb_cache.get(key)
-        if hit is not None:
-            return hit
-        img = None
-        full = self.db.get(r["id"])
-        if full and full["image"]:
-            try:
-                img = Image.open(io.BytesIO(full["image"]))
-                px = max(28, int(round(40 * self._dpi)))
-                img.thumbnail((px, px))
-                img = img.convert("RGBA")
-            except Exception:
-                img = None
-        if img is None:
-            img = self._text_icon_pil
-        if pinned:
-            img = self._with_pin_badge(img)
-        photo = ImageTk.PhotoImage(img)
-        if len(self._thumb_cache) > 160:
-            self._thumb_cache.pop(next(iter(self._thumb_cache)))
-        self._thumb_cache[key] = photo
-        return photo
-
-    def _make_kind_icons(self):
-        """代码 </> / 链接(地球) / 文件(文件夹) 三个类别图标。"""
-        from PIL import Image, ImageDraw
-        size = max(28, int(round(40 * self._dpi)))
-        ss = 2
-        s = size * ss
-        c1 = (120, 126, 138, 255)
-        w = max(2, s // 24)
-
-        def new_canvas():
-            im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-            return im, ImageDraw.Draw(im)
-
-        im, dr = new_canvas()  # 代码 </>
-        dr.line([(s * 0.34, s * 0.30), (s * 0.18, s * 0.50), (s * 0.34, s * 0.70)],
-                fill=c1, width=w, joint="curve")
-        dr.line([(s * 0.66, s * 0.30), (s * 0.82, s * 0.50), (s * 0.66, s * 0.70)],
-                fill=c1, width=w, joint="curve")
-        dr.line([(s * 0.56, s * 0.26), (s * 0.44, s * 0.74)], fill=c1, width=w)
-        self._code_icon_pil = im.resize((size, size), Image.LANCZOS)
-
-        im, dr = new_canvas()  # 链接（地球）
-        cx, cy, rr = s / 2, s / 2, s * 0.30
-        dr.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=c1, width=w)
-        dr.ellipse([cx - rr * 0.45, cy - rr, cx + rr * 0.45, cy + rr],
-                   outline=c1, width=max(2, w - 1))
-        dr.line([(cx - rr, cy), (cx + rr, cy)], fill=c1, width=max(2, w - 1))
-        self._link_icon_pil = im.resize((size, size), Image.LANCZOS)
-
-        im, dr = new_canvas()  # 文件（文件夹）
-        dr.rounded_rectangle([s * 0.16, s * 0.32, s * 0.84, s * 0.78],
-                             radius=s * 0.05, outline=c1, width=w)
-        dr.line([(s * 0.18, s * 0.32), (s * 0.18, s * 0.22), (s * 0.40, s * 0.22),
-                 (s * 0.47, s * 0.32)], fill=c1, width=w, joint="curve")
-        self._file_icon_pil = im.resize((size, size), Image.LANCZOS)
-
-    # ---------- 圆角卡片背景与阴影 ----------
-    _CARD_CACHE = {}
-
-    def _make_card_bg(self, width, height, bg_color, is_dark, pinned=False):
-        """生成圆角卡片背景图（含阴影），带缓存。"""
-        key = (width, height, bg_color, is_dark, pinned)
-        if key in self._CARD_CACHE:
-            return self._CARD_CACHE[key]
-        from PIL import Image, ImageDraw, ImageFilter, ImageTk
-        ss = 2
-        w_ss, h_ss = width * ss, height * ss
-        r = self.CARD_RADIUS * ss
-        shadow_blur = 8 * ss
-        shadow_offset = 4 * ss
-        bg = Image.new("RGBA", (w_ss, h_ss), (0, 0, 0, 0))
-        dr = ImageDraw.Draw(bg)
-        if is_dark:
-            shadow_color = (0, 0, 0, 180)
-        else:
-            shadow_color = (0, 0, 0, 40)
-        shadow = Image.new("RGBA", (w_ss, h_ss), (0, 0, 0, 0))
-        shadow_dr = ImageDraw.Draw(shadow)
-        shadow_dr.rounded_rectangle(
-            [shadow_offset, shadow_offset, w_ss - shadow_offset,
-             h_ss - shadow_offset], radius=r, fill=shadow_color)
-        shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
-        bg = Image.alpha_composite(bg, shadow)
-        if pinned:
-            stroke_col = (234, 67, 53, 255)
-        else:
-            stroke_col = (201, 205, 214, 255) if not is_dark else (60, 60, 62, 255)
-        dr.rounded_rectangle(
-            [0, 0, w_ss - 1, h_ss - 1], radius=r,
-            fill=bg_color, outline=stroke_col, width=int(1 * ss))
-        photo = ImageTk.PhotoImage(bg.resize((width, height), Image.LANCZOS))
-        self._CARD_CACHE[key] = photo
-        return photo
-
-    def _draw_card_content(self, r, is_dark, width, height, now):
-        """在卡片上绘制图标、文本、时间、来源。返回 (icon_photo, main_text, meta_text) 组合信息。"""
-        from PIL import Image, ImageDraw, ImageFont, ImageTk
-        tk = self.tk
-        cat = self._cat_of(r)
-        cat_label = self.CATEGORY_LABELS.get(cat, cat)
-        preview = (r["preview"] or "").strip()
-        size = self.CARD_HEIGHT
-        icon_size = 40
-        pad = self.CARD_PADDING
-
-        # 绘制图标
-        if cat == "image":
-            full = self.db.get(r["id"])
-            if full and full["image"]:
-                try:
-                    img = Image.open(io.BytesIO(full["image"]))
-                    img.thumbnail((icon_size, icon_size))
-                    img = img.convert("RGBA")
-                    icon_pil = img
-                except Exception:
-                    icon_pil = None
-            else:
-                icon_pil = None
-        else:
-            icon_pil = {"code": self._code_icon_pil,
-                        "link": self._link_icon_pil,
-                        "file": self._file_icon_pil}.get(cat, self._text_icon_pil)
-
-        text_color = "#202124" if not is_dark else "#e8e8ed"
-        meta_color = "#86868b" if not is_dark else "#98989d"
-        pinned = 1 if r["pinned"] else 0
-
-        # 主文本
-        if cat == "image":
-            main = f"[图片 {self._fmt_size(r)}]"
-        elif cat == "file":
-            main = "[文件] " + (preview or "")
-        elif cat == "code":
-            main = "[代码] " + (preview or "")
-        elif cat == "link":
-            main = preview or "[链接]"
-        else:
-            main = preview or "(空)"
-        if len(main) > 30:
-            main = main[:30] + "…"
-
-        # 元文本：时间 + 来源
-        src = r["source"] or "?"
-        if src.lower().endswith(".exe"):
-            src = src[:-4]
-        meta = f"{self._fmt_row_time(r['created_at'], self._group_of(
-            self._parse_ts(r['created_at']), now), now)} · {src[:14]}"
-        if r["tags"]:
-            meta = f"#{r['tags'].split(',')[0][:6]} · {meta}"
-
-        # 如果有图标，创建带图标的合成图
-        if icon_pil is not None:
-            icon_w = icon_size
-            icon_h = icon_size
-            canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            dr = ImageDraw.Draw(canvas)
-            # 图标
-            icon_resized = icon_pil.resize((icon_w, icon_h), Image.LANCZOS)
-            canvas.paste(icon_resized, (pad + 4, (height - icon_h) // 2),
-                         icon_resized if icon_pil.mode == "RGBA" else None)
-            # 如果钉住，加图钉徽章
-            if pinned:
-                badge = self._pin_badge(int(icon_w * 0.44))
-                canvas.paste(badge,
-                             (width - pad - badge.width, height - pad - badge.height),
-                             badge)
-            photo = ImageTk.PhotoImage(canvas)
-            return photo, main, meta, icon_w, icon_h
-        else:
-            # 无图标，仅文字
-            canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            dr = ImageDraw.Draw(canvas)
-            if pinned:
-                badge = self._pin_badge(int(icon_size * 0.44))
-                canvas.paste(badge,
-                             (width - pad - badge.width, height - pad - badge.height),
-                             badge)
-            photo = ImageTk.PhotoImage(canvas)
-            return photo, main, meta, 0, 0
-
     # ---------- 悬停浮动预览 ----------
     HOVER_SHOW_MS = 450
     HOVER_POLL_MS = 120
@@ -2699,7 +2158,7 @@ class HistoryPanel:
     def _cancel_hover_timer(self):
         if self._hover_after is not None:
             try:
-                canvas = getattr(self, 'cards_canvas', None) or getattr(self, 'canvas', None)
+                canvas = getattr(self, 'cards_canvas', None)
                 if canvas:
                     canvas.after_cancel(self._hover_after)
             except Exception:
@@ -2731,8 +2190,6 @@ class HistoryPanel:
             self._hover_poll_id = self.win.after(self.HOVER_POLL_MS, self._hover_tick)
 
     def _on_card_motion(self, e):
-        if not self._compact:
-            return
         canvas = getattr(self, 'cards_canvas', None)
         if not canvas:
             return
@@ -2831,59 +2288,28 @@ class HistoryPanel:
             else:
                 self._start_hover_poll()
 
-    # ---------- 模式切换 ----------
+    # ---------- 窗口模式 ----------
     def apply_mode(self):
-        if self._compact:
-            self.win.overrideredirect(True)
-            try:
-                self.win.attributes("-transparentcolor", self.TRANS_COLOR)
-            except self.tk.TclError:
-                pass
-            self.win.configure(bg=self.TRANS_COLOR)
-            self.win.minsize(1, 1)
-            self._exp_root.pack_forget()
-            self._bg_canvas.pack(fill="both", expand=True)
-            self._cmp_root.place(x=16, y=16, relwidth=1.0, relheight=1.0,
-                                 width=-32, height=-32)
-            sw = self.win.winfo_screenwidth()
-            sh = self.win.winfo_screenheight()
-            w = min(self._cw, sw)
-            h = min(self._ch, sh)
-            px, py = self.win.winfo_pointerxy()
-            x = min(max(px - 60, 0), max(0, sw - w))
-            y = min(max(py - 24, 0), max(0, sh - h))
-            self.win.geometry(f"{w}x{h}+{x}+{y}")
-        else:
-            self.win.overrideredirect(False)
-            try:
-                self.win.attributes("-transparentcolor", "")
-            except self.tk.TclError:
-                pass
-            self.win.configure(bg=self._bg_color())
-            self._cmp_root.place_forget()
-            self._bg_canvas.pack_forget()
-            self._exp_root.pack(fill="both", expand=True)
-            self.win.minsize(680, 400)
-            self.win.geometry("900x560")
+        self.win.overrideredirect(True)
+        try:
+            self.win.attributes("-transparentcolor", self.TRANS_COLOR)
+        except self.tk.TclError:
+            pass
+        self.win.configure(bg=self.TRANS_COLOR)
+        self.win.minsize(1, 1)
+        self._bg_canvas.pack(fill="both", expand=True)
+        self._cmp_root.place(x=16, y=16, relwidth=1.0, relheight=1.0,
+                             width=-32, height=-32)
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        w = min(self._cw, sw)
+        h = min(self._ch, sh)
+        px, py = self.win.winfo_pointerxy()
+        x = min(max(px - 60, 0), max(0, sw - w))
+        y = min(max(py - 24, 0), max(0, sh - h))
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
         self.win.attributes("-topmost", True)
         self.refresh()
-
-    def set_compact(self, value):
-        value = bool(value)
-        if value == self._compact:
-            return
-        self._compact = value
-        fn = getattr(self.ui.actions, "set_panel_compact", None)
-        if fn:
-            try:
-                fn(value)
-            except Exception:
-                traceback.print_exc()
-        was_visible = self.is_visible()
-        self.apply_mode()
-        if was_visible:
-            self.win.focus_force()
-            (self.search_entry_c if self._compact else self.search_entry).focus_set()
 
 
 class FlatMenu:

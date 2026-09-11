@@ -13,7 +13,6 @@
   "popup_enabled": true,
   "popup_seconds": 3,
   "panel_enabled": true,
-  "panel_compact": true,
   "hide_panel_on_capture": false,
   "download_dir": ""
 }
