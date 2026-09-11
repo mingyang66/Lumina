@@ -1,0 +1,19 @@
+{
+  "db_path": "data/myclip.db",
+  "retention_days": 30,
+  "max_rows": 5000,
+  "max_text_kb": 512,
+  "max_image_mb": 64,
+  "hotkey_capture": "ctrl+alt+v",
+  "hotkey_region": "ctrl+alt+s",
+  "hotkey_panel": "ctrl+alt+h",
+  "capture_monitor": 1,
+  "copy_screenshot_to_clipboard": true,
+  "cleanup_interval_minutes": 60,
+  "popup_enabled": true,
+  "popup_seconds": 3,
+  "panel_enabled": true,
+  "panel_compact": true,
+  "hide_panel_on_capture": false,
+  "download_dir": ""
+}
