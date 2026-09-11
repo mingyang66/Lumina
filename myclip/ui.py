@@ -979,6 +979,10 @@ class HistoryPanel:
                 self._apply_row_bg(old)
             if cid is not None:
                 self._apply_row_bg(cid)
+        self._track_hover_preview(canvas, cid)
+
+    def _on_canvas_leave(self, event):
+        self._track_hover_preview(self._active_canvas(), None)
 
     def _on_canvas_rightclick(self, event):
         canvas = self._active_canvas()
@@ -991,6 +995,7 @@ class HistoryPanel:
         self._context_menu(clip_id, event.x_root, event.y_root)
 
     def _on_canvas_wheel(self, event):
+        self._close_hover()
         event.widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _on_list_scroll(self, first, last):
@@ -1055,13 +1060,34 @@ class HistoryPanel:
 
     def _get_clip_id_from_event(self, canvas, event):
         """按 y 坐标命中当前渲染的行（考虑滚动偏移）。"""
+        return self._hit_row(canvas, event.y)
+
+    def _hit_row(self, canvas, y):
         try:
-            cy = canvas.canvasy(event.y)
+            cy = canvas.canvasy(y)
         except Exception:
-            cy = event.y
+            cy = y
         for y0, y1, cid in self._row_rects:
             if y0 <= cy <= y1:
                 return cid
+        return None
+
+    def _row_anchor(self, iid):
+        """行的屏幕坐标框 (x0, y0, x1, y1)，复用 _row_rects 命中数据。"""
+        canvas = self._active_canvas()
+        if canvas is None:
+            return None
+        try:
+            cid = int(iid)
+            off = canvas.canvasy(0)
+            x0 = canvas.winfo_rootx()
+            y0 = canvas.winfo_rooty() - off
+            for ry0, ry1, rid in self._row_rects:
+                if rid == cid:
+                    return (x0, y0 + ry0,
+                            x0 + canvas.winfo_width(), y0 + ry1)
+        except Exception:
+            pass
         return None
 
     def _context_menu(self, clip_id, x, y):
@@ -1779,6 +1805,7 @@ class HistoryPanel:
         self.cards_canvas.bind("<Button-1>", self._on_canvas_click)
         self.cards_canvas.bind("<Button-3>", self._on_canvas_rightclick)
         self.cards_canvas.bind("<Motion>", self._on_canvas_motion)
+        self.cards_canvas.bind("<Leave>", self._on_canvas_leave)
         self.cards_canvas.bind("<MouseWheel>", self._on_canvas_wheel)
         self.cards_canvas.bind("<Configure>", self._on_canvas_configure)
 
@@ -2189,18 +2216,8 @@ class HistoryPanel:
         if self._hover_poll_id is None:
             self._hover_poll_id = self.win.after(self.HOVER_POLL_MS, self._hover_tick)
 
-    def _on_card_motion(self, e):
-        canvas = getattr(self, 'cards_canvas', None)
-        if not canvas:
-            return
-        try:
-            item = canvas.find_closest(e.y)
-            iid = item[0] if item else ""
-            tags = canvas.gettags(iid) if item else []
-            iid = tags[1] if len(tags) > 1 else ""
-        except Exception:
-            iid = ""
-        if not iid or iid not in self._rows:
+    def _track_hover_preview(self, canvas, iid):
+        if canvas is None or not iid or iid not in self._rows:
             self._hover_iid = None
             self._cancel_hover_timer()
             return
@@ -2222,18 +2239,7 @@ class HistoryPanel:
         if not full:
             return
         self._close_hover_popup()
-        anchor = None
-        canvas = getattr(self, 'cards_canvas', None)
-        if canvas:
-            try:
-                item = canvas.find_withtag(iid)
-                if item:
-                    bb = canvas.bbox(item[0])
-                    if bb:
-                        anchor = (canvas.winfo_rootx() + bb[0],
-                                  canvas.winfo_rooty() + bb[1], bb[2], bb[3])
-            except Exception:
-                pass
+        anchor = self._row_anchor(iid)
         try:
             self._hover_pop = HoverPopup(self, full, anchor)
         except Exception:
@@ -2244,18 +2250,16 @@ class HistoryPanel:
         self._start_hover_poll()
 
     def _pointer_over_same_row(self, px, py):
-        canvas = getattr(self, 'cards_canvas', None)
-        if not canvas:
+        canvas = self._active_canvas()
+        if canvas is None or not self._hover_iid:
             return False
         try:
-            cx, cy = canvas.winfo_rootx(), canvas.winfo_rooty()
+            x0, y0 = canvas.winfo_rootx(), canvas.winfo_rooty()
             w, h = canvas.winfo_width(), canvas.winfo_height()
-            if not (cx <= px <= cx + w and cy <= py <= cy + h):
+            if not (x0 <= px <= x0 + w and y0 <= py <= y0 + h):
                 return False
-            item = canvas.find_closest(py - cy)
-            tags = canvas.gettags(item[0]) if item else []
-            row_id = tags[1] if len(tags) > 1 else ""
-            return row_id == self._hover_iid
+            cid = self._hit_row(canvas, py - y0)
+            return cid is not None and str(cid) == self._hover_iid
         except Exception:
             return False
 
@@ -2591,7 +2595,7 @@ class HoverPopup:
         if x + bw > sw:
             side = "right"
             x = max(0, pw.winfo_rootx() - GAP - bw)
-        row_cy = (anchor[1] + anchor[3] / 2) if anchor else pw.winfo_rooty() + 80
+        row_cy = ((anchor[1] + anchor[3]) / 2) if anchor else pw.winfo_rooty() + 80
         y = int(row_cy - bh / 2)
         y = max(4, min(y, sh - bh - 4))
         ah = self.ARROW_HALF
