@@ -1,5 +1,5 @@
 import ast
-files = ["myclip/ui.py"]
+files = ["lumina/ui.py"]
 for f in files:
     try:
         ast.parse(open(f, encoding="utf-8").read())

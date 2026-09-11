@@ -15,7 +15,7 @@ from .listener import ClipboardListener
 from .ui import UiServer
 
 
-class MyClipApp:
+class LuminaApp:
     def __init__(self, config, config_path=None):
         self.config = config
         self.config_path = config_path
@@ -80,7 +80,7 @@ class MyClipApp:
 
     @staticmethod
     def _log(msg):
-        print(f"[myclip] {msg}", flush=True)
+        print(f"[lumina] {msg}", flush=True)
 
     # ---------- 截图 ----------
     def _hide_panel_for_capture(self):
@@ -108,7 +108,7 @@ class MyClipApp:
             if self.config.get("copy_screenshot_to_clipboard", True):
                 dib = image_to_dib(img)
                 self.listener.write_clipboard(win32clip.set_clipboard_dib, dib)
-            print(f"[myclip] screenshot #{clip_id} saved ({len(png) // 1024} KB)",
+            print(f"[lumina] screenshot #{clip_id} saved ({len(png) // 1024} KB)",
                   flush=True)
             self.ui.notify("screenshot", clip_id, png=png, source="screenshot")
             self.ui.refresh_panel()
@@ -195,7 +195,7 @@ class MyClipApp:
                     self.config.get("max_rows", 5000),
                 )
                 if deleted:
-                    print(f"[myclip] cleanup: removed {deleted} expired record(s)")
+                    print(f"[lumina] cleanup: removed {deleted} expired record(s)")
         except Exception:
             traceback.print_exc()
         finally:
@@ -208,9 +208,9 @@ class MyClipApp:
                 self.config.get("max_rows", 5000),
             )
             if deleted:
-                print(f"[myclip] startup cleanup: removed {deleted} expired record(s)")
+                print(f"[lumina] startup cleanup: removed {deleted} expired record(s)")
             self._cleaner_thread = threading.Thread(
-                target=self._cleaner_loop, name="myclip-cleaner", daemon=True)
+                target=self._cleaner_loop, name="lumina-cleaner", daemon=True)
             self._cleaner_thread.start()
             self.ui.start()
             if ((self.config.get("popup_enabled", True) or
@@ -221,22 +221,22 @@ class MyClipApp:
             if not self.listener.wait_ready(3):
                 raise RuntimeError(
                     f"clipboard listener failed to start: {self.listener._startup_error}")
-            print("[myclip] clipboard monitor running", flush=True)
-            print(f"[myclip] db: {os.path.abspath(self.db.path)}", flush=True)
-            print(f"[myclip] screenshot hotkey: {self.config.get('hotkey_capture')}",
+            print("[lumina] clipboard monitor running", flush=True)
+            print(f"[lumina] db: {os.path.abspath(self.db.path)}", flush=True)
+            print(f"[lumina] screenshot hotkey: {self.config.get('hotkey_capture')}",
                   flush=True)
-            print(f"[myclip] region capture hotkey: {self.config.get('hotkey_region')}",
+            print(f"[lumina] region capture hotkey: {self.config.get('hotkey_region')}",
                   flush=True)
-            print(f"[myclip] history panel hotkey: {self.config.get('hotkey_panel')}",
+            print(f"[lumina] history panel hotkey: {self.config.get('hotkey_panel')}",
                   flush=True)
-            print(f"[myclip] retention: {self.config.get('retention_days')} days / "
+            print(f"[lumina] retention: {self.config.get('retention_days')} days / "
                   f"max {self.config.get('max_rows')} rows", flush=True)
-            print("[myclip] press Ctrl+C to exit", flush=True)
+            print("[lumina] press Ctrl+C to exit", flush=True)
             while not self._stop.wait(0.5):
                 if not self.listener.is_alive():
                     raise RuntimeError("clipboard listener stopped unexpectedly")
         except KeyboardInterrupt:
-            print("\n[myclip] shutting down...")
+            print("\n[lumina] shutting down...")
         finally:
             self._stop.set()
             if self.listener.ident is not None:

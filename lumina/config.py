@@ -2,7 +2,7 @@ import json
 import os
 
 DEFAULTS = {
-    "db_path": "data/myclip.db",
+    "db_path": "data/lumina.db",
     "retention_days": 30,
     "max_rows": 5000,
     "max_text_kb": 512,

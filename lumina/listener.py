@@ -106,11 +106,11 @@ def parse_hotkey(spec):
 class ClipboardListener(threading.Thread):
     """消息窗口线程：监听剪贴板变化 + 响应全局热键。"""
 
-    CLASS_NAME = "MyClipListenerWindow"
+    CLASS_NAME = "LuminaListenerWindow"
 
     def __init__(self, on_text, on_image, hotkeys=None, on_worker_stop=None,
                  on_files=None):
-        super().__init__(name="myclip-listener", daemon=True)
+        super().__init__(name="lumina-listener", daemon=True)
         self._on_text = on_text
         self._on_image = on_image
         self._on_files = on_files
@@ -167,7 +167,7 @@ class ClipboardListener(threading.Thread):
 
     def run(self):
         self._worker = threading.Thread(target=self._worker_loop,
-                                        name="myclip-processor", daemon=True)
+                                        name="lumina-processor", daemon=True)
         self._worker.start()
         hwnd = None
         listener_added = False
@@ -182,7 +182,7 @@ class ClipboardListener(threading.Thread):
                 if ctypes.GetLastError() != ERROR_CLASS_ALREADY_EXISTS:
                     raise ctypes.WinError()
             hwnd = user32.CreateWindowExW(
-                0, self.CLASS_NAME, "MyClip", 0, 0, 0, 0, 0,
+                0, self.CLASS_NAME, "Lumina", 0, 0, 0, 0, 0,
                 HWND_MESSAGE, None, hinst, None,
             )
             if not hwnd:
@@ -195,12 +195,12 @@ class ClipboardListener(threading.Thread):
                 hid = HOTKEY_BASE + i
                 mods, vk = parse_hotkey(spec)
                 if mods is None:
-                    print(f"[myclip] invalid hotkey spec: '{spec}'", flush=True)
+                    print(f"[lumina] invalid hotkey spec: '{spec}'", flush=True)
                     continue
                 if user32.RegisterHotKey(hwnd, hid, mods, vk):
                     self._hotkey_ids[hid] = (spec, cb)
                 else:
-                    print(f"[myclip] hotkey '{spec}' register failed: "
+                    print(f"[lumina] hotkey '{spec}' register failed: "
                           f"{ctypes.WinError()}", flush=True)
             self._ready.set()
             msg = MSG()
@@ -300,10 +300,10 @@ class ClipboardListener(threading.Thread):
             try:
                 self._work_queue.put_nowait(item)
             except queue.Full:
-                print("[myclip] processor queue saturated; newest item dropped",
+                print("[lumina] processor queue saturated; newest item dropped",
                       flush=True)
                 return
-            print("[myclip] processor queue full; oldest item dropped", flush=True)
+            print("[lumina] processor queue full; oldest item dropped", flush=True)
 
     def _worker_loop(self):
         try:

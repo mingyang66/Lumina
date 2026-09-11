@@ -51,7 +51,7 @@ class UiServer:
     def start(self):
         if not (self.toast_enabled or self.panel_enabled or self.region_enabled):
             return
-        self._thread = threading.Thread(target=self._run, name="myclip-ui",
+        self._thread = threading.Thread(target=self._run, name="lumina-ui",
                                         daemon=True)
         self._thread.start()
         deadline = time.time() + 3
@@ -66,7 +66,7 @@ class UiServer:
             self._put(("quit",), replace_oldest=True)
             thread.join(timeout=3)
             if thread.is_alive():
-                print("[myclip] UI thread did not stop in time", flush=True)
+                print("[lumina] UI thread did not stop in time", flush=True)
             else:
                 self._thread = None
 
@@ -135,14 +135,14 @@ class UiServer:
         try:
             import tkinter as tk
         except ImportError:
-            print("[myclip] UI disabled: tkinter unavailable", flush=True)
+            print("[lumina] UI disabled: tkinter unavailable", flush=True)
             self.toast_enabled = self.panel_enabled = False
             return
         self._tk = tk
         try:
             root = tk.Tk()
         except Exception as e:
-            print(f"[myclip] UI disabled: {e}", flush=True)
+            print(f"[lumina] UI disabled: {e}", flush=True)
             self.toast_enabled = self.panel_enabled = False
             return
         try:
@@ -317,7 +317,7 @@ class UiServer:
             except Exception:
                 traceback.print_exc()
         threading.Thread(target=self._finish_region, args=(png, source),
-                         name="myclip-region-save", daemon=True).start()
+                         name="lumina-region-save", daemon=True).start()
 
     def _finish_region(self, png, source="region"):
         try:
@@ -679,12 +679,12 @@ class RegionSelector:
             return
         from tkinter import filedialog
         default_dir = self.ui.config.get("download_dir") or os.path.join(
-            os.path.expanduser("~"), "Pictures", "MyClip")
+            os.path.expanduser("~"), "Pictures", "Lumina")
         try:
             os.makedirs(default_dir, exist_ok=True)
         except OSError:
             default_dir = os.path.expanduser("~")
-        fname = time.strftime("myclip_%Y%m%d_%H%M%S.png")
+        fname = time.strftime("lumina_%Y%m%d_%H%M%S.png")
         try:
             path = filedialog.asksaveasfilename(
                 parent=self.win, title="保存截图",
@@ -800,7 +800,7 @@ class HistoryPanel:
         self._flat_menu = None
 
         self.win = tk.Toplevel(root)
-        self.win.title("MyClip 历史面板")
+        self.win.title("Lumina 历史面板")
         self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.hide)
         self._build_widgets()

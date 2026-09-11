@@ -2,13 +2,13 @@ import argparse
 import os
 import sys
 
-from myclip.app import MyClipApp
-from myclip.config import load_config
-from myclip.db import Database
+from lumina.app import LuminaApp
+from lumina.config import load_config
+from lumina.db import Database
 
 
 def cmd_run(cfg, config_path=None):
-    MyClipApp(cfg, config_path).start()
+    LuminaApp(cfg, config_path).start()
 
 
 def _print_rows(rows):
@@ -119,7 +119,7 @@ def cmd_stats(cfg):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="myclip",
+    parser = argparse.ArgumentParser(prog="lumina",
                                      description="clipboard & screenshot archiver (SQLite)")
     parser.add_argument("-c", "--config", default="config.json", help="config file path")
     sub = parser.add_subparsers(dest="cmd")
