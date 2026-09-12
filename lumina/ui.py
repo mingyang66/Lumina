@@ -720,7 +720,7 @@ class RegionSelector:
 
 
 class HistoryPanel:
-    COMPACT_W = 460
+    COMPACT_W = 880
     COMPACT_H = 640
     TRANS_COLOR = "#010203"
     FILTERS = (("all", "全部"), ("text", "文本"), ("code", "代码"),
@@ -794,12 +794,8 @@ class HistoryPanel:
         self._card_w = 0
         self._row_h = 0
         self._rows_displayed = []
-        self._hover_iid = None
-        self._hover_after = None
-        self._hover_poll_id = None
-        self._hover_pop = None
-        self._hover_miss = 0
-        self._hover_sticky = False
+        self._detail = None
+        self._detail_hover_id = None
         self._flat_menu = None
 
         self.win = tk.Toplevel(root)
@@ -882,7 +878,6 @@ class HistoryPanel:
         root, tk, ui = self._root, self.tk, self.ui
         sel = self._sel_id
         self._close_shot_menu()
-        self._close_hover()
         try:
             self.win.destroy()
         except Exception:
@@ -983,10 +978,17 @@ class HistoryPanel:
                 self._apply_row_bg(old)
             if cid is not None:
                 self._apply_row_bg(cid)
-        self._track_hover_preview(canvas, cid)
+        self._detail_follow(cid)
 
     def _on_canvas_leave(self, event):
-        self._track_hover_preview(self._active_canvas(), None)
+        self._detail_follow(None)
+
+    def _detail_follow(self, cid):
+        """悬停跟随：指针所在行的详情防抖渲染；离开列表回到选中行。"""
+        if self._detail is None or cid == self._detail_hover_id:
+            return
+        self._detail_hover_id = cid
+        self._detail.show(cid if cid is not None else self._sel_id)
 
     def _on_canvas_rightclick(self, event):
         canvas = self._active_canvas()
@@ -999,7 +1001,6 @@ class HistoryPanel:
         self._context_menu(clip_id, event.x_root, event.y_root)
 
     def _on_canvas_wheel(self, event):
-        self._close_hover()
         event.widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _on_list_scroll(self, first, last):
@@ -1076,24 +1077,6 @@ class HistoryPanel:
                 return cid
         return None
 
-    def _row_anchor(self, iid):
-        """行的屏幕坐标框 (x0, y0, x1, y1)，复用 _row_rects 命中数据。"""
-        canvas = self._active_canvas()
-        if canvas is None:
-            return None
-        try:
-            cid = int(iid)
-            off = canvas.canvasy(0)
-            x0 = canvas.winfo_rootx()
-            y0 = canvas.winfo_rooty() - off
-            for ry0, ry1, rid in self._row_rects:
-                if rid == cid:
-                    return (x0, y0 + ry0,
-                            x0 + canvas.winfo_width(), y0 + ry1)
-        except Exception:
-            pass
-        return None
-
     def _context_menu(self, clip_id, x, y):
         row = self._rows.get(str(clip_id))
         if not row:
@@ -1148,7 +1131,8 @@ class HistoryPanel:
 
     def hide(self):
         self._close_shot_menu()
-        self._close_hover()
+        if self._detail is not None:
+            self._detail._close_menu()
         try:
             self.win.withdraw()
         except Exception:
@@ -1302,7 +1286,6 @@ class HistoryPanel:
         self.refresh()
 
     def refresh(self):
-        self._close_hover()
         q = self.search_var.get().strip()
         limit = 60
         rows = self.db.search(q, limit) if q else self.db.list_recent(limit)
@@ -1310,6 +1293,9 @@ class HistoryPanel:
         self._rows = {str(r["id"]): r for r in rows}
         self._refresh_cards(rows)
         self.status_var.set(f"共 {len(rows)} 条")
+        if self._detail is not None:
+            self._detail_hover_id = None
+            self._detail.show(self._sel_id, immediate=True)
 
     def _apply_filter(self, rows):
         if self._filter == "pinned":
@@ -1351,7 +1337,7 @@ class HistoryPanel:
         T, dark = self._theme()
         cw = canvas.winfo_width()
         if cw <= 1:
-            cw = max(200, self._cw - 20)
+            cw = max(200, int(self._cw * 0.5))
         card_w = max(80, cw - 2 * margin)
         gap = int(round(8 * self._dpi))
         self._card_w, self._row_h = card_w, row_h
@@ -1608,6 +1594,9 @@ class HistoryPanel:
             self._apply_row_bg(old)
         if cid is not None:
             self._apply_row_bg(cid)
+        if self._detail is not None and cid is not None:
+            self._detail_hover_id = cid
+            self._detail.show(cid, immediate=True)
 
     def _move_selection(self, delta):
         order = [str(r["id"]) for r in self._rows_displayed]
@@ -1767,9 +1756,18 @@ class HistoryPanel:
             wgt.bind("<ButtonPress-1>", self._hdr_press)
             wgt.bind("<B1-Motion>", self._hdr_move)
 
+        # ---------- 双栏布局：左列表 / 右详情（master-detail） ----------
+        body_split = tk.Frame(self._cmp_root, bg=win_bg)
+        body_split.pack(fill="both", expand=True, padx=14, pady=(2, 0))
+        left = tk.Frame(body_split, bg=win_bg)
+        left.pack(side="left", fill="both", expand=True)
+        sep = tk.Frame(body_split, bg=T["hairline"], width=1)
+        sep.pack(side="left", fill="y", padx=10, pady=2)
+        self._detail = DetailPane(self, body_split, int(round(400 * dpi)))
+
         # ---------- 胶囊搜索框 ----------
-        search_wrap = tk.Frame(self._cmp_root, bg=win_bg)
-        search_wrap.pack(fill="x", padx=14, pady=(2, 8))
+        search_wrap = tk.Frame(left, bg=win_bg)
+        search_wrap.pack(fill="x", pady=(0, 8))
         self._sh_h = int(round(34 * dpi))
         self._search_canvas = tk.Canvas(search_wrap, height=self._sh_h, bg=win_bg,
                                         highlightthickness=0, bd=0)
@@ -1787,8 +1785,8 @@ class HistoryPanel:
         self._search_canvas.bind("<Configure>", lambda e: self._layout_search())
 
         # ---------- 过滤胶囊 pills（Canvas 自绘） ----------
-        chip_wrap = tk.Frame(self._cmp_root, bg=win_bg)
-        chip_wrap.pack(fill="x", padx=14, pady=(0, 8))
+        chip_wrap = tk.Frame(left, bg=win_bg)
+        chip_wrap.pack(fill="x", pady=(0, 8))
         self._chip_h = int(round(28 * dpi))
         self._chip_canvas = tk.Canvas(chip_wrap, height=self._chip_h, bg=win_bg,
                                       highlightthickness=0, bd=0)
@@ -1799,8 +1797,8 @@ class HistoryPanel:
         self._chip_photos = []
 
         # 卡片列表（Canvas 替代 Treeview）
-        list_frame = tk.Frame(self._cmp_root, bg=self._canvas_bg())
-        list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        list_frame = tk.Frame(left, bg=self._canvas_bg())
+        list_frame.pack(fill="both", expand=True, pady=(0, 4))
         self.cards_canvas = tk.Canvas(list_frame, bg=self._canvas_bg(),
                                           highlightthickness=0, bd=0)
         self.cards_canvas.pack(side="left", fill="both", expand=True)
@@ -1826,7 +1824,7 @@ class HistoryPanel:
                                     bg=win_bg, fg=T["label2"], font=self._font(8))
         self._cmp_status.pack(side="right")
         tk.Label(footer, bg=win_bg, fg=T["label3"], font=self._font(8),
-                 text="Enter 回贴 · 空格 预览 · Ctrl+1-9 快速").pack(side="right", padx=(0, 8))
+                 text="Enter 回贴 · Ctrl+1-9 快速").pack(side="right", padx=(0, 8))
 
     # ---------- Apple 风格控件绘制助手 ----------
     def _font_path(self):
@@ -2092,41 +2090,6 @@ class HistoryPanel:
             self.cards_canvas.bind(f"<Key-{i}>",
                                    lambda e, n=i - 1: self._paste_index(n))
         self.win.bind("<MouseWheel>", self._on_panel_wheel)
-        self.win.bind("<space>", self._quick_look)
-        self.cards_canvas.bind("<space>", self._quick_look)
-
-    def _quick_look(self, event=None):
-        """空格键 Quick Look：对当前选中行弹出/收起悬停浮窗（不自动关闭）。
-
-        搜索框已有查询词时空格照常输入（支持多词搜索）；查询为空则触发预览。
-        """
-        if not self.is_visible():
-            return None
-        try:
-            w = self.win.focus_get()
-        except Exception:
-            w = None
-        if isinstance(w, self.tk.Button):
-            return None
-        if w is getattr(self, "search_entry_c", None):
-            try:
-                if self.search_var.get().strip():
-                    return None
-            except Exception:
-                return None
-        if self._hover_pop is not None and self._hover_sticky:
-            self._close_hover()
-            return "break"
-        iid = str(self._sel_id) if self._sel_id is not None else None
-        if iid is None or iid not in self._rows:
-            return "break"
-        self._close_hover()
-        self._ensure_visible(iid)
-        self._hover_iid = iid
-        self._show_hover(iid)
-        if self._hover_pop is not None:
-            self._hover_sticky = True
-        return "break"
 
     def _paste_index(self, n):
         if not self.is_visible():
@@ -2216,126 +2179,6 @@ class HistoryPanel:
         if dt.year == now.year:
             return dt.strftime("%m-%d")
         return dt.strftime("%Y-%m-%d")
-
-    # ---------- 悬停浮动预览 ----------
-    HOVER_SHOW_MS = 450
-    HOVER_POLL_MS = 120
-
-    def _cancel_hover_timer(self):
-        if self._hover_after is not None:
-            try:
-                canvas = getattr(self, 'cards_canvas', None)
-                if canvas:
-                    canvas.after_cancel(self._hover_after)
-            except Exception:
-                pass
-            self._hover_after = None
-
-    def _close_hover_popup(self):
-        pop = self._hover_pop
-        self._hover_pop = None
-        if pop is not None:
-            try:
-                pop.destroy()
-            except Exception:
-                pass
-
-    def _close_hover(self):
-        self._cancel_hover_timer()
-        if self._hover_poll_id is not None:
-            try:
-                self.win.after_cancel(self._hover_poll_id)
-            except Exception:
-                pass
-            self._hover_poll_id = None
-        self._close_hover_popup()
-        self._hover_iid = None
-        self._hover_sticky = False
-
-    def _start_hover_poll(self):
-        if self._hover_poll_id is None:
-            self._hover_poll_id = self.win.after(self.HOVER_POLL_MS, self._hover_tick)
-
-    def _track_hover_preview(self, canvas, iid):
-        if canvas is None or not iid or iid not in self._rows:
-            self._hover_iid = None
-            self._cancel_hover_timer()
-            return
-        if iid == self._hover_iid:
-            return
-        self._hover_iid = iid
-        self._hover_sticky = False
-        self._cancel_hover_timer()
-        if self._hover_pop is not None:
-            self._show_hover(iid)
-        else:
-            self._hover_after = canvas.after(
-                self.HOVER_SHOW_MS, lambda: self._show_hover(iid))
-
-    def _show_hover(self, iid):
-        self._hover_after = None
-        if not self.is_visible() or iid not in self._rows:
-            return
-        row = self._rows[iid]
-        if row["kind"] == "image":
-            full = self.db.get(row["id"])
-        else:
-            full = self.db.get_text(row["id"])
-        if not full:
-            return
-        self._close_hover_popup()
-        anchor = self._row_anchor(iid)
-        try:
-            self._hover_pop = HoverPopup(self, full, anchor)
-        except Exception:
-            traceback.print_exc()
-            self._hover_pop = None
-            return
-        self._hover_miss = 0
-        self._start_hover_poll()
-
-    def _pointer_over_same_row(self, px, py):
-        canvas = self._active_canvas()
-        if canvas is None or not self._hover_iid:
-            return False
-        try:
-            x0, y0 = canvas.winfo_rootx(), canvas.winfo_rooty()
-            w, h = canvas.winfo_width(), canvas.winfo_height()
-            if not (x0 <= px <= x0 + w and y0 <= py <= y0 + h):
-                return False
-            cid = self._hit_row(canvas, py - y0)
-            return cid is not None and str(cid) == self._hover_iid
-        except Exception:
-            return False
-
-    def _hover_tick(self):
-        self._hover_poll_id = None
-        pop = self._hover_pop
-        if pop is None:
-            return
-        if not self.is_visible():
-            self._close_hover()
-            return
-        if getattr(pop, "_in_menu", False) or self._hover_sticky:
-            self._hover_miss = 0
-            self._start_hover_poll()
-            return
-        try:
-            px, py = self.win.winfo_pointerxy()
-        except Exception:
-            self._close_hover()
-            return
-        if pop.contains_point(px, py) or self._pointer_over_same_row(px, py):
-            self._hover_miss = 0
-            self._start_hover_poll()
-        else:
-            # 连续 3 次(约 360ms)不在浮窗/卡片行上才关闭，
-            # 留出指针从卡片移入浮窗的穿越时间
-            self._hover_miss += 1
-            if self._hover_miss >= 3:
-                self._close_hover()
-            else:
-                self._start_hover_poll()
 
     # ---------- 窗口模式 ----------
     def apply_mode(self):
@@ -2510,26 +2353,18 @@ class FlatMenu:
         self._fire_close()
 
 
-class HoverPopup:
-    """紧凑卡片悬停浮窗：气泡样式，侧边小箭头指向对应卡片行。
+class DetailPane:
+    """右侧常驻详情区（master-detail）：渲染选中/悬停行的完整内容。
 
-    - 图片弹大图（可拖动移位，右键复制/钉图/另存为）；
-      文本弹可选中只读文本框（右键复制选中/复制全部/回贴/导出）
-    - 面板右侧放不下自动翻到左侧，箭头换边并始终对准行中心
-    - 关闭判定由面板轮询驱动：指针连续离开浮窗与对应卡片行才关闭
+    替代旧的悬停气泡浮窗：详情常驻面板右栏，随选中/悬停防抖切换，
+    无第二个 Toplevel、无气泡几何与开关轮询。内容可直接交互
+    （文本可选中、链接可点击、文件双击打开、代码着色），底部为动作栏。
     """
 
-    TEXT_MAX = 4000
-    IMG_MAX = (520, 400)
-    BG = "#ffffff"
-    BORDER = "#c9cdd6"
-    ARROW_D = 10      # 箭头深度
-    ARROW_HALF = 9    # 箭头半宽
-    RADIUS = 12
-    BORDER_W = 2
-    PAD = 8           # 内容内边距
-    GAP = 6           # 与面板的间距
-    FILE_MAX_ROWS = 10
+    TEXT_MAX = 20000
+    IMG_MAX_BASE = (380, 430)
+    FILE_MAX_ROWS = 20
+    DEBOUNCE_MS = 120
     IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
                 ".ico", ".tif", ".tiff")
     URL_RE = re.compile(r"https?://[^\s<>\"'，。；、）】》」』]+")
@@ -2556,39 +2391,133 @@ class HoverPopup:
         ".mp4": "pink", ".avi": "pink", ".mkv": "pink",
     }
 
-    def __init__(self, panel, row, anchor=None):
+    def __init__(self, panel, parent, width):
         self.panel = panel
         self.ui = panel.ui
-        self.row = row
-        self._drag = None
-        self._photo = None
-        self._in_menu = False
-        self._flat_menu = None
-        self._urls = []
-        self._url_down = None
-        self._file_photos = []
+        self.tk = panel.tk
         T, _dark = panel._theme()
         self.T = T
         self.BG = T["card_bg"]
-        self.BORDER = T["hairline"]
-        tk = panel.tk
-        self.win = tk.Toplevel(panel.win)
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
-        try:
-            self.win.attributes("-transparentcolor", panel.TRANS_COLOR)
-        except tk.TclError:
-            pass
-        self.win.configure(bg=panel.TRANS_COLOR)
+        self.row = None
+        self.cat = "text"
+        self._cur_key = None
+        self._pending = None
+        self._photo = None
+        self._urls = []
+        self._url_down = None
+        self._file_photos = []
+        self._in_menu = False
+        self._flat_menu = None
+        self._body = None
+        tk = self.tk
+        self.frame = tk.Frame(parent, bg=self.BG, width=width)
+        self.frame.pack(side="left", fill="y")
+        self.frame.pack_propagate(False)
+        self._meta = tk.Label(self.frame, text="预览", bg=T["field"],
+                              fg=T["label2"], font=("Microsoft YaHei UI", 8),
+                              anchor="w", padx=8, pady=4)
+        self._meta.pack(fill="x")
+        self._actions = tk.Frame(self.frame, bg=self.BG)
+        self._actions.pack(side="bottom", fill="x", padx=4, pady=(2, 6))
+        self._host = tk.Frame(self.frame, bg=self.BG)
+        self._host.pack(fill="both", expand=True, padx=4, pady=4)
+        for w in (self.frame, self._meta, self._host):
+            w.bind("<MouseWheel>", self._on_wheel)
+        self.frame.bind("<Return>", self._paste_key)
+        self._meta.bind("<Button-3>", self._menu)
+        self.show_placeholder()
 
-        outer = tk.Frame(self.win, bg=self.BG)
-        self._content = outer
+    # ---------- 渲染调度 ----------
+    def current_id(self):
+        return self.row["id"] if self.row is not None else None
 
-        kind = row["kind"]
+    def show(self, row_id, immediate=False):
+        """按行 id 渲染详情；默认防抖（悬停跟随），immediate 立即渲染。"""
+        if self._pending is not None:
+            try:
+                self.frame.after_cancel(self._pending)
+            except Exception:
+                pass
+            self._pending = None
+        if immediate or row_id is None:
+            self._render(row_id)
+        else:
+            self._pending = self.frame.after(
+                self.DEBOUNCE_MS, lambda: self._render(row_id))
+
+    def _render(self, row_id):
+        self._pending = None
+        if row_id is None:
+            self.show_placeholder()
+            return
+        iid = str(row_id)
+        lrow = self.panel._rows.get(iid)
+        if lrow is None:
+            self.show_placeholder()
+            return
+        if lrow["kind"] == "image":
+            full = self.panel.db.get(lrow["id"])
+        else:
+            full = self.panel.db.get_text(lrow["id"])
+        if not full:
+            self.show_placeholder()
+            return
+        key = (iid, bool(full["pinned"]))
+        if key == self._cur_key:
+            return
+        self._close_menu()
+        self._cur_key = key
+        self.row = full
+        self._photo = None
+        self._urls = []
+        self._url_down = None
+        self._file_photos = []
+        kind = full["kind"]
         try:
-            self.cat = row["category"] or ("image" if kind == "image" else "text")
+            self.cat = full["category"] or (
+                "image" if kind == "image" else "text")
         except (IndexError, KeyError):
             self.cat = "image" if kind == "image" else "text"
+        self._update_meta(full, kind)
+        for w in self._host.winfo_children():
+            w.destroy()
+        if kind == "image" and full["image"]:
+            self._build_image_body(self._host, full, self.tk)
+        elif self.cat == "file":
+            self._build_file_body(self._host, full, self.tk)
+        else:
+            self._build_text_body(self._host, full, self.tk)
+        self._body.bind("<Button-3>", self._menu)
+        self._update_actions()
+
+    def show_placeholder(self):
+        self._close_menu()
+        self._cur_key = None
+        self.row = None
+        self._photo = None
+        self._urls = []
+        self._file_photos = []
+        self._body = None
+        for w in self._host.winfo_children():
+            w.destroy()
+        for w in self._actions.winfo_children():
+            w.destroy()
+        self._meta.configure(text="预览")
+        tk = self.tk
+        T = self.T
+        from PIL import ImageTk
+        size = int(round(48 * self.panel._dpi))
+        photo = ImageTk.PhotoImage(self.panel._category_tile("text", size))
+        box = tk.Frame(self._host, bg=T["card_bg"])
+        box.pack(fill="both", expand=True)
+        lb = tk.Label(box, image=photo, bg=T["card_bg"])
+        lb.image = photo
+        lb.pack(expand=True, pady=(0, 6))
+        tk.Label(box, text="悬停或选择左侧内容进行预览", bg=T["card_bg"],
+                 fg=T["label3"],
+                 font=("Microsoft YaHei UI", 10)).pack(pady=(0, 24))
+
+    def _update_meta(self, row, kind):
         cat_label = HistoryPanel.CATEGORY_LABELS.get(self.cat, self.cat)
         nbytes = (len(row["image"]) if kind == "image" and row["image"]
                   else len((row["content"] or "").encode("utf-8")))
@@ -2600,84 +2529,91 @@ class HoverPopup:
             meta = "[已钉] " + meta
         if row["tags"]:
             meta += f" · {row['tags'][:16]}"
-        self._meta = tk.Label(outer, text=meta, bg=T["field"], fg=T["label2"],
-                              font=("Microsoft YaHei UI", 8), anchor="w",
-                              padx=8, pady=3, cursor="fleur")
-        self._meta.pack(fill="x")
-        self._meta.bind("<ButtonPress-1>", self._press)
-        self._meta.bind("<B1-Motion>", self._move)
+        self._meta.configure(text=meta)
 
-        if kind == "image" and row["image"]:
-            self._build_image_body(outer, row, tk)
-        elif self.cat == "file":
-            self._build_file_body(outer, row, tk)
-        else:
-            self._build_text_body(outer, row, tk)
+    # ---------- 动作栏 ----------
+    def _update_actions(self):
+        for w in self._actions.winfo_children():
+            w.destroy()
+        if self.row is None:
+            return
+        tk = self.tk
+        T = self.T
+        danger = self.panel._sys("red")
 
-        self.win.bind("<Escape>", lambda e: self.panel._close_hover())
-        self.win.bind("<Return>", self._paste_key)
-        self.win.bind("<MouseWheel>", self._popup_wheel)
-        self._body.bind("<Button-3>", self._menu)
-        self._meta.bind("<Button-3>", self._menu)
-        self._meta.bind("<Double-Button-1>", lambda e: self._paste_this())
-        self._meta.bind("<MouseWheel>", self._popup_wheel)
-        outer.bind("<MouseWheel>", self._popup_wheel)
+        def btn(label, cmd, fg=None):
+            fg = fg or T["accent"]
+            b = tk.Button(self._actions, text=label, command=cmd, relief="flat",
+                          bd=0, font=("Microsoft YaHei UI", 9), bg=T["card_bg"],
+                          fg=fg, activebackground=T["accent_soft"],
+                          activeforeground=fg, padx=8, pady=3,
+                          cursor="hand2", highlightthickness=0)
+            b.pack(side="left", padx=(2, 0))
+            return b
 
-        # ---------- 气泡几何：箭头对准对应卡片行的垂直中心 ----------
-        self.win.update_idletasks()
-        w0 = outer.winfo_reqwidth()
-        h0 = outer.winfo_reqheight()
-        A, PAD, GAP, R = self.ARROW_D, self.PAD, self.GAP, self.RADIUS
-        bw = A + w0 + 2 * PAD
-        bh = h0 + 2 * PAD
-        pw = panel.win
-        sw = self.win.winfo_screenwidth()
-        sh = self.win.winfo_screenheight()
-        side = "left"  # 箭头在气泡左侧 => 气泡位于面板右侧
-        x = pw.winfo_rootx() + pw.winfo_width() + GAP
-        if x + bw > sw:
-            side = "right"
-            x = max(0, pw.winfo_rootx() - GAP - bw)
-        row_cy = ((anchor[1] + anchor[3]) / 2) if anchor else pw.winfo_rooty() + 80
-        y = int(row_cy - bh / 2)
-        y = max(4, min(y, sh - bh - 4))
-        ah = self.ARROW_HALF
-        ay = int(row_cy - y)
-        ay = max(R + ah + 2, min(ay, bh - R - ah - 2))
-        self._side = side
-        self._arrow_y = ay
+        btn("回贴", self._paste_this)
+        btn("复制", self._copy)
+        if self.cat == "image":
+            btn("钉图", self._pin_it)
+        if self.cat == "file":
+            btn("打开", self._open_file)
+        if self._urls:
+            btn("打开链接", lambda: self._open_url(self._urls[0]))
+        btn("取消钉住" if self.row["pinned"] else "钉住", self._toggle_pin)
+        btn("导出…", self._save_as)
+        btn("删除", self._delete, fg=danger)
 
-        self._bg_photo = self._bubble_bg(bw, bh, side, ay)
-        self.canvas = tk.Canvas(self.win, width=bw, height=bh,
-                                bg=panel.TRANS_COLOR, highlightthickness=0, bd=0)
-        self.canvas.pack()
-        self.canvas.bind("<MouseWheel>", self._popup_wheel)
-        self.canvas.create_image(0, 0, image=self._bg_photo, anchor="nw")
-        cx = A + PAD if side == "left" else PAD
-        outer.place(x=cx, y=PAD, width=w0, height=h0)
-        outer.lift()
-        self.win.geometry(f"{bw}x{bh}+{x}+{y}")
+    def _toggle_pin(self):
+        row = self.row
+        if row is None:
+            return
+        self.panel.db.set_pinned(row["id"], not row["pinned"])
+        self.panel.status_var.set(
+            f"#{row['id']} {'已取消钉住' if row['pinned'] else '已钉住（不可清除）'}")
+        self.panel.refresh()
+        self.show(row["id"], immediate=True)
+
+    def _delete(self):
+        row = self.row
+        if row is None:
+            return
+        if row["pinned"]:
+            self.panel.status_var.set(f"#{row['id']} 已钉住，不可删除；请先取消钉住")
+            return
+        self.panel.db.delete(row["id"])
+        self.panel.status_var.set(f"#{row['id']} 已删除")
+        self._cur_key = None
+        self.panel.refresh()
+
+    def _close_menu(self):
+        menu, self._flat_menu = self._flat_menu, None
+        self._in_menu = False
+        if menu is not None:
+            try:
+                menu.close()
+            except Exception:
+                pass
 
     # ---------- 正文构建 ----------
     def _build_image_body(self, outer, row, tk):
         from PIL import Image, ImageTk
         cache = self.panel._preview_cache
-        key = (row["id"], self.IMG_MAX)
+        d = self.panel._dpi
+        img_max = (int(self.IMG_MAX_BASE[0] * d), int(self.IMG_MAX_BASE[1] * d))
+        key = (row["id"], img_max)
         photo = cache.get(key)
         if photo is None:
             img = Image.open(io.BytesIO(row["image"]))
-            img.thumbnail(self.IMG_MAX)
+            img.thumbnail(img_max)
             photo = ImageTk.PhotoImage(img)
             if len(cache) > 8:
                 cache.pop(next(iter(cache)))
             cache[key] = photo
         self._photo = photo
-        self._body = tk.Label(outer, image=photo, bg=self.BG, cursor="fleur")
-        self._body.pack(padx=6, pady=6)
-        self._body.bind("<ButtonPress-1>", self._press)
-        self._body.bind("<B1-Motion>", self._move)
+        self._body = tk.Label(outer, image=photo, bg=self.BG, cursor="hand2")
+        self._body.pack(expand=True, padx=6, pady=6)
         self._body.bind("<Double-Button-1>", lambda e: self._paste_this())
-        self._body.bind("<MouseWheel>", self._popup_wheel)
+        self._body.bind("<MouseWheel>", self._on_wheel)
 
     def _build_text_body(self, outer, row, tk):
         T = self.T
@@ -2705,14 +2641,12 @@ class HoverPopup:
                              undo=False, autoseparators=False,
                              exportselection=0)
         self._body.insert("1.0", content)
-        shown = content
         if truncated:
             notice = (f"\n────\n… 已截断，共 {len(full_text)} 字符，"
                       f"仅显示前 {self.TEXT_MAX}")
             start = self._body.index("end-1c")
             self._body.insert("end", notice)
             self._body.tag_add("dim", start, "end-1c")
-            shown = content + notice
         self._body.tag_configure("dim", foreground=T["label3"])
         # 只读但可选中：保持 normal 才能鼠标拖选/建立 sel 标签，
         # 通过拦截按键阻止编辑（复制走右键菜单或 Ctrl+C）。
@@ -2720,16 +2654,12 @@ class HoverPopup:
         # 也不会因外部剪贴板变动收到"选区丢失"而被清空。
         self._body.bind("<Key>", self._readonly_key)
         self._body.bind("<Return>", self._paste_key)
-        self._body.bind("<MouseWheel>", self._popup_wheel)
-        self._body.pack(padx=6, pady=6)
+        self._body.bind("<MouseWheel>", self._on_wheel)
+        # 详情区高度固定：Text 直接撑满可用空间，超长内容滚轮滚动
+        self._body.pack(fill="both", expand=True, padx=2, pady=2)
         if is_code:
             self._highlight_code(content)
         self._linkify(content)
-        # 高度按换行后的实际显示行数自适应（长单行折行也能撑开）。
-        # Text.count(-displaylines) 需控件真实映射绘制后才准确，
-        # 浮窗构建阶段尚未显示，故用字体度量离线估算。
-        nlines = self._estimate_display_lines(shown, width, mono=is_code)
-        self._body.configure(height=max(1, min(nlines, 18)))
 
     def _build_file_body(self, outer, row, tk):
         T = self.T
@@ -2745,8 +2675,8 @@ class HoverPopup:
                      bg=self.BG, fg=T["label3"],
                      font=("Microsoft YaHei UI", 9),
                      anchor="w").pack(fill="x", padx=6, pady=(0, 4))
-        body.pack(padx=6, pady=4, fill="x")
-        body.bind("<MouseWheel>", self._popup_wheel)
+        body.pack(fill="both", expand=True, padx=2, pady=2)
+        body.bind("<MouseWheel>", self._on_wheel)
 
     def _file_row(self, parent, tk, path, T):
         exists = os.path.exists(path)
@@ -2761,7 +2691,7 @@ class HoverPopup:
         nl = tk.Label(fr,
                       text=self.panel._fit_text(
                           name, ("Microsoft YaHei UI", 10),
-                          int(240 * self.panel._dpi)),
+                          int(260 * self.panel._dpi)),
                       bg=self.BG, fg=T["label"] if exists else T["label3"],
                       font=("Microsoft YaHei UI", 10), anchor="w")
         nl.pack(side="left", fill="x", expand=True, pady=2)
@@ -2780,7 +2710,7 @@ class HoverPopup:
         for w in (fr, il, nl):
             w.bind("<Double-Button-1>", lambda e, p=path: self._open_path(p))
             w.bind("<Button-3>", lambda e, p=path: self._file_menu(p, e))
-            w.bind("<MouseWheel>", self._popup_wheel)
+            w.bind("<MouseWheel>", self._on_wheel)
 
     def _file_icon(self, path, is_dir, exists):
         from PIL import ImageTk
@@ -2930,7 +2860,7 @@ class HoverPopup:
             traceback.print_exc()
 
     # ---------- 滚轮 / 回贴 ----------
-    def _popup_wheel(self, e):
+    def _on_wheel(self, e):
         try:
             body = self._body
             if body is not None and body.winfo_class() == "Text":
@@ -2940,15 +2870,17 @@ class HoverPopup:
         return "break"
 
     def _paste_key(self, e):
-        self._paste_this()
+        if self.row is not None:
+            self._paste_this()
         return "break"
 
     def _paste_this(self):
+        if self.row is None:
+            return
         try:
             panel = self.panel
             full = self.row
             prev = panel._prev_hwnd
-            panel._close_hover()
             panel.hide()
             threading.Thread(target=panel._do_paste_back, args=(full, prev),
                              daemon=True).start()
@@ -2991,97 +2923,12 @@ class HoverPopup:
                   ("回贴  (Enter)", self._paste_this), None,
                   ("导出…", self._save_as)]
         self._in_menu = True
-        self._flat_menu = FlatMenu(self.panel.tk, self.win, items,
+        self._flat_menu = FlatMenu(self.panel.tk, self.panel.win, items,
                                    theme=self.panel._theme()[0])
         self._flat_menu.popup(e.x_root, e.y_root, on_close=self._menu_closed)
         return "break"
 
-    def _bubble_bg(self, wb, hb, side, ay):
-        """圆角气泡 + 侧边小箭头一体绘制：外层描边色，内层卡片填充色。
-
-        与面板窗口同因：-transparentcolor 只认精确键色、无半透明，
-        超采样缩放会在边缘留下半透明像素，合成到键色画布上即一圈黑边。
-        故按最终尺寸纯 RGB 硬边缘绘制，透明区=键色。
-        """
-        from PIL import Image, ImageDraw, ImageTk
-        key = self.panel._hex_to_rgb(self.panel.TRANS_COLOR)
-        A = self.ARROW_D
-        AH = self.ARROW_HALF
-        B = self.BORDER_W
-        R = self.RADIUS
-        W, H = wb, hb
-        ayc = ay
-        bc = self.panel._hex_to_rgb(self.BORDER)
-        wc = self.panel._hex_to_rgb(self.BG)
-        im = Image.new("RGB", (W, H), key)
-        dr = ImageDraw.Draw(im)
-        if side == "left":
-            dr.rounded_rectangle([A, 0, W - 1, H - 1], radius=R, fill=bc)
-            dr.polygon([(0, ayc), (A + B, ayc - AH), (A + B, ayc + AH)], fill=bc)
-            dr.rounded_rectangle([A + B, B, W - 1 - B, H - 1 - B],
-                                 radius=max(2, R - B), fill=wc)
-            dr.polygon([(B + 1, ayc), (A + B, ayc - AH + B + 2),
-                        (A + B, ayc + AH - B - 2)], fill=wc)
-        else:
-            dr.rounded_rectangle([0, 0, W - 1 - A, H - 1], radius=R, fill=bc)
-            dr.polygon([(W - 1, ayc), (W - 1 - A - B, ayc - AH),
-                        (W - 1 - A - B, ayc + AH)], fill=bc)
-            dr.rounded_rectangle([B, B, W - 1 - A - B, H - 1 - B],
-                                 radius=max(2, R - B), fill=wc)
-            dr.polygon([(W - 2 - B, ayc), (W - 1 - A - B, ayc - AH + B + 2),
-                        (W - 1 - A - B, ayc + AH - B - 2)], fill=wc)
-        return ImageTk.PhotoImage(im)
-
     # ---------- 交互 ----------
-    _measure_font = None
-    _measure_font_mono = None
-
-    @classmethod
-    def _estimate_display_lines(cls, text, width_chars, mono=False):
-        """按字体度量估算 word-wrap 后的显示行数（近似 Tk wrap=word）。
-
-        规则：按空白切词贪心填行；超宽 token（如连续中文）按字符折行；
-        空段落记 1 行。与 Text.count(-displaylines) 的实测误差在 ±1 行内。
-        """
-        try:
-            from tkinter import font as tkfont
-            if mono:
-                if cls._measure_font_mono is None:
-                    cls._measure_font_mono = tkfont.Font(family="Consolas",
-                                                         size=10)
-                fnt = cls._measure_font_mono
-            else:
-                if cls._measure_font is None:
-                    cls._measure_font = tkfont.Font(family="Microsoft YaHei UI",
-                                                    size=10)
-                fnt = cls._measure_font
-            budget = max(40, width_chars * fnt.measure("0"))
-            total = 0
-            for para in text.split("\n"):
-                if not para.strip():
-                    total += 1
-                    continue
-                lines, cur = 1, 0
-                for tok in re.findall(r"\S+|\s+", para):
-                    wpx = fnt.measure(tok)
-                    if wpx <= budget:
-                        if cur + wpx > budget and cur > 0:
-                            lines += 1
-                            cur = 0 if tok.isspace() else wpx
-                        else:
-                            cur += wpx
-                    else:
-                        for ch in tok:  # 超宽 token 按字符折行（CJK 场景）
-                            cw = fnt.measure(ch)
-                            if cur + cw > budget and cur > 0:
-                                lines += 1
-                                cur = 0
-                            cur += cw
-                total += lines
-            return max(1, total)
-        except Exception:
-            return text.count("\n") + 1
-
     def _readonly_key(self, e):
         # 允许复制/全选/导航/Esc，其余按键拦截以保持只读且可选中
         if (e.state & 0x4) and e.keysym.lower() in ("c", "a"):
@@ -3090,24 +2937,6 @@ class HoverPopup:
                         "Prior", "Next", "Tab", "Escape"):
             return None
         return "break"
-
-    def contains_point(self, x, y):
-        try:
-            if not self.win.winfo_viewable():
-                return False
-            x0, y0 = self.win.winfo_rootx(), self.win.winfo_rooty()
-            return (x0 - 4 <= x <= x0 + self.win.winfo_width() + 4 and
-                    y0 - 4 <= y <= y0 + self.win.winfo_height() + 4)
-        except Exception:
-            return False
-
-    def _press(self, e):
-        self._drag = (e.x_root - self.win.winfo_x(), e.y_root - self.win.winfo_y())
-
-    def _move(self, e):
-        if self._drag:
-            self.win.geometry(
-                f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
 
     def _menu(self, e):
         if self.cat == "image":
@@ -3129,7 +2958,7 @@ class HoverPopup:
                       ("回贴  (Enter)", self._paste_this), None,
                       ("导出…", self._save_as)]
         self._in_menu = True
-        self._flat_menu = FlatMenu(self.panel.tk, self.win, items,
+        self._flat_menu = FlatMenu(self.panel.tk, self.panel.win, items,
                                    theme=self.panel._theme()[0])
         self._flat_menu.popup(e.x_root, e.y_root, on_close=self._menu_closed)
         return "break"  # 阻断 Text 类绑定，保护当前选区
@@ -3181,7 +3010,7 @@ class HoverPopup:
         except Exception:
             sel = ""
         if not sel:
-            self.panel.status_var.set("浮窗中无选中文本")
+            self.panel.status_var.set("预览区无选中文本")
             return
         try:
             # 抑制路径：复制选中只写剪贴板，不产生历史记录
@@ -3195,8 +3024,8 @@ class HoverPopup:
     def _pin_it(self):
         try:
             png = self.row["image"]
-            x, y = self.win.winfo_rootx(), self.win.winfo_rooty()
-            self.panel._close_hover()
+            x = self.panel.win.winfo_rootx() + self.panel.win.winfo_width() // 2
+            y = self.panel.win.winfo_rooty() + 80
             self.ui._pins.append(PinWindow(self.ui, png, (x, y)))
         except Exception:
             traceback.print_exc()
@@ -3206,13 +3035,13 @@ class HoverPopup:
         row = self.row
         if row["kind"] == "image":
             path = filedialog.asksaveasfilename(
-                parent=self.win, title="保存图片", defaultextension=".png",
+                parent=self.panel.win, title="保存图片", defaultextension=".png",
                 initialfile=f"clip_{row['id']}.png",
                 filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")])
             data = row["image"]
         else:
             path = filedialog.asksaveasfilename(
-                parent=self.win, title="导出文本", defaultextension=".txt",
+                parent=self.panel.win, title="导出文本", defaultextension=".txt",
                 initialfile=f"clip_{row['id']}.txt",
                 filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
             data = (row["content"] or "").encode("utf-8")
@@ -3224,12 +3053,6 @@ class HoverPopup:
             self.panel.status_var.set(f"已导出 {os.path.basename(path)}")
         except OSError:
             traceback.print_exc()
-
-    def destroy(self):
-        try:
-            self.win.destroy()
-        except Exception:
-            pass
 
 
 class PinWindow:
