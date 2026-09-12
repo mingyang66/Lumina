@@ -1730,45 +1730,33 @@ class HistoryPanel:
                                     highlightthickness=0, bd=0)
         self._rounded_bg = self._make_rounded_bg(self._cw, self._ch)
         self._bg_canvas.create_image(0, 0, image=self._rounded_bg, anchor="nw")
+        self._bg_canvas.bind("<ButtonPress-1>", self._hdr_press)
+        self._bg_canvas.bind("<B1-Motion>", self._hdr_move)
 
         T, dark = self._theme()
         win_bg = T["window_bg"]
         # 内容容器不透明（避免缝隙透出桌面）；其内缩大于圆角背景的角排除区，故不产生直角溢出
         self._cmp_root = tk.Frame(self.win, bg=win_bg)
 
-        # ---------- 标题栏（可拖动） ----------
+        # ---------- 顶栏：拖动 grip + 搜索 + 截图 + 关闭 ----------
         header = tk.Frame(self._cmp_root, bg=win_bg)
-        header.pack(fill="x", padx=14, pady=(12, 4))
-        title = tk.Label(header, text="剪贴板", bg=win_bg, fg=T["label"],
-                         font=self._font(13, "bold"))
-        title.pack(side="left")
+        header.pack(fill="x", padx=14, pady=(10, 6))
         self._hdr_icons = self._make_header_icons(dpi, T["label2"])
+        grip = tk.Label(header, image=self._hdr_icons["grip"], bg=win_bg,
+                        cursor="fleur")
+        grip.image = self._hdr_icons["grip"]
+        grip.pack(side="left", padx=(0, 8))
         close_b = self._icon_button(header, self._hdr_icons["close"], self.hide,
                                     win_bg, T["fill_hover"])
         close_b.pack(side="right")
         self._shot_btn_c = self._icon_button(
             header, self._hdr_icons["shot"],
             lambda: self._toggle_shot_menu(self._shot_btn_c), win_bg, T["fill_hover"])
-        self._shot_btn_c.pack(side="right", padx=(0, 2))
-        spacer = tk.Frame(header, bg=win_bg)
-        spacer.pack(side="left", fill="x", expand=True)
-        for wgt in (header, title, spacer):
-            wgt.bind("<ButtonPress-1>", self._hdr_press)
-            wgt.bind("<B1-Motion>", self._hdr_move)
+        self._shot_btn_c.pack(side="right", padx=(0, 4))
 
-        # ---------- 双栏布局：左列表 / 右详情（master-detail） ----------
-        body_split = tk.Frame(self._cmp_root, bg=win_bg)
-        body_split.pack(fill="both", expand=True, padx=14, pady=(2, 0))
-        left = tk.Frame(body_split, bg=win_bg)
-        left.pack(side="left", fill="both", expand=True)
-        sep = tk.Frame(body_split, bg=T["hairline"], width=1)
-        sep.pack(side="left", fill="y", padx=10, pady=2)
-        self._detail = DetailPane(self, body_split, int(round(400 * dpi)))
-
-        # ---------- 胶囊搜索框 ----------
-        search_wrap = tk.Frame(left, bg=win_bg)
-        search_wrap.pack(fill="x", pady=(0, 8))
-        self._sh_h = int(round(34 * dpi))
+        search_wrap = tk.Frame(header, bg=win_bg)
+        search_wrap.pack(side="left", fill="x", expand=True)
+        self._sh_h = int(round(30 * dpi))
         self._search_canvas = tk.Canvas(search_wrap, height=self._sh_h, bg=win_bg,
                                         highlightthickness=0, bd=0)
         self._search_canvas.pack(fill="x")
@@ -1783,11 +1771,25 @@ class HistoryPanel:
         self._search_pill_photo = None
         self._search_pill_size = None
         self._search_canvas.bind("<Configure>", lambda e: self._layout_search())
+        self._search_canvas.bind("<ButtonPress-1>", self._search_press)
+        self._search_canvas.bind("<B1-Motion>", self._hdr_move)
+        for wgt in (header, grip):
+            wgt.bind("<ButtonPress-1>", self._hdr_press)
+            wgt.bind("<B1-Motion>", self._hdr_move)
 
-        # ---------- 过滤胶囊 pills（Canvas 自绘） ----------
+        # ---------- 双栏布局：左列表 / 右详情（master-detail） ----------
+        body_split = tk.Frame(self._cmp_root, bg=win_bg)
+        body_split.pack(fill="both", expand=True, padx=14, pady=(2, 0))
+        left = tk.Frame(body_split, bg=win_bg)
+        left.pack(side="left", fill="both", expand=True)
+        sep = tk.Frame(body_split, bg=T["hairline"], width=1)
+        sep.pack(side="left", fill="y", padx=10, pady=2)
+        self._detail = DetailPane(self, body_split, int(round(400 * dpi)))
+
+        # ---------- 过滤胶囊 pills（Canvas 自绘，紧凑） ----------
         chip_wrap = tk.Frame(left, bg=win_bg)
-        chip_wrap.pack(fill="x", pady=(0, 8))
-        self._chip_h = int(round(28 * dpi))
+        chip_wrap.pack(fill="x", pady=(0, 6))
+        self._chip_h = int(round(24 * dpi))
         self._chip_canvas = tk.Canvas(chip_wrap, height=self._chip_h, bg=win_bg,
                                       highlightthickness=0, bd=0)
         self._chip_canvas.pack(fill="x")
@@ -1811,20 +1813,15 @@ class HistoryPanel:
         self.cards_canvas.bind("<MouseWheel>", self._on_canvas_wheel)
         self.cards_canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # ---------- 底部：动作图标 + 提示 + 状态 ----------
+        # ---------- 底部：细状态行（行级动作由详情区动作栏承担） ----------
         footer = tk.Frame(self._cmp_root, bg=win_bg)
-        footer.pack(fill="x", padx=14, pady=(2, 10))
-        self._ficons = self._make_footer_icons()
-        for key, cmd in (("paste", self.paste_back), ("copy", self.copy_only),
-                          ("pin", self.toggle_pin), ("trash", self.delete_selected)):
-            b = self._icon_button(footer, self._ficons[key], cmd, win_bg,
-                                  T["fill_hover"])
-            b.pack(side="left", padx=(0, 2))
+        footer.pack(fill="x", padx=14, pady=(0, 6))
+        tk.Label(footer, bg=win_bg, fg=T["label3"], font=self._font(8),
+                 text="Enter 回贴 · Ctrl+C 复制 · Ctrl+P 钉住 · Del 删除 · Ctrl+1-9 快速"
+                 ).pack(side="left")
         self._cmp_status = tk.Label(footer, textvariable=self.status_var,
                                     bg=win_bg, fg=T["label2"], font=self._font(8))
         self._cmp_status.pack(side="right")
-        tk.Label(footer, bg=win_bg, fg=T["label3"], font=self._font(8),
-                 text="Enter 回贴 · Ctrl+1-9 快速").pack(side="right", padx=(0, 8))
 
     # ---------- Apple 风格控件绘制助手 ----------
     def _font_path(self):
@@ -1878,8 +1875,15 @@ class HistoryPanel:
                      (s * 0.61, s * 0.37)], fill=c, width=w, joint="curve")
             dr.ellipse([s * 0.43, s * 0.46, s * 0.57, s * 0.60], outline=c, width=w)
 
+        def grip(dr, s, c, w):
+            r = max(1.5, s * 0.055)
+            for gx in (s * 0.38, s * 0.62):
+                for gy in (s * 0.28, s * 0.50, s * 0.72):
+                    dr.ellipse([gx - r, gy - r, gx + r, gy + r], fill=c)
+
         return {"close": self._mono_icon(close, box, color_hex),
-                "shot": self._mono_icon(shot, box, color_hex)}
+                "shot": self._mono_icon(shot, box, color_hex),
+                "grip": self._mono_icon(grip, box, color_hex)}
 
     def _make_search_icon(self, dpi, color_hex):
         from PIL import Image, ImageDraw, ImageTk
@@ -1932,9 +1936,9 @@ class HistoryPanel:
     def _make_chip_photo(self, label, h, sel, T):
         from PIL import Image, ImageDraw, ImageTk
         ss = 2
-        fsize = max(9, int(round(10 * self._dpi)))
+        fsize = max(8, int(round(9 * self._dpi)))
         fnt = self._load_font(fsize * ss)
-        pad_x = int(round(12 * self._dpi)) * ss
+        pad_x = int(round(10 * self._dpi)) * ss
         probe = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
         bb = probe.textbbox((0, 0), label, font=fnt)
         tw, th = bb[2] - bb[0], bb[3] - bb[1]
@@ -2000,71 +2004,6 @@ class HistoryPanel:
                                              fill=win_bg, outline=hair, width=1)
         return ImageTk.PhotoImage(im)
 
-    def _make_footer_icons(self):
-        from PIL import Image, ImageDraw, ImageTk
-        size = max(20, int(round(26 * self._dpi)))
-        ss = 2
-        col = self._hex_to_rgb(self._c("label2")) + (255,)
-        sheet = self._hex_to_rgb(self._c("window_bg")) + (255,)
-
-        def make(fn):
-            s = size * ss
-            im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-            fn(ImageDraw.Draw(im), s, col)
-            return ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
-
-        def paste(dr, s, c):  # ↩ 回贴
-            w = max(2, s // 10)
-            dr.line([(s * 0.22, s * 0.28), (s * 0.22, s * 0.72)], fill=c, width=w)
-            dr.line([(s * 0.80, s * 0.50), (s * 0.40, s * 0.50)], fill=c, width=w)
-            dr.polygon([(s * 0.46, s * 0.34), (s * 0.46, s * 0.66),
-                        (s * 0.26, s * 0.50)], fill=c)
-
-        def copy(dr, s, c):  # 两张叠放的纸
-            w = max(2, s // 12)
-            dr.rounded_rectangle([s * 0.36, s * 0.18, s * 0.82, s * 0.64],
-                                 radius=s * 0.06, outline=c, width=w)
-            dr.rounded_rectangle([s * 0.18, s * 0.36, s * 0.64, s * 0.82],
-                                 radius=s * 0.06, fill=sheet,
-                                 outline=c, width=w)
-
-        def pin_icon(dr, s, c):  # 📌 实心字形，缺字体回退简笔钉
-            sym = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
-                               "Fonts", "seguisym.ttf")
-            drawn = False
-            if os.path.exists(sym):
-                try:
-                    from PIL import ImageFont
-                    fnt = ImageFont.truetype(sym, int(s * 0.76))
-                    bb = dr.textbbox((0, 0), "\U0001F4CC", font=fnt)
-                    if bb[2] - bb[0] > 4:
-                        dr.text(((s - bb[2] + bb[0]) / 2 - bb[0],
-                                 (s - bb[3] + bb[1]) / 2 - bb[1]),
-                                "\U0001F4CC", font=fnt, fill=c)
-                        drawn = True
-                except Exception:
-                    drawn = False
-            if not drawn:
-                cx = s / 2
-                r = s * 0.18
-                dr.ellipse([cx - r, s * 0.20, cx + r, s * 0.20 + 2 * r], fill=c)
-                dr.rectangle([cx - s * 0.05, s * 0.55, cx + s * 0.05, s * 0.72],
-                             fill=c)
-                dr.line([(cx, s * 0.72), (cx, s * 0.86)], fill=c,
-                        width=max(2, s // 12))
-
-        def trash(dr, s, c):  # 垃圾桶
-            w = max(2, s // 12)
-            dr.line([(s * 0.24, s * 0.30), (s * 0.76, s * 0.30)], fill=c, width=w)
-            dr.line([(s * 0.42, s * 0.30), (s * 0.42, s * 0.20)], fill=c, width=w)
-            dr.line([(s * 0.58, s * 0.30), (s * 0.58, s * 0.20)], fill=c, width=w)
-            dr.line([(s * 0.42, s * 0.20), (s * 0.58, s * 0.20)], fill=c, width=w)
-            dr.rounded_rectangle([s * 0.30, s * 0.38, s * 0.70, s * 0.82],
-                                 radius=s * 0.05, outline=c, width=w)
-
-        return {"paste": make(paste), "copy": make(copy),
-                "pin": make(pin_icon), "trash": make(trash)}
-
     def _set_filter(self, key):
         self._filter = key
         self._style_chips()
@@ -2077,6 +2016,10 @@ class HistoryPanel:
     def _hdr_press(self, e):
         self._drag_off = (e.x_root - self.win.winfo_x(),
                           e.y_root - self.win.winfo_y())
+
+    def _search_press(self, e):
+        self.search_entry_c.focus_set()
+        self._hdr_press(e)
 
     def _hdr_move(self, e):
         if self._drag_off:
