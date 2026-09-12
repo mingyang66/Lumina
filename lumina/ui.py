@@ -785,7 +785,8 @@ class HistoryPanel:
         self._preview_cache = {}
         self._fileicon_cache = {}
         self._drag_off = None
-        self._shot_anchor = None
+        self._maxed = False
+        self._normal_geom = None
         self._sel_id = None
         self._hover_id = None
         self._row_rects = []
@@ -811,11 +812,16 @@ class HistoryPanel:
         self.status_var = tk.StringVar(value="就绪")
         self._hide_on_capture = tk.BooleanVar(
             value=bool(self.ui.config.get("hide_panel_on_capture", True)))
-        self._shot_popup = None
-        self._shot_open = False
-        self._shot_focus_check = None
+        self._popup_menu = None
+        self._popup_open = False
+        self._popup_focus_check = None
+        self._menu_anchor = None
+        self._menu_kind = None
+        self._search_active = False
+        self._search_focus_check = None
 
         self.win.bind("<F5>", lambda e: self.refresh())
+        self.win.bind("<F11>", self._toggle_maximize)
         self.win.bind("<Escape>", lambda e: self.hide())
         self.win.bind("<Delete>", lambda e: self.delete_selected())
         self.win.bind("<Control-p>", lambda e: self.toggle_pin())
@@ -877,7 +883,8 @@ class HistoryPanel:
             return False
         root, tk, ui = self._root, self.tk, self.ui
         sel = self._sel_id
-        self._close_shot_menu()
+        maxed = self._maxed
+        self._close_popup_menu()
         try:
             self.win.destroy()
         except Exception:
@@ -888,6 +895,7 @@ class HistoryPanel:
             cache.clear()
         self.__init__(root, tk, ui)
         self._sel_id = sel
+        self._maxed = maxed
         return True
 
     # ---------- 分类彩色图标 tile（SF Symbols 风格） ----------
@@ -1122,15 +1130,17 @@ class HistoryPanel:
     def show(self, prev_hwnd=None):
         self._sync_theme()
         self._prev_hwnd = prev_hwnd
-        self.apply_mode()  # 重设边框/尺寸/位置（光标附近）并刷新
+        self.apply_mode()  # 重设边框/尺寸/位置（光标附近或全屏态）并刷新
         self.win.deiconify()
         self.win.lift()
         self.win.focus_force()
-        self.search_entry_c.focus_set()
+        if self.search_var.get().strip():
+            self._activate_search()
         self.ui.panel_visible = True
 
     def hide(self):
-        self._close_shot_menu()
+        self._close_popup_menu()
+        self._deactivate_search(refocus=False)
         if self._detail is not None:
             self._detail._close_menu()
         try:
@@ -1139,26 +1149,22 @@ class HistoryPanel:
             pass
         self.ui.panel_visible = False
 
-    # ---------- ✂ 截图下拉弹窗 ----------
+    # ---------- 顶栏下拉弹窗（截图 / 设置） ----------
     # 不用 Tk 原生菜单：Windows 下 menu.post 会进入模态跟踪循环，
     # 在其 Unmap 回调里重新 post 会让 UI 线程死锁，且无法自动化验证。
     # 自绘 overrideredirect 弹窗行为完全可控：勾选项点击不收起，Esc/失焦收起。
-    def _toggle_shot_menu(self, anchor=None):
-        self._shot_anchor = anchor
-        if self._shot_open:
-            self._close_shot_menu()
-        else:
-            self._open_shot_menu()
+    def _toggle_popup_menu(self, kind, anchor):
+        if self._popup_open and self._menu_kind == kind:
+            self._close_popup_menu()
+            return
+        self._close_popup_menu()
+        self._menu_kind = kind
+        self._menu_anchor = anchor
+        self._open_popup_menu(kind)
 
-    def _open_shot_menu(self):
+    def _open_popup_menu(self, kind):
         tk = self.tk
         T, dark = self._theme()
-        if self._shot_popup is not None:
-            try:
-                self._shot_popup.destroy()
-            except Exception:
-                pass
-            self._shot_popup = None
         pop = tk.Toplevel(self.win)
         pop.overrideredirect(True)
         pop.attributes("-topmost", True)
@@ -1170,71 +1176,101 @@ class HistoryPanel:
                       bg=T["card_bg"], fg=T["label"],
                       activebackground=T["fill_hover"], activeforeground=T["label"],
                       highlightthickness=0, padx=14, pady=6)
-        tk.Button(frame, text="全屏截图",
-                  command=lambda: self._shot_action(self.capture_fullscreen),
-                  **btn_kw).pack(fill="x", padx=4, pady=(4, 1))
-        tk.Button(frame, text="区域截图",
-                  command=lambda: self._shot_action(self.capture_region),
-                  **btn_kw).pack(fill="x", padx=4, pady=1)
-        tk.Frame(frame, bg=T["separator"], height=1).pack(fill="x", padx=6, pady=4)
-        tk.Checkbutton(frame, text="隐藏此窗口", variable=self._hide_on_capture,
-                       command=self._hide_on_capture_changed, anchor="w", font=f,
-                       bg=T["card_bg"], fg=T["label"], selectcolor=T["field"],
-                       activebackground=T["card_bg"], activeforeground=T["label"],
-                       highlightthickness=0, cursor="hand2",
-                       ).pack(fill="x", padx=6, pady=(0, 5))
-        pop.bind("<Escape>", lambda e: self._close_shot_menu())
-        pop.bind("<FocusOut>", self._on_shot_focus_out)
-        self._shot_popup = pop
-        btn = self._shot_anchor or self._shot_btn_c
+        if kind == "shot":
+            tk.Button(frame, text="全屏截图",
+                      command=lambda: self._popup_action(self.capture_fullscreen),
+                      **btn_kw).pack(fill="x", padx=4, pady=(4, 1))
+            tk.Button(frame, text="区域截图",
+                      command=lambda: self._popup_action(self.capture_region),
+                      **btn_kw).pack(fill="x", padx=4, pady=1)
+            tk.Frame(frame, bg=T["separator"], height=1).pack(
+                fill="x", padx=6, pady=4)
+            tk.Checkbutton(frame, text="截图时隐藏此窗口",
+                           variable=self._hide_on_capture,
+                           command=self._hide_on_capture_changed, anchor="w",
+                           font=f, bg=T["card_bg"], fg=T["label"],
+                           selectcolor=T["field"],
+                           activebackground=T["card_bg"],
+                           activeforeground=T["label"],
+                           highlightthickness=0, cursor="hand2",
+                           ).pack(fill="x", padx=6, pady=(0, 4))
+        else:
+            tk.Button(frame, text="刷新  (F5)",
+                      command=lambda: self._popup_action(self.refresh),
+                      **btn_kw).pack(fill="x", padx=4, pady=(4, 1))
+            tk.Button(frame, text="清理过期记录",
+                      command=lambda: self._popup_action(self._cleanup_now),
+                      **btn_kw).pack(fill="x", padx=4, pady=(1, 4))
+        pop.bind("<Escape>", lambda e: self._close_popup_menu())
+        pop.bind("<FocusOut>", self._on_popup_focus_out)
+        self._popup_menu = pop
+        btn = self._menu_anchor
         btn.update_idletasks()
-        self._shot_popup.geometry(
-            f"+{btn.winfo_rootx()}+{btn.winfo_rooty() + btn.winfo_height() + 4}")
-        self._shot_popup.deiconify()
-        self._shot_popup.lift()
-        self._shot_popup.focus_force()
-        self._shot_open = True
+        pop.update_idletasks()
+        x = btn.winfo_rootx()
+        y = btn.winfo_rooty() + btn.winfo_height() + 4
+        sw = self.win.winfo_screenwidth()
+        if x + pop.winfo_reqwidth() > sw - 8:
+            x = max(0, sw - 8 - pop.winfo_reqwidth())
+        pop.geometry(f"+{x}+{y}")
+        pop.deiconify()
+        pop.lift()
+        pop.focus_force()
+        self._popup_open = True
 
-    def _shot_action(self, fn):
-        self._close_shot_menu()
+    def _popup_action(self, fn):
+        self._close_popup_menu()
         fn()
 
-    def _close_shot_menu(self):
-        self._shot_open = False
-        pop = self._shot_popup
-        self._shot_popup = None
+    def _cleanup_now(self):
+        try:
+            deleted = self.db.cleanup(
+                self.ui.config.get("retention_days", 30),
+                self.ui.config.get("max_rows", 5000))
+        except Exception:
+            traceback.print_exc()
+            self.status_var.set("清理失败")
+            return
+        self.refresh()
+        self.status_var.set(f"已清理 {deleted} 条过期记录（钉住保留）")
+
+    def _close_popup_menu(self):
+        self._popup_open = False
+        pop = self._popup_menu
+        self._popup_menu = None
         if pop is not None:
             try:
                 pop.destroy()
             except Exception:
                 pass
 
-    def _on_shot_focus_out(self, _event):
-        if not self._shot_open or self._shot_popup is None:
+    def _on_popup_focus_out(self, _event):
+        if not self._popup_open or self._popup_menu is None:
             return
-        if self._shot_focus_check is not None:
+        if self._popup_focus_check is not None:
             try:
-                self._shot_popup.after_cancel(self._shot_focus_check)
+                self._popup_menu.after_cancel(self._popup_focus_check)
             except Exception:
                 pass
-        self._shot_focus_check = self._shot_popup.after(150, self._check_shot_focus)
+        self._popup_focus_check = self._popup_menu.after(
+            150, self._check_popup_focus)
 
-    def _check_shot_focus(self):
-        self._shot_focus_check = None
-        if not self._shot_open:
+    def _check_popup_focus(self):
+        self._popup_focus_check = None
+        if not self._popup_open:
             return
         try:
             focused = self.win.focus_get()
         except (KeyError, self.tk.TclError):
             focused = None
         if focused is None:
-            self._close_shot_menu()
+            self._close_popup_menu()
             return
         try:
-            if focused.winfo_toplevel() is not self._shot_popup:
-                self._close_shot_menu()
+            if focused.winfo_toplevel() is not self._popup_menu:
+                self._close_popup_menu()
         except Exception:
-            self._close_shot_menu()
+            self._close_popup_menu()
 
     # ---------- 截屏入口 ----------
     def _hide_on_capture_changed(self):
@@ -1729,7 +1765,8 @@ class HistoryPanel:
         self._bg_canvas = tk.Canvas(self.win, bg=self.TRANS_COLOR,
                                     highlightthickness=0, bd=0)
         self._rounded_bg = self._make_rounded_bg(self._cw, self._ch)
-        self._bg_canvas.create_image(0, 0, image=self._rounded_bg, anchor="nw")
+        self._bg_item = self._bg_canvas.create_image(
+            0, 0, image=self._rounded_bg, anchor="nw")
         self._bg_canvas.bind("<ButtonPress-1>", self._hdr_press)
         self._bg_canvas.bind("<B1-Motion>", self._hdr_move)
 
@@ -1738,27 +1775,45 @@ class HistoryPanel:
         # 内容容器不透明（避免缝隙透出桌面）；其内缩大于圆角背景的角排除区，故不产生直角溢出
         self._cmp_root = tk.Frame(self.win, bg=win_bg)
 
-        # ---------- 顶栏：拖动 grip + 搜索 + 截图 + 关闭 ----------
+        # ---------- 顶栏：搜索胶囊(左栏宽) + 动作簇 📷⚙⛶✕(详情栏宽) ----------
+        detail_w = int(round(400 * dpi))
+        self._sh_h = int(round(30 * dpi))
         header = tk.Frame(self._cmp_root, bg=win_bg)
         header.pack(fill="x", padx=14, pady=(10, 6))
         self._hdr_icons = self._make_header_icons(dpi, T["label2"])
-        grip = tk.Label(header, image=self._hdr_icons["grip"], bg=win_bg,
-                        cursor="fleur")
-        grip.image = self._hdr_icons["grip"]
-        grip.pack(side="left", padx=(0, 8))
-        close_b = self._icon_button(header, self._hdr_icons["close"], self.hide,
-                                    win_bg, T["fill_hover"])
-        close_b.pack(side="right")
-        self._shot_btn_c = self._icon_button(
-            header, self._hdr_icons["shot"],
-            lambda: self._toggle_shot_menu(self._shot_btn_c), win_bg, T["fill_hover"])
-        self._shot_btn_c.pack(side="right", padx=(0, 4))
 
-        search_wrap = tk.Frame(header, bg=win_bg)
-        search_wrap.pack(side="left", fill="x", expand=True)
-        self._sh_h = int(round(30 * dpi))
-        self._search_canvas = tk.Canvas(search_wrap, height=self._sh_h, bg=win_bg,
-                                        highlightthickness=0, bd=0)
+        # 结构化分区：左区弹性(=列表栏宽) + 21px 占位(=分隔线) + 右区固定(=详情栏宽)
+        header_left = tk.Frame(header, bg=win_bg)
+        header_left.pack(side="left", fill="both", expand=True)
+        tk.Frame(header, bg=win_bg, width=21).pack(side="left")
+        header_right = tk.Frame(header, bg=win_bg, width=detail_w)
+        header_right.pack(side="left", fill="y")
+        header_right.pack_propagate(False)
+
+        btn_pad = (max(0, (self._sh_h - int(round(24 * dpi))) // 2), 0)
+        close_b = self._icon_button(header_right, self._hdr_icons["close"],
+                                    self.hide, win_bg, T["fill_hover"])
+        close_b.pack(side="right", pady=btn_pad)
+        self._max_btn = self._icon_button(
+            header_right, self._hdr_icons["expand"], self._toggle_maximize,
+            win_bg, T["fill_hover"])
+        self._max_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
+        self._settings_btn = self._icon_button(
+            header_right, self._hdr_icons["gear"],
+            lambda: self._toggle_popup_menu("settings", self._settings_btn),
+            win_bg, T["fill_hover"])
+        self._settings_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
+        self._shot_btn = self._icon_button(
+            header_right, self._hdr_icons["shot"],
+            lambda: self._toggle_popup_menu("shot", self._shot_btn),
+            win_bg, T["fill_hover"])
+        self._shot_btn.pack(side="right", padx=(0, 6), pady=btn_pad)
+
+        # 搜索胶囊常驻左区：默认图标居中（占位态），点击后图标靠左变输入框
+        self._search_wrap = tk.Frame(header_left, bg=win_bg, height=self._sh_h)
+        self._search_wrap.pack(side="left", fill="x", expand=True)
+        self._search_canvas = tk.Canvas(self._search_wrap, height=self._sh_h,
+                                        bg=win_bg, highlightthickness=0, bd=0)
         self._search_canvas.pack(fill="x")
         self._search_icon = self._make_search_icon(dpi, T["label3"])
         self.search_entry_c = tk.Entry(self._search_canvas,
@@ -1766,16 +1821,18 @@ class HistoryPanel:
                                        bg=T["field"], fg=T["label"], bd=0,
                                        insertbackground=T["label"],
                                        highlightthickness=0, font=self._font(11))
-        self.search_entry_c.bind("<KeyRelease>", lambda e: self._debounce_refresh())
+        self.search_entry_c.bind("<KeyRelease>", self._on_search_key)
         self.search_entry_c.bind("<Return>", self._on_enter)
+        self.search_entry_c.bind("<Escape>", self._search_esc)
+        self.search_entry_c.bind("<FocusOut>", self._on_search_focus_out)
         self._search_pill_photo = None
         self._search_pill_size = None
         self._search_canvas.bind("<Configure>", lambda e: self._layout_search())
         self._search_canvas.bind("<ButtonPress-1>", self._search_press)
         self._search_canvas.bind("<B1-Motion>", self._hdr_move)
-        for wgt in (header, grip):
-            wgt.bind("<ButtonPress-1>", self._hdr_press)
-            wgt.bind("<B1-Motion>", self._hdr_move)
+
+        header.bind("<ButtonPress-1>", self._hdr_press)
+        header.bind("<B1-Motion>", self._hdr_move)
 
         # ---------- 双栏布局：左列表 / 右详情（master-detail） ----------
         body_split = tk.Frame(self._cmp_root, bg=win_bg)
@@ -1784,7 +1841,7 @@ class HistoryPanel:
         left.pack(side="left", fill="both", expand=True)
         sep = tk.Frame(body_split, bg=T["hairline"], width=1)
         sep.pack(side="left", fill="y", padx=10, pady=2)
-        self._detail = DetailPane(self, body_split, int(round(400 * dpi)))
+        self._detail = DetailPane(self, body_split, detail_w)
 
         # ---------- 过滤胶囊 pills（Canvas 自绘，紧凑） ----------
         chip_wrap = tk.Frame(left, bg=win_bg)
@@ -1875,15 +1932,36 @@ class HistoryPanel:
                      (s * 0.61, s * 0.37)], fill=c, width=w, joint="curve")
             dr.ellipse([s * 0.43, s * 0.46, s * 0.57, s * 0.60], outline=c, width=w)
 
-        def grip(dr, s, c, w):
-            r = max(1.5, s * 0.055)
-            for gx in (s * 0.38, s * 0.62):
-                for gy in (s * 0.28, s * 0.50, s * 0.72):
-                    dr.ellipse([gx - r, gy - r, gx + r, gy + r], fill=c)
+        def gear(dr, s, c, w):
+            import math
+            cx, cy = s * 0.5, s * 0.5
+            r_out, r_in = s * 0.27, s * 0.13
+            dr.ellipse([cx - r_out, cy - r_out, cx + r_out, cy + r_out],
+                       outline=c, width=w)
+            dr.ellipse([cx - r_in, cy - r_in, cx + r_in, cy + r_in],
+                       outline=c, width=max(1, w - 1))
+            for k in range(8):
+                a = math.pi * 2 * k / 8
+                dr.line([(cx + math.cos(a) * r_out * 0.9,
+                          cy + math.sin(a) * r_out * 0.9),
+                         (cx + math.cos(a) * s * 0.40,
+                          cy + math.sin(a) * s * 0.40)], fill=c, width=w)
+
+        def expand(dr, s, c, w):
+            dr.rectangle([s * 0.28, s * 0.28, s * 0.72, s * 0.72],
+                         outline=c, width=w)
+
+        def restore(dr, s, c, w):
+            dr.rectangle([s * 0.36, s * 0.24, s * 0.76, s * 0.64],
+                         outline=c, width=w)
+            dr.rectangle([s * 0.24, s * 0.36, s * 0.64, s * 0.76],
+                         outline=c, width=w)
 
         return {"close": self._mono_icon(close, box, color_hex),
                 "shot": self._mono_icon(shot, box, color_hex),
-                "grip": self._mono_icon(grip, box, color_hex)}
+                "gear": self._mono_icon(gear, box, color_hex),
+                "expand": self._mono_icon(expand, box, color_hex),
+                "restore": self._mono_icon(restore, box, color_hex)}
 
     def _make_search_icon(self, dpi, color_hex):
         from PIL import Image, ImageDraw, ImageTk
@@ -1924,14 +2002,78 @@ class HistoryPanel:
             self._search_pill_size = (w, h)
         c.delete("all")
         c.create_image(0, 0, image=self._search_pill_photo, anchor="nw")
+        if not self._search_active and not self.search_var.get():
+            # 占位态：图标居中，不映射输入框
+            c.create_image(w // 2, h // 2, image=self._search_icon,
+                           anchor="center")
+            return
         pad = int(round(9 * self._dpi))
         iw = self._search_icon.width()
         c.create_image(pad, h // 2, image=self._search_icon, anchor="w")
         ex = pad + iw + int(round(6 * self._dpi))
+        clear_w = 0
+        if self.search_var.get():
+            clear_w = int(round(18 * self._dpi))
+            item = c.create_text(w - pad - clear_w // 2, h // 2, text="✕",
+                                 fill=T["label3"], font=self._font(9))
+            c.tag_bind(item, "<Button-1>", self._search_clear)
         self.search_entry_c.configure(bg=T["field"], fg=T["label"],
                                       insertbackground=T["label"])
         c.create_window(ex, h // 2, anchor="w", window=self.search_entry_c,
-                        width=max(20, w - ex - pad), height=h - 2)
+                        width=max(20, w - ex - pad - clear_w), height=h - 2)
+
+    # ---------- 搜索激活状态机 ----------
+    def _on_search_key(self, e):
+        self._layout_search()
+        self._debounce_refresh()
+
+    def _activate_search(self):
+        if not self._search_active:
+            self._search_active = True
+            self._layout_search()
+        self.search_entry_c.focus_set()
+
+    def _deactivate_search(self, refocus=True):
+        if not self._search_active:
+            return
+        self._search_active = False
+        self._layout_search()
+        if refocus:
+            try:
+                self.win.focus_set()
+            except Exception:
+                pass
+
+    def _search_esc(self, e):
+        if self.search_var.get():
+            self.search_var.set("")
+            self._layout_search()
+            self.refresh()
+        else:
+            self._deactivate_search()
+        return "break"
+
+    def _search_clear(self, e=None):
+        self.search_var.set("")
+        self._layout_search()
+        self.refresh()
+        self.search_entry_c.focus_set()
+
+    def _on_search_focus_out(self, _event):
+        if not self._search_active or self._search_focus_check is not None:
+            return
+        self._search_focus_check = self.win.after(200, self._check_search_focus)
+
+    def _check_search_focus(self):
+        self._search_focus_check = None
+        if not self._search_active or self.search_var.get().strip():
+            return
+        try:
+            focused = self.win.focus_get()
+        except Exception:
+            focused = None
+        if focused is not self.search_entry_c:
+            self._deactivate_search(refocus=False)
 
     def _make_chip_photo(self, label, h, sel, T):
         from PIL import Image, ImageDraw, ImageTk
@@ -2018,7 +2160,7 @@ class HistoryPanel:
                           e.y_root - self.win.winfo_y())
 
     def _search_press(self, e):
-        self.search_entry_c.focus_set()
+        self._activate_search()
         self._hdr_press(e)
 
     def _hdr_move(self, e):
@@ -2124,6 +2266,45 @@ class HistoryPanel:
         return dt.strftime("%Y-%m-%d")
 
     # ---------- 窗口模式 ----------
+    # ---------- 面板全屏切换 ----------
+    @staticmethod
+    def _work_area():
+        """Windows 工作区(不含任务栏) (x, y, w, h)；失败返回 None。"""
+        try:
+            import ctypes
+            rect = (ctypes.c_long * 4)()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, rect, 0):
+                l, t, r, b = rect[0], rect[1], rect[2], rect[3]
+                if r > l and b > t:
+                    return l, t, r - l, b - t
+        except Exception:
+            pass
+        return None
+
+    def _apply_bg_size(self, w, h):
+        self._rounded_bg = self._make_rounded_bg(w, h)
+        self._bg_canvas.itemconfigure(self._bg_item, image=self._rounded_bg)
+
+    def _toggle_maximize(self, event=None):
+        if self._maxed:
+            self._maxed = False
+            geom = self._normal_geom
+            self._apply_bg_size(self._cw, self._ch)
+            self.win.geometry(geom or f"{self._cw}x{self._ch}+80+80")
+            self._max_btn.configure(image=self._hdr_icons["expand"])
+        else:
+            wa = self._work_area()
+            if wa is None:
+                x, y = 0, 0
+                w, h = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+            else:
+                x, y, w, h = wa
+            self._normal_geom = self.win.geometry()
+            self._maxed = True
+            self._apply_bg_size(w, h)
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+            self._max_btn.configure(image=self._hdr_icons["restore"])
+
     def apply_mode(self):
         self.win.overrideredirect(True)
         try:
@@ -2135,6 +2316,17 @@ class HistoryPanel:
         self._bg_canvas.pack(fill="both", expand=True)
         self._cmp_root.place(x=16, y=16, relwidth=1.0, relheight=1.0,
                              width=-32, height=-32)
+        if self._maxed:
+            wa = self._work_area()
+            if wa:
+                x, y, w, h = wa
+                self._apply_bg_size(w, h)
+                self.win.geometry(f"{w}x{h}+{x}+{y}")
+                self.win.attributes("-topmost", True)
+                self._max_btn.configure(image=self._hdr_icons["restore"])
+                self.refresh()
+                return
+            self._maxed = False
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
         w = min(self._cw, sw)
@@ -2142,8 +2334,10 @@ class HistoryPanel:
         px, py = self.win.winfo_pointerxy()
         x = min(max(px - 60, 0), max(0, sw - w))
         y = min(max(py - 24, 0), max(0, sh - h))
+        self._apply_bg_size(w, h)
         self.win.geometry(f"{w}x{h}+{x}+{y}")
         self.win.attributes("-topmost", True)
+        self._max_btn.configure(image=self._hdr_icons["expand"])
         self.refresh()
 
 
