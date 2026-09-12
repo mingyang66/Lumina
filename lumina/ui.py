@@ -720,8 +720,8 @@ class RegionSelector:
 
 
 class HistoryPanel:
-    COMPACT_W = 880
-    COMPACT_H = 640
+    COMPACT_W = 980
+    COMPACT_H = 680
     TRANS_COLOR = "#010203"
     FILTERS = (("all", "全部"), ("text", "文本"), ("code", "代码"),
                ("link", "链接"), ("image", "图片"), ("file", "文件"),
@@ -795,6 +795,8 @@ class HistoryPanel:
         self._card_w = 0
         self._row_h = 0
         self._rows_displayed = []
+        self._canvas_w = None
+        self._relayout_id = None
         self._detail = None
         self._detail_hover_id = None
         self._flat_menu = None
@@ -960,6 +962,25 @@ class HistoryPanel:
         bbox = canvas.bbox("all")
         if bbox and bbox != (0, 0, 0, 0):
             canvas.configure(scrollregion=bbox)
+        w = event.width
+        if w > 1 and self._canvas_w != w:
+            self._canvas_w = w
+            if self._relayout_id is not None:
+                try:
+                    canvas.after_cancel(self._relayout_id)
+                except Exception:
+                    pass
+            self._relayout_id = canvas.after(30, self._relayout_cards)
+
+    def _relayout_cards(self):
+        """画布宽度变化（首次映射/全屏切换）后按真实宽度重渲染卡片。"""
+        self._relayout_id = None
+        if not self.is_visible():
+            return
+        canvas = self._active_canvas()
+        if canvas is None or canvas.winfo_width() <= 1:
+            return
+        self._refresh_cards(self._rows_displayed)
 
     def _on_canvas_click(self, event):
         canvas = self._active_canvas()
@@ -1373,7 +1394,7 @@ class HistoryPanel:
         T, dark = self._theme()
         cw = canvas.winfo_width()
         if cw <= 1:
-            cw = max(200, int(self._cw * 0.5))
+            cw = self._left_col_width()
         card_w = max(80, cw - 2 * margin)
         gap = int(round(8 * self._dpi))
         self._card_w, self._row_h = card_w, row_h
@@ -1776,19 +1797,20 @@ class HistoryPanel:
         self._cmp_root = tk.Frame(self.win, bg=win_bg)
 
         # ---------- 顶栏：搜索胶囊(左栏宽) + 动作簇 📷⚙⛶✕(详情栏宽) ----------
-        detail_w = int(round(400 * dpi))
+        detail_w = self._detail_width(self._cw - 60)  # 60 = cmp_root内缩32 + body padx28
         self._sh_h = int(round(30 * dpi))
         header = tk.Frame(self._cmp_root, bg=win_bg)
         header.pack(fill="x", padx=14, pady=(10, 6))
         self._hdr_icons = self._make_header_icons(dpi, T["label2"])
 
-        # 结构化分区：左区弹性(=列表栏宽) + 21px 占位(=分隔线) + 右区固定(=详情栏宽)
+        # 结构化分区：左区弹性(=列表栏宽) + 21px 占位(=分隔线) + 右区(=详情栏宽)
         header_left = tk.Frame(header, bg=win_bg)
         header_left.pack(side="left", fill="both", expand=True)
         tk.Frame(header, bg=win_bg, width=21).pack(side="left")
-        header_right = tk.Frame(header, bg=win_bg, width=detail_w)
-        header_right.pack(side="left", fill="y")
-        header_right.pack_propagate(False)
+        self._hdr_right = tk.Frame(header, bg=win_bg, width=detail_w)
+        self._hdr_right.pack(side="left", fill="y")
+        self._hdr_right.pack_propagate(False)
+        header_right = self._hdr_right
 
         btn_pad = (max(0, (self._sh_h - int(round(24 * dpi))) // 2), 0)
         close_b = self._icon_button(header_right, self._hdr_icons["close"],
@@ -1834,9 +1856,10 @@ class HistoryPanel:
         header.bind("<ButtonPress-1>", self._hdr_press)
         header.bind("<B1-Motion>", self._hdr_move)
 
-        # ---------- 双栏布局：左列表 / 右详情（master-detail） ----------
+        # ---------- 双栏布局：左列表 / 右详情（master-detail，42:58 动态比例） ----------
         body_split = tk.Frame(self._cmp_root, bg=win_bg)
         body_split.pack(fill="both", expand=True, padx=14, pady=(2, 0))
+        body_split.bind("<Configure>", self._on_split_configure)
         left = tk.Frame(body_split, bg=win_bg)
         left.pack(side="left", fill="both", expand=True)
         sep = tk.Frame(body_split, bg=T["hairline"], width=1)
@@ -1879,6 +1902,38 @@ class HistoryPanel:
         self._cmp_status = tk.Label(footer, textvariable=self.status_var,
                                     bg=win_bg, fg=T["label2"], font=self._font(8))
         self._cmp_status.pack(side="right")
+
+    # ---------- 双栏比例 ----------
+    DETAIL_RATIO = 0.58
+    DETAIL_MIN = 340
+    DETAIL_MAX = 760
+
+    def _detail_width(self, total):
+        """按 42:58 计算详情栏宽（total=双栏区总宽，含 21px 分隔区）。"""
+        avail = max(0, total - 21)
+        d = self._dpi
+        return int(min(max(avail * self.DETAIL_RATIO,
+                           self.DETAIL_MIN * d), self.DETAIL_MAX * d))
+
+    def _left_col_width(self):
+        """左栏（列表画布）宽度推导：画布尚未映射时的首帧渲染兜底。"""
+        body = max(200, self._cw - 60)  # 60 = cmp_root内缩32 + body padx28
+        return max(200, body - 21 - self._detail_width(body))
+
+    def _on_split_configure(self, e):
+        """窗口尺寸变化（含全屏切换）时详情栏跟随比例伸缩。"""
+        dw = self._detail_width(e.width)
+        try:
+            changed = self._detail.frame.winfo_width() != dw
+            if changed:
+                self._detail.frame.configure(width=dw)
+            if self._hdr_right.winfo_width() != dw:
+                self._hdr_right.configure(width=dw)
+            if changed and self._detail.row is not None \
+                    and self._detail.row["kind"] == "image":
+                self._detail.invalidate_size()
+        except Exception:
+            pass
 
     # ---------- Apple 风格控件绘制助手 ----------
     def _font_path(self):
@@ -2568,6 +2623,21 @@ class DetailPane:
     def current_id(self):
         return self.row["id"] if self.row is not None else None
 
+    def invalidate_size(self):
+        """详情栏宽度变化后重渲染当前行（图片按新宽度重新缩放）。"""
+        self._cur_key = None
+        if self.row is None:
+            return
+        try:
+            self.frame.after_idle(self._rerender_current)
+        except Exception:
+            pass
+
+    def _rerender_current(self):
+        rid = self.current_id()
+        if rid is not None:
+            self._render(rid)
+
     def show(self, row_id, immediate=False):
         """按行 id 渲染详情；默认防抖（悬停跟随），immediate 立即渲染。"""
         if self._pending is not None:
@@ -2736,7 +2806,10 @@ class DetailPane:
         from PIL import Image, ImageTk
         cache = self.panel._preview_cache
         d = self.panel._dpi
-        img_max = (int(self.IMG_MAX_BASE[0] * d), int(self.IMG_MAX_BASE[1] * d))
+        hw = self.frame.winfo_reqwidth()
+        lim_w = (hw - int(20 * d)) if hw > 1 else int(self.IMG_MAX_BASE[0] * d)
+        img_max = (max(int(200 * d), min(lim_w, int(680 * d))),
+                   int(self.IMG_MAX_BASE[1] * d))
         key = (row["id"], img_max)
         photo = cache.get(key)
         if photo is None:
@@ -2825,10 +2898,13 @@ class DetailPane:
         il = tk.Label(fr, image=icon, bg=self.BG)
         il.pack(side="left", padx=(4, 6), pady=2)
         name = os.path.basename(path.rstrip("\\/")) or path
+        d = self.panel._dpi
+        hw = self.frame.winfo_reqwidth()
+        name_w = (max(int(120 * d), hw - int(104 * d)) if hw > 1
+                  else int(260 * d))
         nl = tk.Label(fr,
                       text=self.panel._fit_text(
-                          name, ("Microsoft YaHei UI", 10),
-                          int(260 * self.panel._dpi)),
+                          name, ("Microsoft YaHei UI", 10), name_w),
                       bg=self.BG, fg=T["label"] if exists else T["label3"],
                       font=("Microsoft YaHei UI", 10), anchor="w")
         nl.pack(side="left", fill="x", expand=True, pady=2)
