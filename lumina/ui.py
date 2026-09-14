@@ -5,6 +5,7 @@ Tk 解释器。因此 toast 与面板共用这里的一个 UI 线程，通过队
 """
 import io
 import gc
+import ctypes
 import os
 import queue
 import re
@@ -37,6 +38,7 @@ class UiServer:
         self._q = queue.Queue(maxsize=32)
         self._thread = None
         self._stop_lock = threading.Lock()
+        self._last_panel_toggle = 0.0
         self._root = None
         self._tk = None
         self._toast_stack = []
@@ -292,6 +294,10 @@ class UiServer:
     def _toggle_panel(self):
         if not self._panel:
             return
+        now = time.monotonic()
+        if now - self._last_panel_toggle < 0.35:
+            return
+        self._last_panel_toggle = now
         if self._panel.is_visible():
             self._panel.hide()
         else:
@@ -720,8 +726,8 @@ class RegionSelector:
 
 
 class HistoryPanel:
-    COMPACT_W = 980
-    COMPACT_H = 680
+    COMPACT_W = 1160
+    COMPACT_H = 720
     TRANS_COLOR = "#010203"
     FILTERS = (("all", "全部"), ("text", "文本"), ("code", "代码"),
                ("link", "链接"), ("image", "图片"), ("file", "文件"),
@@ -858,7 +864,6 @@ class HistoryPanel:
 
         self.win = tk.Toplevel(root)
         self.win.title("Lumina 历史面板")
-        self.win.attributes("-topmost", True)
         self.win.protocol("WM_DELETE_WINDOW", self.hide)
         self._build_widgets()
         self.win.withdraw()
@@ -878,7 +883,6 @@ class HistoryPanel:
         self._search_focus_check = None
 
         self.win.bind("<F5>", lambda e: self.refresh())
-        self.win.bind("<F11>", self._toggle_maximize)
         self.win.bind("<Escape>", lambda e: self.hide())
         self.win.bind("<Delete>", lambda e: self.delete_selected())
         self.win.bind("<Control-p>", lambda e: self.toggle_pin())
@@ -1220,6 +1224,7 @@ class HistoryPanel:
         self._prev_hwnd = prev_hwnd
         self.apply_mode()  # 重设边框/尺寸/位置（光标附近或全屏态）并刷新
         self.win.deiconify()
+        self._make_taskbar_window()
         self.win.lift()
         self.win.focus_force()
         if self.search_var.get().strip():
@@ -1236,6 +1241,34 @@ class HistoryPanel:
         except Exception:
             pass
         self.ui.panel_visible = False
+
+    def _make_taskbar_window(self):
+        """Expose the custom borderless panel as one Windows taskbar button."""
+        if os.name != "nt":
+            return
+        try:
+            from ctypes import wintypes
+
+            hwnd = wintypes.HWND(self.win.winfo_id())
+            user32 = ctypes.windll.user32
+            get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+            set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+            get_long.restype = ctypes.c_void_p
+            set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            set_long.restype = ctypes.c_void_p
+
+            # Clear Tk's hidden-root owner and mark this Toplevel as an app
+            # window. Do this after mapping; doing it during construction can
+            # create a second empty shell window on Windows.
+            set_long(hwnd, -8, 0)  # GWLP_HWNDPARENT
+            exstyle = int(get_long(hwnd, -20))
+            exstyle = (exstyle | 0x00040000) & ~0x00000080
+            set_long(hwnd, -20, exstyle)  # APPWINDOW, not TOOLWINDOW
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                                0x0001 | 0x0002 | 0x0004 | 0x0020)
+        except Exception:
+            traceback.print_exc()
 
     # ---------- 顶栏下拉弹窗（截图 / 设置） ----------
     # 不用 Tk 原生菜单：Windows 下 menu.post 会进入模态跟踪循环，
@@ -1255,7 +1288,6 @@ class HistoryPanel:
         T, dark = self._theme()
         pop = tk.Toplevel(self.win)
         pop.overrideredirect(True)
-        pop.attributes("-topmost", True)
         pop.configure(bg=T["hairline"])
         frame = tk.Frame(pop, bg=T["card_bg"])
         frame.pack(fill="both", expand=True, padx=1, pady=1)
@@ -1913,12 +1945,74 @@ class HistoryPanel:
         # 内容容器不透明（避免缝隙透出桌面）；其内缩大于圆角背景的角排除区，故不产生直角溢出
         self._cmp_root = tk.Frame(self.win, bg=win_bg)
 
-        # ---------- 双栏布局：左(搜索+列表) / 右(详情)，两栏顶端对齐 ----------
-        # 详情区上移到窗口内容顶端：其首行工具栏与左侧搜索胶囊同高，
-        # 窗口按钮(📷⚙⛶✕)并入该行最右侧，行级动作按钮也在此行。
-        detail_w = self._detail_width(self._cw - 60)  # 60 = cmp_root内缩32 + body padx28
+        # ---------- 自定义窗口标题栏 + 双栏布局 ----------
+        # 无边框窗口没有 Windows 原生标题栏，因此把功能按钮和窗口控制
+        # 统一放在这一行。
         self._sh_h = int(round(30 * dpi))
-        self._hdr_icons = self._make_header_icons(dpi, T["label2"])
+        title_bar = tk.Frame(self._cmp_root, bg=win_bg, height=self._sh_h)
+        title_bar.pack(fill="x", padx=0, pady=0)
+        title_bar.pack_propagate(False)
+        title_bar.bind("<ButtonPress-1>", self._hdr_press)
+        title_bar.bind("<B1-Motion>", self._hdr_move)
+        menu_btn_kw = dict(
+            bd=0, bg=win_bg, activebackground=T["fill_hover"],
+            relief="flat", cursor="hand2", highlightthickness=0,
+            font=self._font(10), fg=T["label"])
+        self._settings_btn = tk.Button(
+            title_bar, text="设置",
+            command=lambda: self._toggle_popup_menu("settings", self._settings_btn),
+            **menu_btn_kw)
+        self._shot_btn = tk.Button(
+            title_bar, text="截图",
+            command=lambda: self._toggle_popup_menu("shot", self._shot_btn),
+            **menu_btn_kw)
+        self._shot_btn.pack(side="left", padx=(0, 6))
+        self._settings_btn.pack(side="left", padx=(0, 6))
+
+        control_size = max(24, int(round(30 * dpi)))
+        normal_fg = T["label"]
+        self._control_icons = {
+            "minimize": self._make_window_control_icons(
+                "minimize", control_size, normal_fg, normal_fg),
+            "maximize": self._make_window_control_icons(
+                "maximize", control_size, normal_fg, normal_fg),
+            "close": self._make_window_control_icons(
+                "close", control_size, normal_fg, "#ffffff"),
+        }
+        control_kw = dict(
+            bd=0, bg=win_bg, activebackground=T["fill_hover"],
+            relief="flat", cursor="hand2", highlightthickness=0,
+            padx=0, pady=0)
+        self._minimize_btn = tk.Button(
+            title_bar, image=self._control_icons["minimize"][0],
+            command=self._minimize, **control_kw)
+        self._max_btn = tk.Button(
+            title_bar, image=self._control_icons["maximize"][0],
+            command=self._toggle_maximize, **control_kw)
+        self._close_btn = tk.Button(
+            title_bar, image=self._control_icons["close"][0],
+            command=self.hide, **control_kw)
+
+        def bind_control_hover(button, key, hover_bg):
+            normal_bg = win_bg
+            button.image = self._control_icons[key][0]
+            button.bind("<Enter>", lambda _e: button.configure(
+                bg=hover_bg, image=self._control_icons[key][1]))
+            button.bind("<Leave>", lambda _e: button.configure(
+                bg=normal_bg, image=self._control_icons[key][0]))
+
+        bind_control_hover(self._minimize_btn, "minimize", T["fill_hover"])
+        bind_control_hover(self._max_btn, "maximize", T["fill_hover"])
+        bind_control_hover(self._close_btn, "close", "#e81123")
+        self._close_btn.pack(side="right", padx=(2, 0), pady=0,
+                            ipadx=0, ipady=0, fill="y")
+        self._max_btn.pack(side="right", padx=(2, 0), pady=0,
+                           ipadx=0, ipady=0, fill="y")
+        self._minimize_btn.pack(side="right", padx=(2, 0), pady=0,
+                                ipadx=0, ipady=0, fill="y")
+
+        # ---------- 双栏布局：左(搜索+列表) / 右(详情) ----------
+        detail_w = self._detail_width(self._cw - 60)  # 60 = cmp_root内缩32 + body padx28
 
         body_split = tk.Frame(self._cmp_root, bg=win_bg)
         body_split.pack(fill="both", expand=True, padx=14, pady=(10, 0))
@@ -1958,42 +2052,6 @@ class HistoryPanel:
         sep.bind("<B1-Motion>", self._hdr_move)
         self._detail = DetailPane(self, body_split, detail_w)
 
-        # 窗口按钮：详情区顶部工具栏最右侧（垂直居中）
-        # 视觉从左到右：截图 · 设置 ⚙ · 最小化 · 最大化 ⛶ · 关闭 ×
-        # pack 顺序决定从右到左：close 最右，shot 最左
-        header_right = self._detail.win_bar
-        btn_bg = self._detail.BG
-        btn_pad = (max(0, (self._sh_h - int(round(28 * dpi))) // 2), 0)
-        close_b = self._icon_button(header_right, self._hdr_icons["close"],
-                                    self.hide, btn_bg, T["fill_hover"])
-        self._max_btn = self._icon_button(
-            header_right, self._hdr_icons["expand"], self._toggle_maximize,
-            btn_bg, T["fill_hover"])
-        self._settings_btn = tk.Button(header_right, text="设置",
-                                       command=lambda: self._toggle_popup_menu(
-                                           "settings", self._settings_btn),
-                                       bd=0, bg=btn_bg, activebackground=T["fill_hover"],
-                                       relief="flat", cursor="hand2",
-                                       highlightthickness=0,
-                                       font=self._font(10),
-                                       fg=T["label"])
-        self._minimize_btn = self._icon_button(
-            header_right, self._hdr_icons["minimize"],
-            self._minimize, btn_bg, T["fill_hover"])
-        self._shot_btn = tk.Button(header_right, text="截图",
-                                   command=lambda: self._toggle_popup_menu(
-                                       "shot", self._shot_btn),
-                                   bd=0, bg=btn_bg, activebackground=T["fill_hover"],
-                                   relief="flat", cursor="hand2",
-                                   highlightthickness=0,
-                                   font=self._font(10),
-                                   fg=T["label"])
-        close_b.pack(side="right", pady=btn_pad)
-        self._max_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
-        self._minimize_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
-        self._settings_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
-        self._shot_btn.pack(side="right", padx=(0, 6), pady=btn_pad)
-
         # ---------- 过滤胶囊 pills（Canvas 自绘，紧凑） ----------
         chip_wrap = tk.Frame(left, bg=win_bg)
         chip_wrap.pack(fill="x", pady=(0, 6))
@@ -2032,9 +2090,9 @@ class HistoryPanel:
         self._cmp_status.pack(side="right")
 
     # ---------- 双栏比例 ----------
-    DETAIL_RATIO = 0.58
-    DETAIL_MIN = 340
-    DETAIL_MAX = 760
+    DETAIL_RATIO = 0.64
+    DETAIL_MIN = 380
+    DETAIL_MAX = 840
 
     def _detail_width(self, total):
         """按 42:58 计算详情栏宽（total=双栏区总宽，含 21px 分隔区）。"""
@@ -2079,6 +2137,32 @@ class HistoryPanel:
             except Exception:
                 pass
         return ImageFont.load_default()
+
+    def _make_window_control_icons(self, kind, size, normal_color, hover_color):
+        """Create matched Windows/WeChat-style title-bar line icons."""
+        from PIL import Image, ImageDraw, ImageTk
+
+        scale = 3
+
+        def make(color):
+            s = size * scale
+            image = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            color = self._hex_to_rgb(color) + (255,)
+            width = max(2, round(s * 0.07))
+            left, right = s * 0.28, s * 0.72
+            center = s * 0.50
+            if kind == "minimize":
+                draw.line((left, center, right, center), fill=color, width=width)
+            elif kind == "maximize":
+                draw.rectangle((left, s * 0.28, right, s * 0.72),
+                               outline=color, width=width)
+            else:
+                draw.line((left, left, right, right), fill=color, width=width)
+                draw.line((right, left, left, right), fill=color, width=width)
+            return ImageTk.PhotoImage(image.resize((size, size), Image.LANCZOS))
+
+        return make(normal_color), make(hover_color)
 
     def _icon_button(self, parent, photo, cmd, bg, active):
         b = self.tk.Button(parent, image=photo, command=cmd, bd=0, bg=bg,
@@ -2315,7 +2399,7 @@ class HistoryPanel:
                 return
 
     def _make_rounded_bg(self, w, h):
-        """窗口材质：大圆角 + 发丝描边，填充随主题。
+        """窗口材质：圆角背景 + 发丝描边，填充随主题。
 
         注意：-transparentcolor 是"颜色键"透明（精确匹配、二值），不支持半透明。
         若画投影或做超采样抗锯齿，半透明/混合像素会被颜色键当作不透明深色，
@@ -2327,8 +2411,9 @@ class HistoryPanel:
         win_bg = self._hex_to_rgb(self._c("window_bg"))
         hair = self._hex_to_rgb(self._c("hairline"))
         im = Image.new("RGB", (w, h), key)
-        ImageDraw.Draw(im).rounded_rectangle([0, 0, w - 1, h - 1], radius=20,
-                                             fill=win_bg, outline=hair, width=1)
+        ImageDraw.Draw(im).rounded_rectangle(
+            [0, 0, w - 1, h - 1], radius=18,
+            fill=win_bg, outline=hair, width=1)
         return ImageTk.PhotoImage(im)
 
     def _set_filter(self, key):
@@ -2450,49 +2535,36 @@ class HistoryPanel:
             return dt.strftime("%m-%d")
         return dt.strftime("%Y-%m-%d")
 
-    # ---------- 窗口模式 ----------
-    # ---------- 面板全屏切换 ----------
+    def _minimize(self):
+        self.win.withdraw()
+
+    def _toggle_maximize(self):
+        if self._maxed:
+            self._maxed = False
+            if self._normal_geom:
+                self.win.geometry(self._normal_geom)
+            self._max_btn.configure(image=self._control_icons["maximize"][0])
+            return
+        self._normal_geom = self.win.geometry()
+        self._maxed = True
+        wa = self._work_area()
+        if wa:
+            x, y, w, h = wa
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+        else:
+            self.win.geometry(f"{self.win.winfo_screenwidth()}x{self.win.winfo_screenheight()}+0+0")
+        self._max_btn.configure(image=self._control_icons["maximize"][0])
+
     @staticmethod
     def _work_area():
-        """Windows 工作区(不含任务栏) (x, y, w, h)；失败返回 None。"""
         try:
-            import ctypes
             rect = (ctypes.c_long * 4)()
             if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, rect, 0):
                 l, t, r, b = rect[0], rect[1], rect[2], rect[3]
-                if r > l and b > t:
-                    return l, t, r - l, b - t
+                return l, t, r - l, b - t
         except Exception:
             pass
         return None
-
-    def _apply_bg_size(self, w, h):
-        self._rounded_bg = self._make_rounded_bg(w, h)
-        self._bg_canvas.itemconfigure(self._bg_item, image=self._rounded_bg)
-
-    def _toggle_maximize(self, event=None):
-        if self._maxed:
-            self._maxed = False
-            geom = self._normal_geom
-            self._apply_bg_size(self._cw, self._ch)
-            self.win.geometry(geom or f"{self._cw}x{self._ch}+80+80")
-            self._max_btn.configure(image=self._hdr_icons["expand"])
-        else:
-            wa = self._work_area()
-            if wa is None:
-                x, y = 0, 0
-                w, h = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-            else:
-                x, y, w, h = wa
-            self._normal_geom = self.win.geometry()
-            self._maxed = True
-            self._apply_bg_size(w, h)
-            self.win.geometry(f"{w}x{h}+{x}+{y}")
-            self._max_btn.configure(image=self._hdr_icons["restore"])
-
-    def _minimize(self):
-        """最小化窗口到任务栏。"""
-        self.win.withdraw()
 
     def apply_mode(self):
         self.win.overrideredirect(True)
@@ -2503,19 +2575,8 @@ class HistoryPanel:
         self.win.configure(bg=self.TRANS_COLOR)
         self.win.minsize(1, 1)
         self._bg_canvas.pack(fill="both", expand=True)
-        self._cmp_root.place(x=16, y=16, relwidth=1.0, relheight=1.0,
-                             width=-32, height=-32)
-        if self._maxed:
-            wa = self._work_area()
-            if wa:
-                x, y, w, h = wa
-                self._apply_bg_size(w, h)
-                self.win.geometry(f"{w}x{h}+{x}+{y}")
-                self.win.attributes("-topmost", True)
-                self._max_btn.configure(image=self._hdr_icons["restore"])
-                self.refresh()
-                return
-            self._maxed = False
+        self._cmp_root.place(x=4, y=4, relwidth=1.0, relheight=1.0,
+                             width=-8, height=-8)
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
         w = min(self._cw, sw)
@@ -2523,10 +2584,7 @@ class HistoryPanel:
         px, py = self.win.winfo_pointerxy()
         x = min(max(px - 60, 0), max(0, sw - w))
         y = min(max(py - 24, 0), max(0, sh - h))
-        self._apply_bg_size(w, h)
         self.win.geometry(f"{w}x{h}+{x}+{y}")
-        self.win.attributes("-topmost", True)
-        self._max_btn.configure(image=self._hdr_icons["expand"])
         self.refresh()
 
 
@@ -2551,7 +2609,6 @@ class FlatMenu:
                       "fill_hover": "#DCDCE1"}
         self.win = tk.Toplevel(parent_win)
         self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
         self.win.configure(bg=T["hairline"])
         frame = tk.Frame(self.win, bg=T["card_bg"])
         frame.pack(fill="both", expand=True, padx=1, pady=1)

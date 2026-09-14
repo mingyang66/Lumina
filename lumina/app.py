@@ -12,6 +12,7 @@ from .config import save_config
 from .db import Database
 from .imaging import grab_screen, image_to_dib, to_png
 from .listener import ClipboardListener
+from .tray import TrayIcon
 from .ui import UiServer
 
 
@@ -36,6 +37,7 @@ class LuminaApp:
         self._stop = threading.Event()
         self._capture_lock = threading.Lock()
         self._cleaner_thread = None
+        self.tray = TrayIcon(self)
 
     def stop(self):
         """请求主循环退出；资源由 start() 的 finally 按顺序回收。"""
@@ -221,6 +223,7 @@ class LuminaApp:
             if not self.listener.wait_ready(3):
                 raise RuntimeError(
                     f"clipboard listener failed to start: {self.listener._startup_error}")
+            self.tray.start()
             print("[lumina] clipboard monitor running", flush=True)
             print(f"[lumina] db: {os.path.abspath(self.db.path)}", flush=True)
             print(f"[lumina] screenshot hotkey: {self.config.get('hotkey_capture')}",
@@ -239,6 +242,7 @@ class LuminaApp:
             print("\n[lumina] shutting down...")
         finally:
             self._stop.set()
+            self.tray.stop()
             if self.listener.ident is not None:
                 self.listener.stop()
                 self.listener.join(timeout=5)
