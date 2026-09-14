@@ -877,6 +877,7 @@ class HistoryPanel:
         self._popup_menu = None
         self._popup_open = False
         self._popup_focus_check = None
+        self._popup_outside_binding = None
         self._menu_anchor = None
         self._menu_kind = None
         self._search_active = False
@@ -1261,18 +1262,18 @@ class HistoryPanel:
         pop.overrideredirect(True)
         pop.configure(bg=T["hairline"])
         frame = tk.Frame(pop, bg=T["card_bg"])
-        frame.pack(fill="both", expand=True, padx=1, pady=1)
-        f = self._font(10)
+        frame.pack(fill="both", expand=True, padx=7, pady=7)
+        f = self._font(11)
         btn_kw = dict(anchor="w", relief="flat", font=f, bd=0, cursor="hand2",
                       bg=T["card_bg"], fg=T["label"],
                       activebackground=T["fill_hover"], activeforeground=T["label"],
-                      highlightthickness=0, padx=14, pady=6)
+                      highlightthickness=0, padx=16, pady=7)
 
-        def sm_icon(draw_fn, size, color_name="label"):
+        def sm_icon(draw_fn, size, color_name="label", color_hex=None):
             """创建一个小尺寸图标 PhotoImage，供弹出菜单项右侧使用。"""
             from PIL import Image, ImageDraw, ImageTk
             s = size * 2  # 超采样保证平滑
-            rgb = self._hex_to_rgb(self._sys(color_name)) + (255,)
+            rgb = self._hex_to_rgb(color_hex or self._sys(color_name)) + (255,)
             im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
             draw_fn(ImageDraw.Draw(im), s, rgb, max(1, int(s * 0.062)))
             return ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
@@ -1321,28 +1322,35 @@ class HistoryPanel:
             for yy in (s*0.34, s*0.46):
                 dr.line([(s*0.34, yy), (s*0.66, yy)], fill=c, width=w)
 
-        def cut_icon(dr, s, c, w):
-            """剪刀：用于全屏截图"""
+        def fullscreen_icon(dr, s, c, w):
+            """显示器加取景框：用于全屏截图。"""
             w = int(round(w))
-            dr.line([(s*0.28, s*0.22), (s*0.22, s*0.50), (s*0.28, s*0.76)],
-                    fill=c, width=round(w*1.3), joint="curve")
-            dr.line([(s*0.72, s*0.22), (s*0.78, s*0.50), (s*0.72, s*0.76)],
-                    fill=c, width=round(w*1.3), joint="curve")
-            dr.line([(s*0.30, s*0.48), (s*0.50, s*0.30)],
-                    fill=c, width=round(w*1.1))
-            dr.line([(s*0.30, s*0.52), (s*0.50, s*0.70)],
-                    fill=c, width=round(w*1.1))
-            dr.ellipse([s*0.36, s*0.44, s*0.64, s*0.56], outline=c, width=w)
+            left, top, right, bottom = s * 0.18, s * 0.22, s * 0.82, s * 0.68
+            dr.rounded_rectangle([left, top, right, bottom],
+                                 radius=s * 0.05, outline=c, width=w)
+            dr.line([(s * 0.50, bottom), (s * 0.50, s * 0.80)],
+                    fill=c, width=w)
+            dr.line([(s * 0.34, s * 0.82), (s * 0.66, s * 0.82)],
+                    fill=c, width=w)
+            m = s * 0.10
+            corner = s * 0.19
+            for x, y, dx, dy in (
+                    (s * 0.30, s * 0.36, 1, 1),
+                    (s * 0.70, s * 0.36, -1, 1),
+                    (s * 0.30, s * 0.58, 1, -1),
+                    (s * 0.70, s * 0.58, -1, -1)):
+                dr.line([(x, y), (x + dx * corner, y)], fill=c, width=w)
+                dr.line([(x, y), (x, y + dy * corner)], fill=c, width=w)
 
         if kind == "shot":
-            cut_photo = sm_icon(cut_icon, 14)
+            cut_photo = sm_icon(fullscreen_icon, 18, color_hex=self._sys("blue"))
             cut_button = tk.Button(
                 frame, text="全屏截图", image=cut_photo, compound="right",
                 command=lambda: self._popup_action(self.capture_fullscreen),
                 **btn_kw)
             cut_button.image = cut_photo
             cut_button.pack(fill="x", padx=4, pady=(4, 1))
-            sel_photo = sm_icon(sel_icon, 14)
+            sel_photo = sm_icon(sel_icon, 18, color_hex=self._sys("purple"))
             sel_button = tk.Button(
                 frame, text="区域截图", image=sel_photo, compound="right",
                 command=lambda: self._popup_action(self.capture_region),
@@ -1351,7 +1359,7 @@ class HistoryPanel:
             sel_button.pack(fill="x", padx=4, pady=1)
             tk.Frame(frame, bg=T["separator"], height=1).pack(
                 fill="x", padx=6, pady=4)
-            eye_photo = sm_icon(eye_icon, 14)
+            eye_photo = sm_icon(eye_icon, 18, color_hex=self._sys("gray"))
             eye_button = tk.Checkbutton(
                 frame, text="隐藏此窗口", image=eye_photo, compound="right",
                 variable=self._hide_on_capture,
@@ -1363,13 +1371,13 @@ class HistoryPanel:
             eye_button.image = eye_photo
             eye_button.pack(fill="x", padx=6, pady=(0, 4))
         else:
-            refresh_photo = sm_icon(refresh_icon, 14)
+            refresh_photo = sm_icon(refresh_icon, 18, color_hex=self._sys("blue"))
             refresh_button = tk.Button(
                 frame, text="刷新  (F5)", image=refresh_photo, compound="right",
                 command=lambda: self._popup_action(self.refresh), **btn_kw)
             refresh_button.image = refresh_photo
             refresh_button.pack(fill="x", padx=4, pady=(4, 1))
-            trash_photo = sm_icon(trash_icon, 14)
+            trash_photo = sm_icon(trash_icon, 18, color_hex=self._sys("red"))
             trash_button = tk.Button(
                 frame, text="清理过期记录", image=trash_photo, compound="right",
                 command=lambda: self._popup_action(self._cleanup_now), **btn_kw)
@@ -1385,10 +1393,35 @@ class HistoryPanel:
         if x + pop.winfo_reqwidth() > sw - 8:
             x = max(0, sw - 8 - pop.winfo_reqwidth())
         pop.geometry(f"+{x}+{y}")
+        self._round_popup_background(pop, frame, T)
         pop.deiconify()
         pop.lift()
         self._popup_menu = pop
         self._popup_open = True
+        self._popup_outside_binding = self.win.bind_all(
+            "<Button-1>", self._popup_outside_click, add="+")
+
+    def _round_popup_background(self, pop, frame, theme):
+        """Paint a rounded popup shell behind the menu controls."""
+        from PIL import Image, ImageDraw, ImageTk
+
+        pop.update_idletasks()
+        width = max(1, pop.winfo_reqwidth())
+        height = max(1, pop.winfo_reqheight())
+        scale = 2
+        image = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        fill = self._hex_to_rgb(theme["card_bg"]) + (255,)
+        border = self._hex_to_rgb(theme["hairline"]) + (255,)
+        draw.rounded_rectangle(
+            (0, 0, width * scale - 1, height * scale - 1),
+            radius=10 * scale, fill=fill, outline=border, width=scale)
+        photo = ImageTk.PhotoImage(image.resize((width, height), Image.LANCZOS))
+        background = self.tk.Label(pop, image=photo, bd=0, highlightthickness=0)
+        background.image = photo
+        background.place(x=0, y=0, relwidth=1, relheight=1)
+        background.lower()
+        pop.configure(bg=theme["card_bg"])
 
     def _popup_action(self, fn):
         self._close_popup_menu()
@@ -1408,6 +1441,12 @@ class HistoryPanel:
 
     def _close_popup_menu(self):
         self._popup_open = False
+        if self._popup_outside_binding is not None:
+            try:
+                self.win.unbind_all("<Button-1>", self._popup_outside_binding)
+            except Exception:
+                pass
+            self._popup_outside_binding = None
         pop = self._popup_menu
         self._popup_menu = None
         if pop is not None:
@@ -1415,6 +1454,19 @@ class HistoryPanel:
                 pop.destroy()
             except Exception:
                 pass
+
+    def _popup_outside_click(self, event):
+        """Close a dropdown when another part of the main panel is clicked."""
+        if not self._popup_open or self._popup_menu is None:
+            return
+        try:
+            if event.widget is self._menu_anchor:
+                return
+            if event.widget.winfo_toplevel() is self._popup_menu:
+                return
+        except Exception:
+            pass
+        self._close_popup_menu()
 
     # ---------- 截屏入口 ----------
     def _hide_on_capture_changed(self):
@@ -1930,8 +1982,9 @@ class HistoryPanel:
                  bd=0, highlightthickness=0).pack(side="left", padx=(6, 8))
         menu_btn_kw = dict(
             bd=0, bg=win_bg, activebackground=T["fill_hover"],
-            relief="flat", cursor="hand2", highlightthickness=0,
-            font=self._font(10), fg=T["label"])
+            activeforeground=T["label"], relief="flat", cursor="hand2",
+            highlightthickness=0, font=self._font(11, "bold"),
+            fg=T["label"], padx=6, pady=2)
         self._settings_btn = tk.Button(
             title_bar, text="设置",
             command=lambda: self._toggle_popup_menu("settings", self._settings_btn),
@@ -1940,8 +1993,8 @@ class HistoryPanel:
             title_bar, text="截图",
             command=lambda: self._toggle_popup_menu("shot", self._shot_btn),
             **menu_btn_kw)
-        self._shot_btn.pack(side="left", padx=(0, 6))
-        self._settings_btn.pack(side="left", padx=(0, 6))
+        self._shot_btn.pack(side="left", padx=(0, 2))
+        self._settings_btn.pack(side="left", padx=(0, 2))
 
         control_size = max(24, int(round(30 * dpi)))
         normal_fg = T["label"]
