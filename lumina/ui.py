@@ -1224,7 +1224,6 @@ class HistoryPanel:
         self._prev_hwnd = prev_hwnd
         self.apply_mode()  # 重设边框/尺寸/位置（光标附近或全屏态）并刷新
         self.win.deiconify()
-        self._make_taskbar_window()
         self.win.lift()
         self.win.focus_force()
         if self.search_var.get().strip():
@@ -1241,34 +1240,6 @@ class HistoryPanel:
         except Exception:
             pass
         self.ui.panel_visible = False
-
-    def _make_taskbar_window(self):
-        """Expose the custom borderless panel as one Windows taskbar button."""
-        if os.name != "nt":
-            return
-        try:
-            from ctypes import wintypes
-
-            hwnd = wintypes.HWND(self.win.winfo_id())
-            user32 = ctypes.windll.user32
-            get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-            set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-            get_long.argtypes = [wintypes.HWND, ctypes.c_int]
-            get_long.restype = ctypes.c_void_p
-            set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-            set_long.restype = ctypes.c_void_p
-
-            # Clear Tk's hidden-root owner and mark this Toplevel as an app
-            # window. Do this after mapping; doing it during construction can
-            # create a second empty shell window on Windows.
-            set_long(hwnd, -8, 0)  # GWLP_HWNDPARENT
-            exstyle = int(get_long(hwnd, -20))
-            exstyle = (exstyle | 0x00040000) & ~0x00000080
-            set_long(hwnd, -20, exstyle)  # APPWINDOW, not TOOLWINDOW
-            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-                                0x0001 | 0x0002 | 0x0004 | 0x0020)
-        except Exception:
-            traceback.print_exc()
 
     # ---------- 顶栏下拉弹窗（截图 / 设置） ----------
     # 不用 Tk 原生菜单：Windows 下 menu.post 会进入模态跟踪循环，
@@ -1954,6 +1925,9 @@ class HistoryPanel:
         title_bar.pack_propagate(False)
         title_bar.bind("<ButtonPress-1>", self._hdr_press)
         title_bar.bind("<B1-Motion>", self._hdr_move)
+        self._title_icon = self._make_lumina_title_icon(max(20, int(round(24 * dpi))))
+        tk.Label(title_bar, image=self._title_icon, bg=win_bg,
+                 bd=0, highlightthickness=0).pack(side="left", padx=(6, 8))
         menu_btn_kw = dict(
             bd=0, bg=win_bg, activebackground=T["fill_hover"],
             relief="flat", cursor="hand2", highlightthickness=0,
@@ -1979,37 +1953,15 @@ class HistoryPanel:
             "close": self._make_window_control_icons(
                 "close", control_size, normal_fg, "#ffffff"),
         }
-        control_kw = dict(
-            bd=0, bg=win_bg, activebackground=T["fill_hover"],
-            relief="flat", cursor="hand2", highlightthickness=0,
-            padx=0, pady=0)
-        self._minimize_btn = tk.Button(
-            title_bar, image=self._control_icons["minimize"][0],
-            command=self._minimize, **control_kw)
-        self._max_btn = tk.Button(
-            title_bar, image=self._control_icons["maximize"][0],
-            command=self._toggle_maximize, **control_kw)
-        self._close_btn = tk.Button(
-            title_bar, image=self._control_icons["close"][0],
-            command=self.hide, **control_kw)
-
-        def bind_control_hover(button, key, hover_bg):
-            normal_bg = win_bg
-            button.image = self._control_icons[key][0]
-            button.bind("<Enter>", lambda _e: button.configure(
-                bg=hover_bg, image=self._control_icons[key][1]))
-            button.bind("<Leave>", lambda _e: button.configure(
-                bg=normal_bg, image=self._control_icons[key][0]))
-
-        bind_control_hover(self._minimize_btn, "minimize", T["fill_hover"])
-        bind_control_hover(self._max_btn, "maximize", T["fill_hover"])
-        bind_control_hover(self._close_btn, "close", "#e81123")
-        self._close_btn.pack(side="right", padx=(2, 0), pady=0,
-                            ipadx=0, ipady=0, fill="y")
-        self._max_btn.pack(side="right", padx=(2, 0), pady=0,
-                           ipadx=0, ipady=0, fill="y")
-        self._minimize_btn.pack(side="right", padx=(2, 0), pady=0,
-                                ipadx=0, ipady=0, fill="y")
+        self._minimize_btn = self._make_control_button(
+            title_bar, "minimize", self._minimize, win_bg, T["fill_hover"])
+        self._max_btn = self._make_control_button(
+            title_bar, "maximize", self._toggle_maximize, win_bg, T["fill_hover"])
+        self._close_btn = self._make_control_button(
+            title_bar, "close", self.hide, win_bg, "#e81123")
+        self._close_btn.pack(side="right", padx=(2, 0), fill="y")
+        self._max_btn.pack(side="right", padx=(2, 0), fill="y")
+        self._minimize_btn.pack(side="right", padx=(2, 0), fill="y")
 
         # ---------- 双栏布局：左(搜索+列表) / 右(详情) ----------
         detail_w = self._detail_width(self._cw - 60)  # 60 = cmp_root内缩32 + body padx28
@@ -2137,6 +2089,60 @@ class HistoryPanel:
             except Exception:
                 pass
         return ImageFont.load_default()
+
+    def _make_lumina_title_icon(self, size):
+        from PIL import Image, ImageDraw, ImageTk
+
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((1, 1, size - 2, size - 2),
+                               radius=max(4, size // 4), fill="#243b78")
+        draw.ellipse((size * .18, size * .08, size * .82, size * .70),
+                     fill="#558dff")
+        draw.rounded_rectangle((size * .30, size * .25, size * .70, size * .88),
+                               radius=max(2, size // 8), fill="#f6f9ff")
+        draw.rounded_rectangle((size * .40, size * .16, size * .60, size * .34),
+                               radius=max(2, size // 10), fill="#f6f9ff")
+        draw.line((size * .40, size * .50, size * .60, size * .50),
+                  fill="#445ca8", width=max(1, size // 10))
+        draw.line((size * .40, size * .65, size * .60, size * .65),
+                  fill="#445ca8", width=max(1, size // 10))
+        return ImageTk.PhotoImage(image)
+
+    def _make_control_button(self, parent, key, command, normal_bg, hover_bg):
+        from PIL import Image, ImageDraw, ImageTk
+
+        size = max(30, int(round(32 * self._dpi)))
+        canvas = self.tk.Canvas(parent, width=size, height=size,
+                                bg=normal_bg, bd=0, highlightthickness=0,
+                                cursor="hand2")
+        radius = max(6, int(round(8 * self._dpi)))
+        def rounded_bg(color):
+            image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            ImageDraw.Draw(image).rounded_rectangle(
+                (0, 0, size - 1, size - 1), radius=radius, fill=color)
+            return ImageTk.PhotoImage(image)
+
+        normal_photo = rounded_bg(normal_bg)
+        hover_photo = rounded_bg("#e81123" if key == "close" else hover_bg)
+        bg_id = canvas.create_image(size // 2, size // 2, image=normal_photo)
+        icon = self._control_icons[key][0]
+        icon_id = canvas.create_image(size // 2, size // 2, image=icon)
+        canvas._lumina_refs = (normal_photo, hover_photo, icon,
+                               self._control_icons[key][1])
+
+        def enter(_event):
+            canvas.itemconfigure(bg_id, image=canvas._lumina_refs[1])
+            canvas.itemconfigure(icon_id, image=canvas._lumina_refs[3])
+
+        def leave(_event):
+            canvas.itemconfigure(bg_id, image=canvas._lumina_refs[0])
+            canvas.itemconfigure(icon_id, image=canvas._lumina_refs[2])
+
+        canvas.bind("<Enter>", enter)
+        canvas.bind("<Leave>", leave)
+        canvas.bind("<ButtonRelease-1>", lambda _event: command())
+        return canvas
 
     def _make_window_control_icons(self, kind, size, normal_color, hover_color):
         """Create matched Windows/WeChat-style title-bar line icons."""
@@ -2543,7 +2549,6 @@ class HistoryPanel:
             self._maxed = False
             if self._normal_geom:
                 self.win.geometry(self._normal_geom)
-            self._max_btn.configure(image=self._control_icons["maximize"][0])
             return
         self._normal_geom = self.win.geometry()
         self._maxed = True
@@ -2553,7 +2558,6 @@ class HistoryPanel:
             self.win.geometry(f"{w}x{h}+{x}+{y}")
         else:
             self.win.geometry(f"{self.win.winfo_screenwidth()}x{self.win.winfo_screenheight()}+0+0")
-        self._max_btn.configure(image=self._control_icons["maximize"][0])
 
     @staticmethod
     def _work_area():
