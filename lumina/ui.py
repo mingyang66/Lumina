@@ -728,6 +728,61 @@ class HistoryPanel:
                ("pinned", "钉住"))
     CATEGORY_LABELS = {"text": "文本", "code": "代码", "link": "链接",
                         "image": "图片", "file": "文件"}
+    # source 进程名（小写）→ (显示名, 系统色, 渲染风格)
+    # 渲染风格：ide=代码风格 term=控制台风格 chat=聊天气泡 browser=地址栏+正文
+    SOURCE_APPS = {
+        # IDE / 代码编辑器
+        "idea64.exe": ("IDEA", "orange", "ide"),
+        "pycharm64.exe": ("PyCharm", "green", "ide"),
+        "webstorm64.exe": ("WebStorm", "blue", "ide"),
+        "goland64.exe": ("GoLand", "teal", "ide"),
+        "clion64.exe": ("CLion", "purple", "ide"),
+        "rider64.exe": ("Rider", "red", "ide"),
+        "datagrip64.exe": ("DataGrip", "indigo", "ide"),
+        "dataspell64.exe": ("DataSpell", "orange", "ide"),
+        "studio64.exe": ("Android Studio", "green", "ide"),
+        "code.exe": ("VS Code", "blue", "ide"),
+        "cursor.exe": ("Cursor", "indigo", "ide"),
+        "devenv.exe": ("Visual Studio", "purple", "ide"),
+        "sublime_text.exe": ("Sublime", "orange", "ide"),
+        "notepad++.exe": ("Notepad++", "gray", "ide"),
+        # 聊天
+        "wechat.exe": ("微信", "green", "chat"),
+        "weixin.exe": ("微信", "green", "chat"),
+        "wechatapp.exe": ("微信小程序", "green", "chat"),
+        "qq.exe": ("QQ", "blue", "chat"),
+        "tim.exe": ("TIM", "blue", "chat"),
+        "dingtalk.exe": ("钉钉", "blue", "chat"),
+        "feishu.exe": ("飞书", "teal", "chat"),
+        "telegram.exe": ("Telegram", "teal", "chat"),
+        # 浏览器
+        "chrome.exe": ("Chrome", "red", "browser"),
+        "msedge.exe": ("Edge", "blue", "browser"),
+        "firefox.exe": ("Firefox", "orange", "browser"),
+        "iexplore.exe": ("IE", "blue", "browser"),
+        "360se.exe": ("360浏览器", "green", "browser"),
+        "360chrome.exe": ("360浏览器", "green", "browser"),
+        "360chromex.exe": ("360浏览器", "green", "browser"),
+        # 终端
+        "cmd.exe": ("命令提示符", "gray", "term"),
+        "powershell.exe": ("PowerShell", "indigo", "term"),
+        "pwsh.exe": ("PowerShell", "indigo", "term"),
+        "windowsterminal.exe": ("终端", "gray", "term"),
+        "wt.exe": ("终端", "gray", "term"),
+        # Office / 文档
+        "winword.exe": ("Word", "blue", "office"),
+        "excel.exe": ("Excel", "green", "office"),
+        "powerpnt.exe": ("PPT", "red", "office"),
+        "wps.exe": ("WPS", "blue", "office"),
+        "et.exe": ("WPS表格", "green", "office"),
+        "wpp.exe": ("WPS演示", "red", "office"),
+        # 系统 / Lumina 虚拟来源
+        "explorer.exe": ("资源管理器", "teal", "app"),
+        "screenshot": ("截图", "purple", "shot"),
+        "region": ("截图", "purple", "shot"),
+        "fullscreen": ("截图", "purple", "shot"),
+        "download": ("图片下载", "purple", "shot"),
+    }
 
     # ---------- Apple 设计令牌 ----------
     # 系统色板：(浅色, 深色)，取自 iOS/macOS system colors
@@ -866,6 +921,18 @@ class HistoryPanel:
         """单个系统色，如 self._sys('blue')。"""
         idx = 1 if self._is_dark_mode() else 0
         return self.SYS_COLORS.get(name, self.SYS_COLORS["gray"])[idx]
+
+    def _source_app(self, source):
+        """source 字段 → (显示名, 系统色名, 渲染风格)。
+
+        未收录的进程回退为去 .exe 的进程名 + 默认风格。
+        """
+        s = (source or "").strip()
+        hit = self.SOURCE_APPS.get(s.lower())
+        if hit:
+            return hit
+        name = s[:-4] if s.lower().endswith(".exe") else s
+        return (name or "未知来源", "gray", "app")
 
     def _font(self, size, weight="normal"):
         return (self.FONT_FAMILY, size, weight)
@@ -1477,10 +1544,7 @@ class HistoryPanel:
         return preview or "(空)"
 
     def _row_meta(self, r, group, now):
-        src = (r["source"] or "").strip()
-        if src.lower().endswith(".exe"):
-            src = src[:-4]
-        src = src or "未知来源"
+        src = self._source_app(r["source"])[0][:18]
         when = self._fmt_row_time(r["created_at"], group, now)
         parts = [when, src[:18]]
         if self._cat_of(r) != "image":
@@ -1796,44 +1860,26 @@ class HistoryPanel:
         # 内容容器不透明（避免缝隙透出桌面）；其内缩大于圆角背景的角排除区，故不产生直角溢出
         self._cmp_root = tk.Frame(self.win, bg=win_bg)
 
-        # ---------- 顶栏：搜索胶囊(左栏宽) + 动作簇 📷⚙⛶✕(详情栏宽) ----------
+        # ---------- 双栏布局：左(搜索+列表) / 右(详情)，两栏顶端对齐 ----------
+        # 详情区上移到窗口内容顶端：其首行工具栏与左侧搜索胶囊同高，
+        # 窗口按钮(📷⚙⛶✕)并入该行最右侧，行级动作按钮也在此行。
         detail_w = self._detail_width(self._cw - 60)  # 60 = cmp_root内缩32 + body padx28
         self._sh_h = int(round(30 * dpi))
-        header = tk.Frame(self._cmp_root, bg=win_bg)
-        header.pack(fill="x", padx=14, pady=(10, 6))
         self._hdr_icons = self._make_header_icons(dpi, T["label2"])
 
-        # 结构化分区：左区弹性(=列表栏宽) + 21px 占位(=分隔线) + 右区(=详情栏宽)
-        header_left = tk.Frame(header, bg=win_bg)
-        header_left.pack(side="left", fill="both", expand=True)
-        tk.Frame(header, bg=win_bg, width=21).pack(side="left")
-        self._hdr_right = tk.Frame(header, bg=win_bg, width=detail_w)
-        self._hdr_right.pack(side="left", fill="y")
-        self._hdr_right.pack_propagate(False)
-        header_right = self._hdr_right
+        body_split = tk.Frame(self._cmp_root, bg=win_bg)
+        body_split.pack(fill="both", expand=True, padx=14, pady=(10, 0))
+        body_split.bind("<Configure>", self._on_split_configure)
+        body_split.bind("<ButtonPress-1>", self._hdr_press)
+        body_split.bind("<B1-Motion>", self._hdr_move)
+        left = tk.Frame(body_split, bg=win_bg)
+        left.pack(side="left", fill="both", expand=True)
+        left.bind("<ButtonPress-1>", self._hdr_press)
+        left.bind("<B1-Motion>", self._hdr_move)
 
-        btn_pad = (max(0, (self._sh_h - int(round(24 * dpi))) // 2), 0)
-        close_b = self._icon_button(header_right, self._hdr_icons["close"],
-                                    self.hide, win_bg, T["fill_hover"])
-        close_b.pack(side="right", pady=btn_pad)
-        self._max_btn = self._icon_button(
-            header_right, self._hdr_icons["expand"], self._toggle_maximize,
-            win_bg, T["fill_hover"])
-        self._max_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
-        self._settings_btn = self._icon_button(
-            header_right, self._hdr_icons["gear"],
-            lambda: self._toggle_popup_menu("settings", self._settings_btn),
-            win_bg, T["fill_hover"])
-        self._settings_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
-        self._shot_btn = self._icon_button(
-            header_right, self._hdr_icons["shot"],
-            lambda: self._toggle_popup_menu("shot", self._shot_btn),
-            win_bg, T["fill_hover"])
-        self._shot_btn.pack(side="right", padx=(0, 6), pady=btn_pad)
-
-        # 搜索胶囊常驻左区：默认图标居中（占位态），点击后图标靠左变输入框
-        self._search_wrap = tk.Frame(header_left, bg=win_bg, height=self._sh_h)
-        self._search_wrap.pack(side="left", fill="x", expand=True)
+        # 搜索胶囊常驻左栏顶部：默认图标居中（占位态），点击后图标靠左变输入框
+        self._search_wrap = tk.Frame(left, bg=win_bg, height=self._sh_h)
+        self._search_wrap.pack(fill="x", pady=(0, 6))
         self._search_canvas = tk.Canvas(self._search_wrap, height=self._sh_h,
                                         bg=win_bg, highlightthickness=0, bd=0)
         self._search_canvas.pack(fill="x")
@@ -1853,23 +1899,37 @@ class HistoryPanel:
         self._search_canvas.bind("<ButtonPress-1>", self._search_press)
         self._search_canvas.bind("<B1-Motion>", self._hdr_move)
 
-        header.bind("<ButtonPress-1>", self._hdr_press)
-        header.bind("<B1-Motion>", self._hdr_move)
-
-        # ---------- 双栏布局：左列表 / 右详情（master-detail，42:58 动态比例） ----------
-        body_split = tk.Frame(self._cmp_root, bg=win_bg)
-        body_split.pack(fill="both", expand=True, padx=14, pady=(2, 0))
-        body_split.bind("<Configure>", self._on_split_configure)
-        left = tk.Frame(body_split, bg=win_bg)
-        left.pack(side="left", fill="both", expand=True)
         sep = tk.Frame(body_split, bg=T["hairline"], width=1)
         sep.pack(side="left", fill="y", padx=10, pady=2)
+        sep.bind("<ButtonPress-1>", self._hdr_press)
+        sep.bind("<B1-Motion>", self._hdr_move)
         self._detail = DetailPane(self, body_split, detail_w)
+
+        # 窗口按钮：详情区顶部工具栏最右侧（垂直居中由 pack anchor 完成）
+        header_right = self._detail.win_bar
+        btn_bg = self._detail.BG
+        close_b = self._icon_button(header_right, self._hdr_icons["close"],
+                                    self.hide, btn_bg, T["fill_hover"])
+        close_b.pack(side="right")
+        self._max_btn = self._icon_button(
+            header_right, self._hdr_icons["expand"], self._toggle_maximize,
+            btn_bg, T["fill_hover"])
+        self._max_btn.pack(side="right", padx=(0, 2))
+        self._settings_btn = self._icon_button(
+            header_right, self._hdr_icons["gear"],
+            lambda: self._toggle_popup_menu("settings", self._settings_btn),
+            btn_bg, T["fill_hover"])
+        self._settings_btn.pack(side="right", padx=(0, 2))
+        self._shot_btn = self._icon_button(
+            header_right, self._hdr_icons["shot"],
+            lambda: self._toggle_popup_menu("shot", self._shot_btn),
+            btn_bg, T["fill_hover"])
+        self._shot_btn.pack(side="right", padx=(0, 6))
 
         # ---------- 过滤胶囊 pills（Canvas 自绘，紧凑） ----------
         chip_wrap = tk.Frame(left, bg=win_bg)
         chip_wrap.pack(fill="x", pady=(0, 6))
-        self._chip_h = int(round(24 * dpi))
+        self._chip_h = int(round(28 * dpi))
         self._chip_canvas = tk.Canvas(chip_wrap, height=self._chip_h, bg=win_bg,
                                       highlightthickness=0, bd=0)
         self._chip_canvas.pack(fill="x")
@@ -1927,8 +1987,6 @@ class HistoryPanel:
             changed = self._detail.frame.winfo_width() != dw
             if changed:
                 self._detail.frame.configure(width=dw)
-            if self._hdr_right.winfo_width() != dw:
-                self._hdr_right.configure(width=dw)
             if changed and self._detail.row is not None \
                     and self._detail.row["kind"] == "image":
                 self._detail.invalidate_size()
@@ -2133,7 +2191,7 @@ class HistoryPanel:
     def _make_chip_photo(self, label, h, sel, T):
         from PIL import Image, ImageDraw, ImageTk
         ss = 2
-        fsize = max(8, int(round(9 * self._dpi)))
+        fsize = max(10, int(round(11 * self._dpi)))
         fnt = self._load_font(fsize * ss)
         pad_x = int(round(10 * self._dpi)) * ss
         probe = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
@@ -2605,18 +2663,31 @@ class DetailPane:
         self.frame = tk.Frame(parent, bg=self.BG, width=width)
         self.frame.pack(side="left", fill="y")
         self.frame.pack_propagate(False)
+        # 顶部工具栏：与左侧搜索胶囊同高、顶端对齐；
+        # 左=行级动作（回贴/复制/…），右=窗口按钮（由 HistoryPanel 填充）
+        self._toolbar = tk.Frame(self.frame, bg=self.BG,
+                                 height=getattr(panel, "_sh_h", 30))
+        self._toolbar.pack(fill="x")
+        self._toolbar.pack_propagate(False)
+        self.win_bar = tk.Frame(self._toolbar, bg=self.BG)
+        self.win_bar.pack(side="right", padx=(0, 2))
+        self._actions = tk.Frame(self._toolbar, bg=self.BG)
+        self._actions.pack(side="left", fill="x", expand=True, padx=(4, 0))
         self._meta = tk.Label(self.frame, text="预览", bg=T["field"],
                               fg=T["label2"], font=("Microsoft YaHei UI", 8),
                               anchor="w", padx=8, pady=4)
         self._meta.pack(fill="x")
-        self._actions = tk.Frame(self.frame, bg=self.BG)
-        self._actions.pack(side="bottom", fill="x", padx=4, pady=(2, 6))
         self._host = tk.Frame(self.frame, bg=self.BG)
-        self._host.pack(fill="both", expand=True, padx=4, pady=4)
-        for w in (self.frame, self._meta, self._host):
+        self._host.pack(fill="both", expand=True, padx=4, pady=(2, 4))
+        for w in (self.frame, self._toolbar, self._meta, self._host):
             w.bind("<MouseWheel>", self._on_wheel)
         self.frame.bind("<Return>", self._paste_key)
         self._meta.bind("<Button-3>", self._menu)
+        # 工具栏/meta 空白区域可拖动窗口（接替原顶栏拖拽区）；
+        # 子按钮自带事件处理，Tk 不冒泡，故绑定互不干扰
+        for w in (self._toolbar, self._actions, self._meta):
+            w.bind("<ButtonPress-1>", panel._hdr_press)
+            w.bind("<B1-Motion>", panel._hdr_move)
         self.show_placeholder()
 
     # ---------- 渲染调度 ----------
@@ -2689,8 +2760,14 @@ class DetailPane:
         for w in self._host.winfo_children():
             w.destroy()
         if kind == "image" and full["image"]:
+            s_name, s_color, s_style = self.panel._source_app(full["source"])
+            if s_style in ("chat", "browser", "ide", "term", "office"):
+                self._source_header(self._host, s_name, s_color, full, self.tk)
             self._build_image_body(self._host, full, self.tk)
         elif self.cat == "file":
+            s_name, s_color, s_style = self.panel._source_app(full["source"])
+            if s_style in ("chat", "browser", "ide", "term", "office"):
+                self._source_header(self._host, s_name, s_color, full, self.tk)
             self._build_file_body(self._host, full, self.tk)
         else:
             self._build_text_body(self._host, full, self.tk)
@@ -2731,7 +2808,7 @@ class DetailPane:
         size_txt = f"{nbytes // 1024} KB" if nbytes >= 1024 else f"{nbytes} B"
         meta = (f"#{row['id']} · {cat_label} · "
                 f"{size_txt} · {(row['created_at'] or '')[:19]}"
-                f" · {(row['source'] or '?')[:18]}")
+                f" · {self.panel._source_app(row['source'])[0][:18]}")
         if row["pinned"]:
             meta = "[已钉] " + meta
         if row["tags"]:
@@ -2827,10 +2904,34 @@ class DetailPane:
 
     def _build_text_body(self, outer, row, tk):
         T = self.T
+        p = self.panel
         full_text = row["content"] or ""
         truncated = len(full_text) > self.TEXT_MAX
         content = full_text[:self.TEXT_MAX]
-        is_code = self.cat == "code"
+        src_name, src_color, src_style = p._source_app(row["source"])
+        is_code = self.cat == "code" or src_style in ("ide", "term")
+        console = src_style == "term"
+        chat = src_style == "chat"
+        dark = p._is_dark_mode()
+
+        if chat:
+            self._source_header(outer, src_name, src_color, row, tk)
+            bg = self._mix(p._sys(src_color), T["card_bg"],
+                           0.14 if not dark else 0.30)
+            fg, font = T["label"], ("Microsoft YaHei UI", 11)
+            padx, pady = 12, 10
+        elif console:
+            self._source_header(outer, src_name, src_color, row, tk)
+            bg, fg, font = "#1F1F1F", "#E8E8E8", ("Consolas", 10)
+            padx, pady = 10, 8
+        else:
+            if src_style == "browser":
+                self._browser_bar(outer, content, src_name, src_color, tk)
+            elif src_style == "ide":
+                self._source_header(outer, src_name, src_color, row, tk)
+            bg, fg = self.BG, T["label"]
+            font = ("Consolas", 10) if is_code else ("Microsoft YaHei UI", 10)
+            padx, pady = 8, 6
 
         def _wlen(s):
             # CJK 等宽字符按 2 列估算，避免中文行被折得过窄
@@ -2838,12 +2939,12 @@ class DetailPane:
 
         longest = max((_wlen(s) for s in content.split("\n")), default=10)
         width = max(28, min(longest + 2, 64))
-        font = ("Consolas", 10) if is_code else ("Microsoft YaHei UI", 10)
+        sel_bg = "#264F78" if console else T["accent_soft"]
         self._body = tk.Text(outer, wrap="word", relief="flat", bd=0,
-                             bg=self.BG, fg=T["label"], padx=8, pady=6,
-                             insertbackground=T["label"],
-                             selectbackground=T["accent_soft"],
-                             selectforeground=T["label"],
+                             bg=bg, fg=fg, padx=padx, pady=pady,
+                             insertbackground=fg,
+                             selectbackground=sel_bg,
+                             selectforeground=fg if console else T["label"],
                              font=font,
                              width=width,
                              height=2,
@@ -2853,11 +2954,12 @@ class DetailPane:
         self._body.insert("1.0", content)
         if truncated:
             notice = (f"\n────\n… 已截断，共 {len(full_text)} 字符，"
-                      f"仅显示前 {self.TEXT_MAX}")
+                       f"仅显示前 {self.TEXT_MAX}")
             start = self._body.index("end-1c")
             self._body.insert("end", notice)
             self._body.tag_add("dim", start, "end-1c")
-        self._body.tag_configure("dim", foreground=T["label3"])
+        self._body.tag_configure(
+            "dim", foreground="#8A8A8E" if console else T["label3"])
         # 只读但可选中：保持 normal 才能鼠标拖选/建立 sel 标签，
         # 通过拦截按键阻止编辑（复制走右键菜单或 Ctrl+C）。
         # exportselection=0：选区纯本地——不抢占系统剪贴板，
@@ -2868,8 +2970,91 @@ class DetailPane:
         # 详情区高度固定：Text 直接撑满可用空间，超长内容滚轮滚动
         self._body.pack(fill="both", expand=True, padx=2, pady=2)
         if is_code:
-            self._highlight_code(content)
-        self._linkify(content)
+            self._highlight_code(content, console=console)
+        self._linkify(content, dark_bg=console)
+
+    # ---------- 来源风格渲染 ----------
+    @staticmethod
+    def _mix(c1, c2, t):
+        """c1 按占比 t 混入 c2，返回 #RRGGBB（气泡底色等派生色用）。"""
+        def _p(h):
+            h = h.lstrip("#")
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        a, b = _p(c1), _p(c2)
+        return "#%02X%02X%02X" % tuple(
+            int(a[i] * t + b[i] * (1 - t)) for i in range(3))
+
+    def _app_tile(self, color_name, letter, size):
+        """应用色圆角 tile + 白色首字符，返回 PhotoImage。"""
+        from PIL import Image, ImageDraw, ImageTk
+        p = self.panel
+        rgb = p._hex_to_rgb(p._sys(color_name))
+        ss = 2
+        s = size * ss
+        im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(im)
+        dr.rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.22),
+                             fill=rgb + (255,))
+        font = p._load_font(int(s * 0.52))
+        bb = dr.textbbox((0, 0), letter, font=font)
+        dr.text(((s - (bb[2] - bb[0])) / 2 - bb[0],
+                 (s - (bb[3] - bb[1])) / 2 - bb[1]),
+                letter, font=font, fill=(255, 255, 255, 255))
+        photo = ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
+        self._file_photos.append(photo)
+        return photo
+
+    def _source_header(self, outer, name, color, row, tk):
+        """来源应用行：彩色 tile + 应用名 + 时间（chat/term/ide 风格顶部）。"""
+        T = self.T
+        p = self.panel
+        bar = tk.Frame(outer, bg=self.BG)
+        bar.pack(fill="x", padx=4, pady=(2, 6))
+        size = max(18, int(round(22 * p._dpi)))
+        tile = self._app_tile(color, (name[:1] or "?").upper(), size)
+        lb = tk.Label(bar, image=tile, bg=self.BG)
+        lb.image = tile
+        lb.pack(side="left", padx=(2, 6))
+        tk.Label(bar, text=name, bg=self.BG, fg=T["label"],
+                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        tk.Label(bar, text=(row["created_at"] or "")[:16], bg=self.BG,
+                 fg=T["label3"],
+                 font=("Microsoft YaHei UI", 8)).pack(side="right", padx=4)
+        bar.bind("<MouseWheel>", self._on_wheel)
+
+    def _browser_bar(self, outer, content, name, color, tk):
+        """浏览器来源：地址栏风格行，检出首个 URL 可点击直达。"""
+        T = self.T
+        p = self.panel
+        bar = tk.Frame(outer, bg=T["field"])
+        bar.pack(fill="x", padx=2, pady=(2, 6))
+        size = max(16, int(round(18 * p._dpi)))
+        tile = self._app_tile(color, (name[:1] or "?").upper(), size)
+        il = tk.Label(bar, image=tile, bg=T["field"])
+        il.image = tile
+        il.pack(side="left", padx=(8, 6), pady=3)
+        m = self.URL_RE.search(content)
+        url = m.group(0).rstrip(self.URL_RSTRIP) if m else None
+        if url:
+            lb = tk.Label(bar, text=url[:96], bg=T["field"], fg=T["accent"],
+                          font=("Microsoft YaHei UI", 9), anchor="w",
+                          cursor="hand2")
+            lb.pack(side="left", fill="x", expand=True, pady=3)
+            lb.bind("<Button-1>", lambda e: self._open_url(url))
+            go = tk.Button(bar, text="打开", command=lambda: self._open_url(url),
+                           relief="flat", bd=0, bg=p._sys("blue"), fg="#FFFFFF",
+                           activebackground=p._sys("blue"),
+                           activeforeground="#FFFFFF",
+                           font=("Microsoft YaHei UI", 8, "bold"),
+                           padx=8, pady=1, cursor="hand2",
+                           highlightthickness=0)
+            go.pack(side="right", padx=6, pady=3)
+            self._urls.append(url)
+        else:
+            tk.Label(bar, text=name, bg=T["field"], fg=T["label2"],
+                     font=("Microsoft YaHei UI", 9), anchor="w"
+                     ).pack(side="left", fill="x", expand=True, pady=3)
+        bar.bind("<MouseWheel>", self._on_wheel)
 
     def _build_file_body(self, outer, row, tk):
         T = self.T
@@ -2981,15 +3166,23 @@ class DetailPane:
         return im.resize((size, size), Image.LANCZOS)
 
     # ---------- 代码着色 / 链接 ----------
-    def _highlight_code(self, content):
+    def _highlight_code(self, content, console=False):
         body = self._body
         T = self.T
         p = self.panel
-        body.tag_configure("kw", foreground=T["accent"],
+        if console:
+            # VS Code Dark 风格控制台配色
+            kw, st = "#569CD6", "#CE9178"
+            num, com = "#B5CEA8", "#6A9955"
+        else:
+            kw = T["accent"]
+            st, num = p._sys("green"), p._sys("orange")
+            com = T["label3"]
+        body.tag_configure("kw", foreground=kw,
                            font=("Consolas", 10, "bold"))
-        body.tag_configure("str", foreground=p._sys("green"))
-        body.tag_configure("num", foreground=p._sys("orange"))
-        body.tag_configure("com", foreground=T["label3"])
+        body.tag_configure("str", foreground=st)
+        body.tag_configure("num", foreground=num)
+        body.tag_configure("com", foreground=com)
         st = [0, 1, 0]  # pos, line, col
 
         def _idx(off):
@@ -3012,10 +3205,11 @@ class DetailPane:
         except Exception:
             traceback.print_exc()
 
-    def _linkify(self, content):
+    def _linkify(self, content, dark_bg=False):
         body = self._body
         T = self.T
-        body.tag_configure("url", foreground=T["accent"], underline=True)
+        url_fg = self.panel.SYS_COLORS["teal"][1] if dark_bg else T["accent"]
+        body.tag_configure("url", foreground=url_fg, underline=True)
         st = [0, 1, 0]
 
         def _idx(off):
