@@ -731,7 +731,7 @@ class HistoryPanel:
     TRANS_COLOR = "#010203"
     FILTERS = (("all", "全部"), ("text", "文本"), ("code", "代码"),
                ("link", "链接"), ("image", "图片"), ("file", "文件"),
-               ("pinned", "钉住"))
+               ("pinned", "收藏"))
     CATEGORY_LABELS = {"text": "文本", "code": "代码", "link": "链接",
                         "image": "图片", "file": "文件"}
     # source 进程名（小写）→ (显示名, 系统色, 渲染风格)
@@ -995,6 +995,53 @@ class HistoryPanel:
         self._tile_cache[key] = out
         return out
 
+    def _source_code_tile(self, source, size):
+        """Brand-like code tile using the source application's short mark."""
+        dark = self._is_dark_mode()
+        app_name, color_name, _style = self._source_app(source)
+        source_key = (source or "").lower()
+        marks = {
+            "idea64.exe": ("IJ", "#FF7A00"),
+            "pycharm64.exe": ("PC", "#21D789"),
+            "webstorm64.exe": ("WS", "#00B8F5"),
+            "goland64.exe": ("GO", "#20D5C2"),
+            "clion64.exe": ("CL", "#F2C94C"),
+            "rider64.exe": ("RD", "#9B51E0"),
+            "datagrip64.exe": ("DG", "#FF5C7A"),
+            "dataspell64.exe": ("DS", "#FF9F43"),
+            "studio64.exe": ("AS", "#3DDC84"),
+            "code.exe": ("<>", "#1683FF"),
+            "cursor.exe": ("C", "#6C63FF"),
+            "devenv.exe": ("VS", "#8B5CF6"),
+            "sublime_text.exe": ("S", "#FF9800"),
+        }
+        mark, fallback = marks.get(source_key, ("</>", self._sys("orange")))
+        if source_key not in marks:
+            mark = "</>" if app_name == "未知来源" else app_name[:2].upper()
+        color = fallback if source_key in marks else self._sys(color_name)
+        key = ("source", source_key, mark, size, dark)
+        hit = self._tile_cache.get(key)
+        if hit is not None:
+            return hit
+        from PIL import Image, ImageDraw, ImageFont
+        size = max(8, int(size))
+        ss = 2
+        s = size * ss
+        im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(im)
+        bg = self._hex_to_rgb(color)
+        dr.rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.24),
+                             fill=bg + (255,))
+        font = self._load_font(max(10, int(s * 0.30)))
+        bbox = dr.textbbox((0, 0), mark, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        fg = (255, 255, 255, 255)
+        dr.text(((s - tw) / 2 - bbox[0], (s - th) / 2 - bbox[1]),
+                mark, font=font, fill=fg)
+        out = im.resize((size, size), Image.LANCZOS)
+        self._tile_cache[key] = out
+        return out
+
     def _draw_glyph(self, dr, name, s, color):
         """在 s×s 画布内绘制白色 SF Symbols 风格字形。"""
         w = max(2, int(round(s * 0.075)))
@@ -1184,7 +1231,7 @@ class HistoryPanel:
             return
         cat = self._cat_of(row)
         items = [("仅复制  (Ctrl+C)", self.copy_only),
-                 ("钉住/取消钉住  (Ctrl+P)", self.toggle_pin),
+                 ("收藏/取消收藏  (Ctrl+P)", self.toggle_pin),
                  ("导出…", self._export_selected),
                  None,
                  ("删除  (Del)", self.delete_selected)]
@@ -1437,7 +1484,7 @@ class HistoryPanel:
             self.status_var.set("清理失败")
             return
         self.refresh()
-        self.status_var.set(f"已清理 {deleted} 条过期记录（钉住保留）")
+        self.status_var.set(f"已清理 {deleted} 条过期记录（收藏保留）")
 
     def _close_popup_menu(self):
         self._popup_open = False
@@ -1559,8 +1606,8 @@ class HistoryPanel:
         self._row_rects = []
         self._card_photos = []
         d = self._dpi
-        self._render_list(canvas, rows, now, row_h=int(round(58 * d)),
-                          tile_size=int(round(38 * d)), margin=int(round(12 * d)),
+        self._render_list(canvas, rows, now, row_h=int(round(66 * d)),
+                          tile_size=int(round(46 * d)), margin=int(round(12 * d)),
                           title_size=11, meta_size=9)
 
     def _render_list(self, canvas, rows, now, row_h, tile_size, margin,
@@ -1622,12 +1669,17 @@ class HistoryPanel:
                                anchor="w", text=meta, fill=T["label2"],
                                font=self._font(meta_size), tags=("card", cid))
 
-            if r["pinned"]:
-                pin = self._pin_marker()
-                self._card_photos.append(pin)
-                canvas.create_image(margin + card_w - int(round(12 * self._dpi)),
-                                    y + row_h // 2, image=pin, anchor="e",
-                                    tags=("card", cid))
+            favorite_size = max(16, int(round(18 * self._dpi)))
+            favorite_x = margin + card_w - int(round(12 * self._dpi))
+            favorite = self._favorite_marker(bool(r["pinned"]), favorite_size)
+            self._card_photos.append(favorite)
+            favorite_tag = f"favorite:{cid}"
+            canvas.create_image(favorite_x, y + row_h // 2, image=favorite,
+                                anchor="e", tags=("card", cid, "favorite",
+                                                   favorite_tag))
+            canvas.tag_bind(
+                favorite_tag, "<Button-1>",
+                lambda _event, favorite_id=int(cid): self._favorite_click(favorite_id))
             y += row_h + gap
 
         canvas.configure(scrollregion=(0, 0, cw, y + int(round(4 * self._dpi))))
@@ -1637,6 +1689,12 @@ class HistoryPanel:
             self._sel_id = ids[0] if ids else None
             if self._sel_id is not None:
                 self._apply_row_bg(self._sel_id)
+
+    def _favorite_click(self, clip_id):
+        """Toggle a row's favorite state without triggering paste-back."""
+        self._select(clip_id)
+        self.toggle_pin()
+        return "break"
 
     # ---------- 行内容/图标 ----------
     def _row_main(self, r, cat):
@@ -1677,6 +1735,15 @@ class HistoryPanel:
                 self._thumb_cache.pop(next(iter(self._thumb_cache)))
             self._thumb_cache[key] = photo
             return photo
+        if cat == "code":
+            source = r["source"] if "source" in r.keys() else ""
+            source_key = (source or "").lower()
+            key = f"tile:code:{source_key}:{size}:{dark}"
+            hit = self._thumb_cache.get(key)
+            if hit is None:
+                hit = ImageTk.PhotoImage(self._source_code_tile(source, size))
+                self._thumb_cache[key] = hit
+            return hit
         key = f"tile:{cat}:{size}:{dark}"
         hit = self._thumb_cache.get(key)
         if hit is None:
@@ -1693,15 +1760,22 @@ class HistoryPanel:
             img = Image.open(io.BytesIO(full["image"])).convert("RGBA")
         except Exception:
             return None
-        img.thumbnail((size, size), Image.LANCZOS)
-        out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        img.thumbnail((size - 4, size - 4), Image.LANCZOS)
+        tile_bg = self._hex_to_rgb(self._c("card_bg")) + (255,)
+        border = self._hex_to_rgb(self._c("hairline")) + (255,)
+        out = Image.new("RGBA", (size, size), tile_bg)
         out.paste(img, ((size - img.width) // 2, (size - img.height) // 2), img)
         ss = 2
         mask = Image.new("L", (size * ss, size * ss), 0)
-        ImageDraw.Draw(mask).rounded_rectangle(
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.rounded_rectangle(
             [0, 0, size * ss - 1, size * ss - 1],
-            radius=int(size * 0.24 * ss), fill=255)
+            radius=int(size * 0.22 * ss), fill=255)
         out.putalpha(mask.resize((size, size), Image.LANCZOS))
+        draw = ImageDraw.Draw(out)
+        draw.rounded_rectangle(
+            [0, 0, size - 1, size - 1],
+            radius=int(size * 0.22), outline=border, width=max(1, size // 20))
         return out
 
     def _row_card_bg(self, w, h, state):
@@ -1744,17 +1818,56 @@ class HistoryPanel:
         if hit is not None:
             return hit
         from PIL import Image, ImageDraw, ImageTk
-        rgb = self._hex_to_rgb(self._c("accent")) + (255,)
+        rgb = self._hex_to_rgb(self._sys("orange")) + (255,)
         ss = 2
         s = size * ss
         im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         dr = ImageDraw.Draw(im)
-        w = max(2, int(round(s * 0.11)))
-        cx, cy, r = s * 0.42, s * 0.40, s * 0.19
-        dr.ellipse([cx - r, cy - r, cx + r, cy + r], fill=rgb)
-        dr.line([(cx + r * 0.55, cy + r * 0.55), (s * 0.80, s * 0.82)],
-                fill=rgb, width=w)
+        import math
+        cx, cy = s * 0.5, s * 0.5
+        outer, inner = s * 0.40, s * 0.18
+        points = []
+        for i in range(10):
+            angle = -math.pi / 2 + i * math.pi / 5
+            radius = outer if i % 2 == 0 else inner
+            points.append((cx + math.cos(angle) * radius,
+                           cy + math.sin(angle) * radius))
+        dr.polygon(points, fill=rgb)
         photo = ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
+        self._marker_cache[key] = photo
+        return photo
+
+    def _favorite_marker(self, selected, size):
+        """Return a hollow or filled orange star for the list favorite action."""
+        dark = self._is_dark_mode()
+        key = ("favorite", selected, size, dark)
+        hit = self._marker_cache.get(key)
+        if hit is not None:
+            return hit
+        from PIL import Image, ImageDraw, ImageTk
+        import math
+
+        color_name = "orange" if selected else "gray"
+        color = self._hex_to_rgb(
+            self._sys(color_name) if selected else self._c("label2")) + (255,)
+        ss = 3
+        s = size * ss
+        image = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        cx, cy = s / 2, s / 2
+        outer, inner = s * 0.42, s * 0.19
+        points = []
+        for i in range(10):
+            angle = -math.pi / 2 + i * math.pi / 5
+            radius = outer if i % 2 == 0 else inner
+            points.append((cx + math.cos(angle) * radius,
+                           cy + math.sin(angle) * radius))
+        if selected:
+            draw.polygon(points, fill=color)
+        else:
+            draw.line(points + [points[0]], fill=color, width=max(2, s // 14),
+                      joint="curve")
+        photo = ImageTk.PhotoImage(image.resize((size, size), Image.LANCZOS))
         self._marker_cache[key] = photo
         return photo
 
@@ -1929,7 +2042,7 @@ class HistoryPanel:
         self.db.set_pinned(row["id"], not row["pinned"])
         self.refresh()
         self.status_var.set(
-            f"#{row['id']} {'已钉住（不可清除）' if not row['pinned'] else '已取消钉住'}")
+            f"#{row['id']} {'已收藏（不可清除）' if not row['pinned'] else '已取消收藏'}")
 
     def delete_selected(self):
         row = self._selected_row()
@@ -1937,7 +2050,7 @@ class HistoryPanel:
             self.status_var.set("未选中记录")
             return
         if row["pinned"]:
-            self.status_var.set(f"#{row['id']} 已钉住，不可删除；请先取消钉住")
+            self.status_var.set(f"#{row['id']} 已收藏，不可删除；请先取消收藏")
             return
         self.db.delete(row["id"])
         self.refresh()
@@ -2065,9 +2178,12 @@ class HistoryPanel:
                                       highlightthickness=0, bd=0)
         self._chip_canvas.pack(fill="x")
         self._chip_canvas.bind("<Button-1>", self._on_chip_click)
+        self._chip_canvas.bind("<Motion>", self._on_chip_motion)
+        self._chip_canvas.bind("<Leave>", self._on_chip_leave)
         self._chip_canvas.bind("<Configure>", lambda e: self._layout_chips())
         self._chip_hit = []
         self._chip_photos = []
+        self._chip_hover = None
 
         # 卡片列表（Canvas 替代 Treeview）
         list_frame = tk.Frame(left, bg=self._canvas_bg())
@@ -2088,7 +2204,7 @@ class HistoryPanel:
         footer = tk.Frame(self._cmp_root, bg=win_bg)
         footer.pack(fill="x", padx=14, pady=(0, 6))
         tk.Label(footer, bg=win_bg, fg=T["label3"], font=self._font(8),
-                 text="Enter 回贴 · Ctrl+C 复制 · Ctrl+P 钉住 · Del 删除 · Ctrl+1-9 快速"
+                 text="Enter 回贴 · Ctrl+C 复制 · Ctrl+P 收藏 · Del 删除 · Ctrl+1-9 快速"
                  ).pack(side="left")
         self._cmp_status = tk.Label(footer, textvariable=self.status_var,
                                     bg=win_bg, fg=T["label2"], font=self._font(8))
@@ -2403,7 +2519,7 @@ class HistoryPanel:
         if focused is not self.search_entry_c:
             self._deactivate_search(refocus=False)
 
-    def _make_chip_photo(self, label, h, sel, T):
+    def _make_chip_photo(self, label, h, sel, T, key="all", hover=False):
         from PIL import Image, ImageDraw, ImageTk
         ss = 2
         fsize = max(10, int(round(11 * self._dpi)))
@@ -2419,14 +2535,41 @@ class HistoryPanel:
         if sel:
             fill = self._hex_to_rgb(T["accent"]) + (255,)
             fg = (255, 255, 255, 255)
+        elif hover:
+            fill = self._hex_to_rgb(self._chip_color(key, T, soft=True)) + (255,)
+            fg = self._hex_to_rgb(self._chip_color(key, T)) + (255,)
         else:
-            fill = self._hex_to_rgb(T["fill"]) + (255,)
+            fill = self._hex_to_rgb(T["field"]) + (255,)
             fg = self._hex_to_rgb(T["label"]) + (235,)
         dr.rounded_rectangle([0, 0, s_w - 1, s_h - 1], radius=s_h // 2, fill=fill)
         dr.text(((s_w - tw) / 2 - bb[0], (s_h - th) / 2 - bb[1]), label,
                 font=fnt, fill=fg)
         w = max(1, s_w // ss)
         return ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS)), w
+
+    def _chip_color(self, key, T, soft=False):
+        colors = {
+            "all": T["accent"],
+            "text": self._sys("gray"),
+            "code": self._sys("orange"),
+            "link": self._sys("blue"),
+            "image": self._sys("purple"),
+            "file": self._sys("green"),
+            "pinned": self._sys("orange"),
+        }
+        color = colors.get(key, T["accent"])
+        if not soft:
+            return color
+        # Keep hover backgrounds subtle while retaining the category hue.
+        return {
+            "all": T["accent_soft"],
+            "text": "#E7E7EA" if not self._dark else "#3A3A3C",
+            "code": "#FFF0D6" if not self._dark else "#4A3820",
+            "link": "#E5F0FF" if not self._dark else "#1E3050",
+            "image": "#F2E5FA" if not self._dark else "#402650",
+            "file": "#E3F6E8" if not self._dark else "#1E4428",
+            "pinned": "#FFF0D6" if not self._dark else "#4A3820",
+        }.get(key, T["accent_soft"])
 
     def _layout_chips(self):
         c = getattr(self, "_chip_canvas", None)
@@ -2440,10 +2583,11 @@ class HistoryPanel:
         self._chip_photos = []
         self._chip_hit = []
         h = self._chip_h
-        gap = int(round(6 * self._dpi))
+        gap = int(round(4 * self._dpi))
         x = 0
         for key, label in self.FILTERS:
-            photo, pw = self._make_chip_photo(label, h, key == self._filter, T)
+            photo, pw = self._make_chip_photo(
+                label, h, key == self._filter, T, key, key == self._chip_hover)
             if x + pw > w:
                 break
             self._chip_photos.append(photo)
@@ -2456,6 +2600,21 @@ class HistoryPanel:
             if x0 <= e.x <= x1:
                 self._set_filter(key)
                 return
+
+    def _on_chip_motion(self, e):
+        key = None
+        for x0, x1, candidate in getattr(self, "_chip_hit", []):
+            if x0 <= e.x <= x1:
+                key = candidate
+                break
+        if key != self._chip_hover:
+            self._chip_hover = key
+            self._layout_chips()
+
+    def _on_chip_leave(self, _event):
+        if self._chip_hover is not None:
+            self._chip_hover = None
+            self._layout_chips()
 
     def _make_rounded_bg(self, w, h):
         """窗口材质：圆角背景 + 发丝描边，填充随主题。
@@ -3000,7 +3159,7 @@ class DetailPane:
                 f"{size_txt} · {(row['created_at'] or '')[:19]}"
                 f" · {self.panel._source_app(row['source'])[0][:18]}")
         if row["pinned"]:
-            meta = "[已钉] " + meta
+            meta = "[已收藏] " + meta
         if row["tags"]:
             meta += f" · {row['tags'][:16]}"
         self._meta.configure(text=meta)
@@ -3033,26 +3192,15 @@ class DetailPane:
             btn("打开", self._open_file)
         if self._urls:
             btn("打开链接", lambda: self._open_url(self._urls[0]))
-        btn("取消钉住" if self.row["pinned"] else "钉住", self._toggle_pin)
         btn("导出…", self._save_as)
         btn("删除", self._delete, fg=danger)
-
-    def _toggle_pin(self):
-        row = self.row
-        if row is None:
-            return
-        self.panel.db.set_pinned(row["id"], not row["pinned"])
-        self.panel.status_var.set(
-            f"#{row['id']} {'已取消钉住' if row['pinned'] else '已钉住（不可清除）'}")
-        self.panel.refresh()
-        self.show(row["id"], immediate=True)
 
     def _delete(self):
         row = self.row
         if row is None:
             return
         if row["pinned"]:
-            self.panel.status_var.set(f"#{row['id']} 已钉住，不可删除；请先取消钉住")
+            self.panel.status_var.set(f"#{row['id']} 已收藏，不可删除；请先取消收藏")
             return
         self.panel.db.delete(row["id"])
         self.panel.status_var.set(f"#{row['id']} 已删除")
