@@ -1264,34 +1264,115 @@ class HistoryPanel:
                       bg=T["card_bg"], fg=T["label"],
                       activebackground=T["fill_hover"], activeforeground=T["label"],
                       highlightthickness=0, padx=14, pady=6)
+
+        def sm_icon(draw_fn, size, color_name="label"):
+            """创建一个小尺寸图标 PhotoImage，供弹出菜单项右侧使用。"""
+            from PIL import Image, ImageDraw, ImageTk
+            s = size * 2  # 超采样保证平滑
+            rgb = self._hex_to_rgb(self._sys(color_name)) + (255,)
+            im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+            draw_fn(ImageDraw.Draw(im), s, rgb, max(1, int(s * 0.062)))
+            return ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
+
+        def sel_icon(dr, s, c, w):
+            """选区框：四个角括号"""
+            w = int(round(w))
+            m = s * 0.28
+            dr.line([(m, s*0.12), (m, s*0.28), (s*0.12, s*0.28)], fill=c, width=w)
+            dr.line([(s-m, s*0.12), (s-m, s*0.28), (s*0.88, s*0.28)], fill=c, width=w)
+            dr.line([(m, s*0.88), (m, s*0.72), (s*0.12, s*0.72)], fill=c, width=w)
+            dr.line([(s-m, s*0.88), (s-m, s*0.72), (s*0.88, s*0.72)], fill=c, width=w)
+
+        def eye_icon(dr, s, c, w):
+            """眼睛：可见/隐藏"""
+            w = int(round(w))
+            cx, cy = s*0.5, s*0.5
+            r = s*0.22
+            dr.ellipse([cx-r, cy-r, cx+r, cy+r], outline=c, width=w)
+            dr.ellipse([cx-s*0.06, cy-s*0.06, cx+s*0.06, cy+s*0.06], fill=c)
+            dr.arc([cx-r*0.3, cy-r*0.55, cx+r*0.3, cy+r*0.55],
+                   start=-60, end=60, fill=c, width=w)
+
+        def refresh_icon(dr, s, c, w):
+            """循环刷新箭头"""
+            import math
+            w = int(round(w))
+            cx, cy = s*0.5, s*0.5
+            r = s*0.30
+            dr.ellipse([cx-r, cy-r, cx+r, cy+r], outline=c, width=w)
+            for a in range(0, 360, 60):
+                rad = math.pi*a/180
+                x1 = cx + math.cos(rad)*r*0.75
+                y1 = cy + math.sin(rad)*r*0.75
+                x2 = cx + math.cos(rad)*r*0.92
+                y2 = cy + math.sin(rad)*r*0.92
+                dr.line([(x1,y1),(x2,y2)], fill=c, width=w)
+            dr.line([(cx+s*0.18, cy-s*0.18), (cx-s*0.04, cy-s*0.30), (cx-s*0.26, cy-s*0.14)],
+                    fill=c, width=w)
+
+        def trash_icon(dr, s, c, w):
+            """垃圾桶"""
+            w = int(round(w))
+            dr.line([(s*0.24, s*0.22), (s*0.24, s*0.78), (s*0.76, s*0.78)], fill=c, width=w*2)
+            dr.line([(s*0.24, s*0.78), (s*0.76, s*0.78)], fill=c, width=w)
+            for yy in (s*0.34, s*0.46):
+                dr.line([(s*0.34, yy), (s*0.66, yy)], fill=c, width=w)
+
+        def cut_icon(dr, s, c, w):
+            """剪刀：用于全屏截图"""
+            w = int(round(w))
+            dr.line([(s*0.28, s*0.22), (s*0.22, s*0.50), (s*0.28, s*0.76)],
+                    fill=c, width=round(w*1.3), joint="curve")
+            dr.line([(s*0.72, s*0.22), (s*0.78, s*0.50), (s*0.72, s*0.76)],
+                    fill=c, width=round(w*1.3), joint="curve")
+            dr.line([(s*0.30, s*0.48), (s*0.50, s*0.30)],
+                    fill=c, width=round(w*1.1))
+            dr.line([(s*0.30, s*0.52), (s*0.50, s*0.70)],
+                    fill=c, width=round(w*1.1))
+            dr.ellipse([s*0.36, s*0.44, s*0.64, s*0.56], outline=c, width=w)
+
         if kind == "shot":
-            tk.Button(frame, text="全屏截图",
-                      command=lambda: self._popup_action(self.capture_fullscreen),
-                      **btn_kw).pack(fill="x", padx=4, pady=(4, 1))
-            tk.Button(frame, text="区域截图",
-                      command=lambda: self._popup_action(self.capture_region),
-                      **btn_kw).pack(fill="x", padx=4, pady=1)
+            cut_photo = sm_icon(cut_icon, 14)
+            cut_button = tk.Button(
+                frame, text="全屏截图", image=cut_photo, compound="right",
+                command=lambda: self._popup_action(self.capture_fullscreen),
+                **btn_kw)
+            cut_button.image = cut_photo
+            cut_button.pack(fill="x", padx=4, pady=(4, 1))
+            sel_photo = sm_icon(sel_icon, 14)
+            sel_button = tk.Button(
+                frame, text="区域截图", image=sel_photo, compound="right",
+                command=lambda: self._popup_action(self.capture_region),
+                **btn_kw)
+            sel_button.image = sel_photo
+            sel_button.pack(fill="x", padx=4, pady=1)
             tk.Frame(frame, bg=T["separator"], height=1).pack(
                 fill="x", padx=6, pady=4)
-            tk.Checkbutton(frame, text="截图时隐藏此窗口",
-                           variable=self._hide_on_capture,
-                           command=self._hide_on_capture_changed, anchor="w",
-                           font=f, bg=T["card_bg"], fg=T["label"],
-                           selectcolor=T["field"],
-                           activebackground=T["card_bg"],
-                           activeforeground=T["label"],
-                           highlightthickness=0, cursor="hand2",
-                           ).pack(fill="x", padx=6, pady=(0, 4))
+            eye_photo = sm_icon(eye_icon, 14)
+            eye_button = tk.Checkbutton(
+                frame, text="隐藏此窗口", image=eye_photo, compound="right",
+                variable=self._hide_on_capture,
+                command=self._hide_on_capture_changed, anchor="w",
+                font=f, bg=T["card_bg"], fg=T["label"],
+                selectcolor=T["field"], activebackground=T["card_bg"],
+                activeforeground=T["label"], highlightthickness=0,
+                cursor="hand2")
+            eye_button.image = eye_photo
+            eye_button.pack(fill="x", padx=6, pady=(0, 4))
         else:
-            tk.Button(frame, text="刷新  (F5)",
-                      command=lambda: self._popup_action(self.refresh),
-                      **btn_kw).pack(fill="x", padx=4, pady=(4, 1))
-            tk.Button(frame, text="清理过期记录",
-                      command=lambda: self._popup_action(self._cleanup_now),
-                      **btn_kw).pack(fill="x", padx=4, pady=(1, 4))
+            refresh_photo = sm_icon(refresh_icon, 14)
+            refresh_button = tk.Button(
+                frame, text="刷新  (F5)", image=refresh_photo, compound="right",
+                command=lambda: self._popup_action(self.refresh), **btn_kw)
+            refresh_button.image = refresh_photo
+            refresh_button.pack(fill="x", padx=4, pady=(4, 1))
+            trash_photo = sm_icon(trash_icon, 14)
+            trash_button = tk.Button(
+                frame, text="清理过期记录", image=trash_photo, compound="right",
+                command=lambda: self._popup_action(self._cleanup_now), **btn_kw)
+            trash_button.image = trash_photo
+            trash_button.pack(fill="x", padx=4, pady=(1, 4))
         pop.bind("<Escape>", lambda e: self._close_popup_menu())
-        pop.bind("<FocusOut>", self._on_popup_focus_out)
-        self._popup_menu = pop
         btn = self._menu_anchor
         btn.update_idletasks()
         pop.update_idletasks()
@@ -1303,7 +1384,7 @@ class HistoryPanel:
         pop.geometry(f"+{x}+{y}")
         pop.deiconify()
         pop.lift()
-        pop.focus_force()
+        self._popup_menu = pop
         self._popup_open = True
 
     def _popup_action(self, fn):
@@ -1331,34 +1412,6 @@ class HistoryPanel:
                 pop.destroy()
             except Exception:
                 pass
-
-    def _on_popup_focus_out(self, _event):
-        if not self._popup_open or self._popup_menu is None:
-            return
-        if self._popup_focus_check is not None:
-            try:
-                self._popup_menu.after_cancel(self._popup_focus_check)
-            except Exception:
-                pass
-        self._popup_focus_check = self._popup_menu.after(
-            150, self._check_popup_focus)
-
-    def _check_popup_focus(self):
-        self._popup_focus_check = None
-        if not self._popup_open:
-            return
-        try:
-            focused = self.win.focus_get()
-        except (KeyError, self.tk.TclError):
-            focused = None
-        if focused is None:
-            self._close_popup_menu()
-            return
-        try:
-            if focused.winfo_toplevel() is not self._popup_menu:
-                self._close_popup_menu()
-        except Exception:
-            self._close_popup_menu()
 
     # ---------- 截屏入口 ----------
     def _hide_on_capture_changed(self):
@@ -1905,26 +1958,41 @@ class HistoryPanel:
         sep.bind("<B1-Motion>", self._hdr_move)
         self._detail = DetailPane(self, body_split, detail_w)
 
-        # 窗口按钮：详情区顶部工具栏最右侧（垂直居中由 pack anchor 完成）
+        # 窗口按钮：详情区顶部工具栏最右侧（垂直居中）
+        # 视觉从左到右：截图 · 设置 ⚙ · 最小化 · 最大化 ⛶ · 关闭 ×
+        # pack 顺序决定从右到左：close 最右，shot 最左
         header_right = self._detail.win_bar
         btn_bg = self._detail.BG
+        btn_pad = (max(0, (self._sh_h - int(round(28 * dpi))) // 2), 0)
         close_b = self._icon_button(header_right, self._hdr_icons["close"],
                                     self.hide, btn_bg, T["fill_hover"])
-        close_b.pack(side="right")
         self._max_btn = self._icon_button(
             header_right, self._hdr_icons["expand"], self._toggle_maximize,
             btn_bg, T["fill_hover"])
-        self._max_btn.pack(side="right", padx=(0, 2))
-        self._settings_btn = self._icon_button(
-            header_right, self._hdr_icons["gear"],
-            lambda: self._toggle_popup_menu("settings", self._settings_btn),
-            btn_bg, T["fill_hover"])
-        self._settings_btn.pack(side="right", padx=(0, 2))
-        self._shot_btn = self._icon_button(
-            header_right, self._hdr_icons["shot"],
-            lambda: self._toggle_popup_menu("shot", self._shot_btn),
-            btn_bg, T["fill_hover"])
-        self._shot_btn.pack(side="right", padx=(0, 6))
+        self._settings_btn = tk.Button(header_right, text="设置",
+                                       command=lambda: self._toggle_popup_menu(
+                                           "settings", self._settings_btn),
+                                       bd=0, bg=btn_bg, activebackground=T["fill_hover"],
+                                       relief="flat", cursor="hand2",
+                                       highlightthickness=0,
+                                       font=self._font(10),
+                                       fg=T["label"])
+        self._minimize_btn = self._icon_button(
+            header_right, self._hdr_icons["minimize"],
+            self._minimize, btn_bg, T["fill_hover"])
+        self._shot_btn = tk.Button(header_right, text="截图",
+                                   command=lambda: self._toggle_popup_menu(
+                                       "shot", self._shot_btn),
+                                   bd=0, bg=btn_bg, activebackground=T["fill_hover"],
+                                   relief="flat", cursor="hand2",
+                                   highlightthickness=0,
+                                   font=self._font(10),
+                                   fg=T["label"])
+        close_b.pack(side="right", pady=btn_pad)
+        self._max_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
+        self._minimize_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
+        self._settings_btn.pack(side="right", padx=(0, 2), pady=btn_pad)
+        self._shot_btn.pack(side="right", padx=(0, 6), pady=btn_pad)
 
         # ---------- 过滤胶囊 pills（Canvas 自绘，紧凑） ----------
         chip_wrap = tk.Frame(left, bg=win_bg)
@@ -2031,47 +2099,51 @@ class HistoryPanel:
         return ImageTk.PhotoImage(im.resize((box, box), Image.LANCZOS))
 
     def _make_header_icons(self, dpi, color_hex):
-        box = max(20, int(round(24 * dpi)))
+        """窗口控制按钮图标：苹果 SF Symbols 风格，线细、比例优雅、统一圆端线帽。"""
+        box = max(22, int(round(28 * dpi)))
+        weight = 0.062
 
         def close(dr, s, c, w):
-            m = s * 0.34
-            dr.line([(m, m), (s - m, s - m)], fill=c, width=w)
-            dr.line([(s - m, m), (m, s - m)], fill=c, width=w)
-
-        def shot(dr, s, c, w):
-            dr.rounded_rectangle([s * 0.22, s * 0.37, s * 0.78, s * 0.73],
-                                 radius=s * 0.07, outline=c, width=w)
-            dr.line([(s * 0.39, s * 0.37), (s * 0.42, s * 0.29), (s * 0.58, s * 0.29),
-                     (s * 0.61, s * 0.37)], fill=c, width=w, joint="curve")
-            dr.ellipse([s * 0.43, s * 0.46, s * 0.57, s * 0.60], outline=c, width=w)
+            w = int(round(w))
+            m = s * 0.24
+            dr.line([(m, m), (s - m, s - m)], fill=c, width=w, joint="curve")
+            dr.line([(s - m, m), (m, s - m)], fill=c, width=w, joint="curve")
 
         def gear(dr, s, c, w):
             import math
-            cx, cy = s * 0.5, s * 0.5
-            r_out, r_in = s * 0.27, s * 0.13
-            dr.ellipse([cx - r_out, cy - r_out, cx + r_out, cy + r_out],
-                       outline=c, width=w)
-            dr.ellipse([cx - r_in, cy - r_in, cx + r_in, cy + r_in],
-                       outline=c, width=max(1, w - 1))
+            w = int(round(w))
+            cx, cy = s*0.5, s*0.5
+            r_out, r_in = s*0.26, s*0.11
+            dr.ellipse([cx-r_out, cy-r_out, cx+r_out, cy+r_out], outline=c, width=w)
             for k in range(8):
-                a = math.pi * 2 * k / 8
-                dr.line([(cx + math.cos(a) * r_out * 0.9,
-                          cy + math.sin(a) * r_out * 0.9),
-                         (cx + math.cos(a) * s * 0.40,
-                          cy + math.sin(a) * s * 0.40)], fill=c, width=w)
+                a = math.pi*2*k/8
+                dr.line([(cx+math.cos(a)*r_out*0.72, cy+math.sin(a)*r_out*0.72),
+                         (cx+math.cos(a)*r_out*1.05, cy+math.sin(a)*r_out*1.05)],
+                        fill=c, width=w)
+            dr.ellipse([cx-r_in, cy-r_in, cx+r_in, cy+r_in], outline=c, width=max(1, w-1))
+            for k in range(4):
+                a = math.pi*2*k/4
+                dr.line([(cx+math.cos(a)*r_in*1.2, cy+math.sin(a)*r_in*1.2),
+                         (cx+math.cos(a)*r_out*0.6, cy+math.sin(a)*r_out*0.6)],
+                        fill=c, width=max(1, round(w*0.8)))
 
         def expand(dr, s, c, w):
-            dr.rectangle([s * 0.28, s * 0.28, s * 0.72, s * 0.72],
-                         outline=c, width=w)
+            dr.line([(s*0.28, s*0.72), (s*0.28, s*0.28), (s*0.72, s*0.28)],
+                    fill=c, width=round(w*1.2), joint="curve")
+
+        def minimize(dr, s, c, w):
+            w = int(round(w))
+            x1, x2 = s * 0.22, s * 0.78
+            y = s * 0.50
+            dr.line([(x1, y), (x2, y)], fill=c, width=round(w*1.4), joint="curve")
 
         def restore(dr, s, c, w):
-            dr.rectangle([s * 0.36, s * 0.24, s * 0.76, s * 0.64],
-                         outline=c, width=w)
-            dr.rectangle([s * 0.24, s * 0.36, s * 0.64, s * 0.76],
-                         outline=c, width=w)
+            w = int(round(w))
+            dr.line([(s*0.72, s*0.28), (s*0.72, s*0.72), (s*0.28, s*0.72)],
+                    fill=c, width=round(w*1.2), joint="curve")
 
         return {"close": self._mono_icon(close, box, color_hex),
-                "shot": self._mono_icon(shot, box, color_hex),
+                "minimize": self._mono_icon(minimize, box, color_hex),
                 "gear": self._mono_icon(gear, box, color_hex),
                 "expand": self._mono_icon(expand, box, color_hex),
                 "restore": self._mono_icon(restore, box, color_hex)}
@@ -2417,6 +2489,10 @@ class HistoryPanel:
             self._apply_bg_size(w, h)
             self.win.geometry(f"{w}x{h}+{x}+{y}")
             self._max_btn.configure(image=self._hdr_icons["restore"])
+
+    def _minimize(self):
+        """最小化窗口到任务栏。"""
+        self.win.withdraw()
 
     def apply_mode(self):
         self.win.overrideredirect(True)
