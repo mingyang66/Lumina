@@ -390,6 +390,14 @@ class RegionSelector:
         self._tb_item_ids = []    # 工具栏 canvas 项（圆角背景图 + 按钮窗口）
         self._tb_bg_photo = None  # 圆角背景 PhotoImage（防 GC）
         self._tb_icons = {}       # 图标 PhotoImage 引用（防 GC）
+        self._tool = None
+        self._draw_start = None
+        self._draw_preview = None
+        self._draw_points = []
+        self._annotations = []
+        self._redo = []
+        self._edit_items = []
+        self._text_editor = None
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
@@ -447,6 +455,12 @@ class RegionSelector:
         self.canvas.coords(self._coord_id, tx, ty)
 
     def _on_press(self, e):
+        if self.done:
+            return
+        if self._sel_box and self._tool:
+            self._begin_annotation(e)
+            return
+        self._tool = None
         self._start = (max(0, min(e.x, self.sw)), max(0, min(e.y, self.sh)))
         self._sel_box = None
         if self._coord_id is not None:
@@ -462,6 +476,9 @@ class RegionSelector:
         self._shot_photo = None
 
     def _on_drag(self, e):
+        if self._draw_start is not None:
+            self._update_annotation(e)
+            return
         if self._start is None:
             return
         now = time.perf_counter()
@@ -495,6 +512,9 @@ class RegionSelector:
         self.canvas.tag_raise(self._size_id)
 
     def _on_release(self, e):
+        if self._draw_start is not None:
+            self._finish_annotation(e)
+            return
         if self._start is None:
             return
         x0, y0, x1, y1 = self._coords(e)
@@ -517,8 +537,51 @@ class RegionSelector:
                min(self.src.width, box[2]), min(self.src.height, box[3]))
         if box[2] - box[0] < 1 or box[3] - box[1] < 1:
             return None
+        from PIL import ImageDraw, ImageFont
+        result = self.src.crop(box).convert("RGBA")
+        scale_x = result.width / max(1, x1 - x0)
+        scale_y = result.height / max(1, y1 - y0)
+        draw = ImageDraw.Draw(result)
+        for item in self._annotations:
+            kind = item[0]
+            if kind in ("rect", "oval", "arrow"):
+                _, a, b = item
+                coords = tuple(int(v) for p in (a, b)
+                               for v in ((p[0] - x0) * scale_x, (p[1] - y0) * scale_y))
+                width = max(2, int(3 * min(scale_x, scale_y)))
+                if kind == "rect":
+                    draw.rectangle(coords, outline="#ff3b30", width=width)
+                elif kind == "oval":
+                    draw.ellipse(coords, outline="#ff3b30", width=width)
+                else:
+                    draw.line(coords, fill="#ff3b30", width=width)
+                    import math
+                    ax, ay, bx, by = coords
+                    angle = math.atan2(by - ay, bx - ax)
+                    length = max(12, int(16 * min(scale_x, scale_y)))
+                    points = [(bx, by),
+                              (bx - length * math.cos(angle - .5), by - length * math.sin(angle - .5)),
+                              (bx - length * math.cos(angle + .5), by - length * math.sin(angle + .5))]
+                    draw.polygon(points, fill="#ff3b30")
+            elif kind in ("brush", "mosaic"):
+                _, points = item
+                pts = [(int((px - x0) * scale_x), int((py - y0) * scale_y)) for px, py in points]
+                if len(pts) > 1 and kind == "brush":
+                    draw.line(pts, fill="#ff3b30", width=max(3, int(5 * min(scale_x, scale_y))), joint="curve")
+                elif kind == "mosaic":
+                    radius = max(4, int(7 * min(scale_x, scale_y)))
+                    for px, py in pts:
+                        draw.rectangle((px - radius, py - radius, px + radius, py + radius), fill="#888888")
+            elif kind == "text":
+                _, pos, text = item
+                try:
+                    font = ImageFont.truetype("msyh.ttc", max(14, int(20 * min(scale_x, scale_y))))
+                except Exception:
+                    font = ImageFont.load_default()
+                draw.text((int((pos[0] - x0) * scale_x), int((pos[1] - y0) * scale_y)), text,
+                          fill="#ff3b30", font=font, stroke_width=1, stroke_fill="#ffffff")
         buf = io.BytesIO()
-        self.src.crop(box).save(buf, "PNG")
+        result.convert("RGB").save(buf, "PNG")
         return buf.getvalue()
 
     # ---------- 选区工具栏 ----------
@@ -621,12 +684,216 @@ class RegionSelector:
             out = Image.composite(gray, out, border)
             return finalize(out)
 
+        def icon_tool(kind, color="#5f6368"):
+            """绘制编辑工具图标，避免用文字占用工具栏按钮。"""
+            s = size * ss
+            im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+            dr = ImageDraw.Draw(im)
+            w = max(2, s // 11)
+            m = s * .22
+            if kind == "rect":
+                dr.rectangle((m, m, s - m, s - m), outline=color, width=w)
+            elif kind == "oval":
+                dr.ellipse((m, m, s - m, s - m), outline=color, width=w)
+            elif kind == "arrow":
+                dr.line((s * .22, s * .75, s * .75, s * .25), fill=color, width=w)
+                dr.polygon(((s * .58, s * .22), (s * .80, s * .20), (s * .78, s * .42)), fill=color)
+            elif kind == "brush":
+                # 一根横线代表纸张，细长钢笔斜放其上并突出尖锐笔尖。
+                line_color = "#a8b1ba"
+                dr.line((s * .18, s * .77, s * .78, s * .77),
+                        fill=line_color, width=max(2, s // 18))
+                pen_outline = "#263746"
+                dr.polygon(((s * .29, s * .65), (s * .71, s * .19),
+                            (s * .78, s * .27), (s * .37, s * .70)),
+                           fill="#344f63", outline=pen_outline, width=max(2, s // 19))
+                dr.line((s * .38, s * .68, s * .73, s * .24),
+                        fill="#6f91a5", width=max(2, s // 20))
+                dr.line((s * .65, s * .25, s * .76, s * .36),
+                        fill="#d4dbe0", width=max(2, s // 18))
+                # 单独拉出笔尖，使用高对比色增强识别度。
+                dr.polygon(((s * .29, s * .65), (s * .18, s * .83),
+                            (s * .37, s * .70)), fill="#e5edf1",
+                           outline=pen_outline, width=max(2, s // 21))
+                dr.line((s * .19, s * .82, s * .33, s * .69),
+                        fill="#263746", width=max(2, s // 25))
+                dr.ellipse((s * .22, s * .76, s * .27, s * .81), fill="#263746")
+            elif kind == "mosaic":
+                # 四格马赛克：两条对角线分别使用黑色和白色。
+                left, top = s * .22, s * .22
+                block = s * .27
+                gap = max(2, int(s * .035))
+                shades = (("#20252a", "#ffffff"), ("#ffffff", "#20252a"))
+                for row in range(2):
+                    for col in range(2):
+                        x = left + col * (block + gap)
+                        y = top + row * (block + gap)
+                        dr.rectangle((x, y, x + block, y + block),
+                                     fill=shades[row][col])
+                dr.rectangle((left, top, left + block * 2 + gap, top + block * 2 + gap),
+                             outline="#4d5962", width=max(2, s // 24))
+            elif kind == "text":
+                # 使用几何线条绘制 T，避免小尺寸字体渲染发虚或缺笔画。
+                text_color = "#6f808c"
+                stroke = max(3, s // 9)
+                dr.line((s * .23, s * .25, s * .77, s * .25),
+                        fill=text_color, width=stroke)
+                dr.line((s * .50, s * .25, s * .50, s * .78),
+                        fill=text_color, width=stroke)
+                # 端点补圆，使线条在缩放后保持平滑。
+                radius = stroke / 2
+                for cx, cy in ((s * .23, s * .25), (s * .77, s * .25),
+                               (s * .50, s * .78)):
+                    dr.ellipse((cx - radius, cy - radius, cx + radius, cy + radius),
+                               fill=text_color)
+            elif kind == "ocr":
+                dr.rectangle((m, m, s - m, s - m), outline=color, width=w)
+                dr.line((s * .36, s * .50, s * .47, s * .61, s * .68, s * .36), fill=color, width=w)
+            elif kind in ("undo", "redo"):
+                start, end = (35, 315) if kind == "undo" else (225, 145)
+                dr.arc((m, m, s - m, s - m), start, end, fill=color, width=w)
+                if kind == "undo":
+                    dr.polygon(((s * .22, s * .42), (s * .22, s * .18), (s * .44, s * .30)), fill=color)
+                else:
+                    dr.polygon(((s * .78, s * .42), (s * .78, s * .18), (s * .56, s * .30)), fill=color)
+            return finalize(im)
+
         self._tb_icons = {
+            "rect": (icon_tool("rect"), size),
+            "oval": (icon_tool("oval"), size),
+            "arrow": (icon_tool("arrow"), size),
+            "brush": (icon_tool("brush"), size),
+            "mosaic": (icon_tool("mosaic"), size),
+            "text": (icon_tool("text"), size),
+            "ocr": (icon_tool("ocr"), size),
+            "undo": (icon_tool("undo"), size),
+            "redo": (icon_tool("redo"), size),
             "x": (icon_x("#e5484d"), size),
             "check": (icon_check("#2f9e44"), size),
             "pin": (icon_pin(), size),
             "download": (icon_download("#5f6368"), size),
         }
+
+    def _select_tool(self, tool):
+        self._tool = tool
+        self.canvas.configure(cursor="crosshair" if tool else "arrow")
+
+    def _begin_annotation(self, e):
+        if self._tool == "text":
+            self._open_text_editor(e.x, e.y)
+            return
+        self._draw_start = (e.x, e.y)
+        self._draw_points = [(e.x, e.y)]
+        self._draw_preview = None
+
+    def _update_annotation(self, e):
+        x, y = e.x, e.y
+        if self._tool in ("brush", "mosaic"):
+            self._draw_points.append((x, y))
+            if len(self._draw_points) > 1:
+                self._draw_preview = self.canvas.create_line(
+                    self._draw_points[-2], self._draw_points[-1], fill="#ff3b30",
+                    width=5 if self._tool == "brush" else 12, capstyle="round")
+        else:
+            if self._draw_preview is not None:
+                self.canvas.delete(self._draw_preview)
+            x0, y0 = self._draw_start
+            if self._tool == "rect":
+                self._draw_preview = self.canvas.create_rectangle(x0, y0, x, y, outline="#ff3b30", width=3)
+            elif self._tool == "oval":
+                self._draw_preview = self.canvas.create_oval(x0, y0, x, y, outline="#ff3b30", width=3)
+            else:
+                self._draw_preview = self.canvas.create_line(x0, y0, x, y, fill="#ff3b30", width=3, arrow="last")
+
+    def _finish_annotation(self, e):
+        start = self._draw_start
+        self._draw_start = None
+        if self._draw_preview is not None:
+            self.canvas.delete(self._draw_preview)
+            self._draw_preview = None
+        if self._tool in ("brush", "mosaic"):
+            item = (self._tool, list(self._draw_points))
+        else:
+            item = (self._tool, start, (e.x, e.y))
+        if self._tool in ("rect", "oval", "arrow", "brush", "mosaic"):
+            self._annotations.append(item)
+            self._redo.clear()
+            self._redraw_annotations()
+
+    def _redraw_annotations(self):
+        for item_id in self._edit_items:
+            self.canvas.delete(item_id)
+        self._edit_items = []
+        for item in self._annotations:
+            kind = item[0]
+            if kind in ("rect", "oval", "arrow"):
+                _, a, b = item
+                fn = self.canvas.create_rectangle if kind == "rect" else self.canvas.create_oval
+                if kind == "arrow":
+                    item_id = self.canvas.create_line(*a, *b, fill="#ff3b30", width=3, arrow="last")
+                    self._edit_items.append(item_id)
+                    continue
+                self._edit_items.append(fn(*a, *b, outline="#ff3b30", width=3))
+            elif kind in ("brush", "mosaic"):
+                _, points = item
+                if len(points) > 1:
+                    self._edit_items.append(self.canvas.create_line(
+                        *[p for point in points for p in point], fill="#ff3b30",
+                        width=5 if kind == "brush" else 12, capstyle="round", smooth=True))
+            elif kind == "text":
+                _, pos, text = item
+                self._edit_items.append(self.canvas.create_text(*pos, text=text, anchor="nw",
+                                                               fill="#ff3b30", font=("Microsoft YaHei UI", 18, "bold")))
+        for item_id in self._edit_items:
+            self.canvas.tag_raise(item_id)
+
+    def _open_text_editor(self, x, y):
+        if self._text_editor is not None:
+            return
+        entry = self.ui._tk.Entry(self.canvas, font=("Microsoft YaHei UI", 14), width=18)
+        self._text_editor = entry
+        item_id = self.canvas.create_window(x, y, window=entry, anchor="nw")
+        def commit(_event=None):
+            text = entry.get().strip()
+            self.canvas.delete(item_id)
+            entry.destroy()
+            self._text_editor = None
+            if text:
+                self._annotations.append(("text", (x, y), text))
+                self._redo.clear()
+                self._redraw_annotations()
+        entry.bind("<Return>", commit)
+        entry.bind("<Escape>", lambda _event: commit())
+        entry.focus_set()
+
+    def _undo(self):
+        if self._annotations:
+            self._redo.append(self._annotations.pop())
+            self._redraw_annotations()
+
+    def _redo_action(self):
+        if self._redo:
+            self._annotations.append(self._redo.pop())
+            self._redraw_annotations()
+
+    def _extract_text(self):
+        try:
+            import pytesseract
+            from PIL import Image
+            text = pytesseract.image_to_string(Image.open(io.BytesIO(self._crop_box())), lang="chi_sim+eng").strip()
+            if text:
+                self.ui._tk.clipboard_clear()
+                self.ui._tk.clipboard_append(text)
+                from tkinter import messagebox
+                messagebox.showinfo("提取文字", "文字已复制到剪贴板。", parent=self.win)
+            else:
+                from tkinter import messagebox
+                messagebox.showinfo("提取文字", "未识别到文字。", parent=self.win)
+        except ImportError:
+            from tkinter import messagebox
+            messagebox.showwarning("提取文字", "请安装 pytesseract 和 Tesseract OCR 后重试。", parent=self.win)
+        except Exception:
+            traceback.print_exc()
 
     def _show_toolbar(self):
         """圆角工具栏：PIL 画圆角矩形背景图放到 canvas，按钮直接叠在上面。
@@ -651,9 +918,20 @@ class RegionSelector:
         gap = max(2, int(round(2 * dpi)))
         border_w = max(1, int(round(dpi)))
         radius = max(6, int(round(10 * dpi)))
-        n_btns = 4
-        bw = size * n_btns + gap * (n_btns - 1) + pad * 2 + border_w * 2
-        bh = size + pad * 2 + border_w * 2
+        buttons = (("rect", lambda: self._select_tool("rect"), "矩形"),
+                   ("oval", lambda: self._select_tool("oval"), "圆形"),
+                   ("arrow", lambda: self._select_tool("arrow"), "箭头"),
+                   ("brush", lambda: self._select_tool("brush"), "画笔"),
+                   ("mosaic", lambda: self._select_tool("mosaic"), "马赛克"),
+                   ("text", lambda: self._select_tool("text"), "文字"),
+                   ("ocr", self._extract_text, "提取文字"),
+                   ("undo", self._undo, "撤销"), ("redo", self._redo_action, "恢复"),
+                   ("pin", self._pin, "钉图"), ("download", self._download, "下载"),
+                   ("x", self.cancel, "取消"), ("check", self._confirm, "保存"))
+        columns = len(buttons)
+        rows = 1
+        bw = size * columns + gap * (columns - 1) + pad * 2 + border_w * 2
+        bh = size * rows + gap * (rows - 1) + pad * 2 + border_w * 2
         radius = min(radius, bh // 2)
 
         ss = 3
@@ -673,19 +951,32 @@ class RegionSelector:
             tx, ty, image=self._tb_bg_photo, anchor="nw")]
         inner_x = tx + border_w + pad
         inner_y = ty + border_w + pad
-        for i, (key, cmd) in enumerate((("pin", self._pin),
-                                        ("download", self._download),
-                                        ("x", self.cancel),
-                                        ("check", self._confirm))):
+        for i, (key, cmd, tip) in enumerate(buttons):
+            row, col = divmod(i, columns)
             photo = self._tb_icons[key][0]
             b = tk.Button(self.canvas, image=photo, command=cmd, bd=0,
-                          bg="#ffffff", activebackground="#e6eaf2", relief="flat",
-                          cursor="hand2", highlightthickness=0)
+                           bg="#ffffff", activebackground="#e6eaf2", relief="flat",
+                           cursor="hand2", highlightthickness=0)
             b.image = photo
+            b.bind("<Enter>", lambda _event, text=tip: self._show_tooltip(text))
+            b.bind("<Leave>", lambda _event: self._hide_tooltip())
             self._tb_buttons.append(b)
             self._tb_item_ids.append(self.canvas.create_window(
-                inner_x + i * (size + gap), inner_y, window=b, anchor="nw",
+                inner_x + col * (size + gap), inner_y + row * (size + gap), window=b, anchor="nw",
                 width=size, height=size))
+
+    def _show_tooltip(self, text):
+        self._hide_tooltip()
+        self._tooltip = self.ui._tk.Label(self.win, text=text, bg="#222831", fg="#ffffff",
+                                          font=("Microsoft YaHei UI", 9), padx=5, pady=2)
+        self._tooltip.place(x=self.win.winfo_pointerx() - self.win.winfo_rootx() + 8,
+                            y=self.win.winfo_pointery() - self.win.winfo_rooty() + 8)
+
+    def _hide_tooltip(self):
+        tooltip = getattr(self, "_tooltip", None)
+        if tooltip is not None:
+            tooltip.destroy()
+            self._tooltip = None
 
     def _clear_toolbar(self):
         for item_id in self._tb_item_ids:
@@ -4012,7 +4303,7 @@ class PinWindow:
 
     - 左键拖动移动位置
     - 滚轮缩放（0.1x - 5x）
-    - 双击 / 右键 关闭
+    - 双击 / ESC 关闭
     """
 
     MIN_SCALE = 0.1
@@ -4047,7 +4338,7 @@ class PinWindow:
         self._label.bind("<ButtonPress-1>", self._on_press)
         self._label.bind("<B1-Motion>", self._on_drag)
         self._label.bind("<Double-Button-1>", lambda e: self.close())
-        self._label.bind("<Button-3>", lambda e: self.close())
+        # 右键不关闭钉图，避免误触导致贴图消失。
         self.win.bind("<MouseWheel>", self._on_wheel)
         self._label.bind("<MouseWheel>", self._on_wheel)
         # ESC 关闭钉图：无边框窗口默认拿不到键盘焦点，
