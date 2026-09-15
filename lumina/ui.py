@@ -377,6 +377,7 @@ class RegionSelector:
         self._hint_id = self.canvas.create_text(
             self.sw // 2, 40, text=self.HINT, fill="#ffffff",
             font=("Microsoft YaHei UI", 13, "bold"))
+        self._coord_id = None
 
         self._start = None
         self._rect_id = None
@@ -393,19 +394,63 @@ class RegionSelector:
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-3>", lambda e: self.cancel())
         self.win.bind("<Escape>", lambda e: self.cancel())
         self.win.bind("<Return>", lambda e: self._confirm())
         self.win.focus_force()
+        self.win.after_idle(self._show_initial_coordinates)
 
     def _coords(self, e):
         x0, y0 = self._start
         x1, y1 = max(0, min(e.x, self.sw)), max(0, min(e.y, self.sh))
         return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
 
+    def _on_motion(self, e):
+        if self._start is not None or self.done:
+            return
+        self._show_coordinates(e.x, e.y)
+
+    def _show_initial_coordinates(self):
+        if self.done or self._start is not None:
+            return
+        try:
+            px, py = self.win.winfo_pointerxy()
+            x = px - self.win.winfo_rootx()
+            y = py - self.win.winfo_rooty()
+        except Exception:
+            x, y = self.sw // 2, self.sh // 2
+        self._show_coordinates(x, y)
+
+    def _show_coordinates(self, x, y):
+        x = max(0, min(int(x), self.sw))
+        y = max(0, min(int(y), self.sh))
+        label = f"坐标：({int(x * self.sx)}, {int(y * self.sy)})"
+        if self._coord_id is None:
+            self._coord_id = self.canvas.create_text(
+                0, 0, text=label, anchor="nw", fill="#ffffff",
+                font=("Microsoft YaHei UI", 12, "bold"),
+                activefill="#ffffff")
+        self.canvas.itemconfigure(self._coord_id, state="normal")
+        self.canvas.itemconfigure(self._coord_id, text=label)
+        self.canvas.tag_raise(self._coord_id)
+        bbox = self.canvas.bbox(self._coord_id)
+        if not bbox:
+            return
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        tx = x + 16
+        ty = y + 16
+        if tx + tw > self.sw:
+            tx = x - tw - 16
+        if ty + th > self.sh:
+            ty = y - th - 16
+        self.canvas.coords(self._coord_id, tx, ty)
+
     def _on_press(self, e):
         self._start = (max(0, min(e.x, self.sw)), max(0, min(e.y, self.sh)))
         self._sel_box = None
+        if self._coord_id is not None:
+            self.canvas.itemconfigure(self._coord_id, state="hidden")
         self._clear_toolbar()
         if self._hint_id is not None:
             self.canvas.delete(self._hint_id)
