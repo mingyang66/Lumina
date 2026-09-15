@@ -63,7 +63,7 @@ class TrayIcon:
         image = image.resize((48, 48), Image.Resampling.LANCZOS)
 
         menu = pystray.Menu(
-            pystray.MenuItem("显示面板", self._show_panel, default=True),
+            pystray.MenuItem("显示/最小化面板", self._toggle_panel, default=True),
             pystray.MenuItem("最小化面板", self._hide_panel),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出 Lumina", self._quit),
@@ -82,6 +82,9 @@ class TrayIcon:
 
     def _show_panel(self, _icon, _item):
         self.app.ui.show_panel()
+
+    def _toggle_panel(self, _icon, _item):
+        self.app.ui.toggle_panel()
 
     def _hide_panel(self, _icon, _item):
         self.app.ui.request_hide_panel()

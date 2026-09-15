@@ -1999,7 +1999,7 @@ class HistoryPanel:
         return self.db.get(row["id"]) if row else None
 
     def _on_enter(self, _event=None):
-        """搜索框内按 Enter = 回贴当前选中项（拦截，避免与刷新重复触发）。"""
+        """搜索框内按 Enter = 粘贴当前选中项（拦截，避免与刷新重复触发）。"""
         self.paste_back()
         return "break"
 
@@ -2204,7 +2204,7 @@ class HistoryPanel:
         footer = tk.Frame(self._cmp_root, bg=win_bg)
         footer.pack(fill="x", padx=14, pady=(0, 6))
         tk.Label(footer, bg=win_bg, fg=T["label3"], font=self._font(8),
-                 text="Enter 回贴 · Ctrl+C 复制 · Ctrl+P 收藏 · Del 删除 · Ctrl+1-9 快速"
+                 text="Enter 粘贴 · Ctrl+C 复制 · Ctrl+P 收藏 · Del 删除 · Ctrl+1-9 快速"
                  ).pack(side="left")
         self._cmp_status = tk.Label(footer, textvariable=self.status_var,
                                     bg=win_bg, fg=T["label2"], font=self._font(8))
@@ -3013,7 +3013,7 @@ class DetailPane:
         self.frame.pack(side="left", fill="y")
         self.frame.pack_propagate(False)
         # 顶部工具栏：与左侧搜索胶囊同高、顶端对齐；
-        # 左=行级动作（回贴/复制/…），右=窗口按钮（由 HistoryPanel 填充）
+        # 左侧是当前记录操作，右侧是窗口控制区域。
         self._toolbar = tk.Frame(self.frame, bg=self.BG,
                                  height=getattr(panel, "_sh_h", 30))
         self._toolbar.pack(fill="x")
@@ -3023,8 +3023,8 @@ class DetailPane:
         self._actions = tk.Frame(self._toolbar, bg=self.BG)
         self._actions.pack(side="left", fill="x", expand=True, padx=(4, 0))
         self._meta = tk.Label(self.frame, text="预览", bg=T["field"],
-                              fg=T["label2"], font=("Microsoft YaHei UI", 8),
-                              anchor="w", padx=8, pady=4)
+                              fg=T["label2"], font=("Microsoft YaHei UI", 9),
+                              anchor="w", padx=12, pady=6)
         self._meta.pack(fill="x")
         self._host = tk.Frame(self.frame, bg=self.BG)
         self._host.pack(fill="both", expand=True, padx=4, pady=(2, 4))
@@ -3174,17 +3174,21 @@ class DetailPane:
         T = self.T
         danger = self.panel._sys("red")
 
-        def btn(label, cmd, fg=None):
+        def btn(label, cmd, fg=None, primary=False):
             fg = fg or T["accent"]
+            bg = T["accent"] if primary else T["card_bg"]
+            active_bg = T["accent"] if primary else T["accent_soft"]
+            active_fg = T["accent_fg"] if primary else fg
             b = tk.Button(self._actions, text=label, command=cmd, relief="flat",
-                          bd=0, font=("Microsoft YaHei UI", 9), bg=T["card_bg"],
-                          fg=fg, activebackground=T["accent_soft"],
-                          activeforeground=fg, padx=8, pady=3,
+                          bd=0, font=("Microsoft YaHei UI", 9, "bold" if primary else "normal"),
+                          bg=bg, fg=T["accent_fg"] if primary else fg,
+                          activebackground=active_bg,
+                          activeforeground=active_fg, padx=10 if primary else 8, pady=4,
                           cursor="hand2", highlightthickness=0)
             b.pack(side="left", padx=(2, 0))
             return b
 
-        btn("回贴", self._paste_this)
+        btn("粘贴", self._paste_this, primary=True)
         btn("复制", self._copy)
         if self.cat == "image":
             btn("钉图", self._pin_it)
@@ -3192,7 +3196,7 @@ class DetailPane:
             btn("打开", self._open_file)
         if self._urls:
             btn("打开链接", lambda: self._open_url(self._urls[0]))
-        btn("导出…", self._save_as)
+        btn("导出", self._save_as)
         btn("删除", self._delete, fg=danger)
 
     def _delete(self):
@@ -3604,7 +3608,7 @@ class DetailPane:
         except Exception:
             traceback.print_exc()
 
-    # ---------- 滚轮 / 回贴 ----------
+    # ---------- 滚轮 / 粘贴 ----------
     def _on_wheel(self, e):
         try:
             body = self._body
@@ -3665,7 +3669,7 @@ class DetailPane:
                       ("在资源管理器中显示", lambda: self._reveal_path(path))]
         items += [("复制路径", lambda: self._copy_text(path)),
                   ("复制全部路径", self._copy),
-                  ("回贴  (Enter)", self._paste_this), None,
+                   ("粘贴  (Enter)", self._paste_this), None,
                   ("导出…", self._save_as)]
         self._in_menu = True
         self._flat_menu = FlatMenu(self.panel.tk, self.panel.win, items,
@@ -3686,21 +3690,21 @@ class DetailPane:
     def _menu(self, e):
         if self.cat == "image":
             items = [("复制图片", self._copy),
-                     ("回贴  (Enter)", self._paste_this),
+                     ("粘贴  (Enter)", self._paste_this),
                      ("钉图", self._pin_it),
                      ("另存为…", self._save_as)]
         elif self.cat == "file":
             items = [("打开", self._open_file),
                      ("在资源管理器中显示", self._reveal_file),
                      ("复制路径", self._copy),
-                     ("回贴  (Enter)", self._paste_this), None,
+                     ("粘贴  (Enter)", self._paste_this), None,
                      ("导出…", self._save_as)]
         else:
             items = []
             if self._urls:
                 items.append(("打开链接", lambda: self._open_url(self._urls[0])))
             items += [("复制选中", self._copy_sel), ("复制全部", self._copy),
-                      ("回贴  (Enter)", self._paste_this), None,
+                       ("粘贴  (Enter)", self._paste_this), None,
                       ("导出…", self._save_as)]
         self._in_menu = True
         self._flat_menu = FlatMenu(self.panel.tk, self.panel.win, items,
