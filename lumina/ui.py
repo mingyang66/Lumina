@@ -1639,7 +1639,16 @@ class HistoryPanel:
         rows = self._apply_filter(rows)
         self._rows = {str(r["id"]): r for r in rows}
         self._refresh_cards(rows)
-        self.status_var.set(f"共 {len(rows)} 条")
+        if self._filter == "pinned":
+            total = self.db.count(q, pinned=True)
+        elif self._filter == "all":
+            total = self.db.count(q)
+        else:
+            total = self.db.count(q, category=self._filter)
+        shown = len(rows)
+        self.status_var.set(
+            f"显示 {shown} / 共 {total} 条" if shown != total
+            else f"共 {total} 条")
         if self._detail is not None:
             self._detail_hover_id = None
             self._detail.show(self._sel_id, immediate=True)
@@ -3065,15 +3074,15 @@ class DetailPane:
         self.frame.pack(side="left", fill="y")
         self.frame.pack_propagate(False)
         # 三段式详情：顶部元信息、中部预览、底部固定操作栏。
-        self._meta_wrap = tk.Frame(self.frame, bg=T["field"], height=38)
-        self._meta_wrap.pack(fill="x", padx=8, pady=(4, 0))
+        self._meta_wrap = tk.Frame(self.frame, bg=T["field"], height=44)
+        self._meta_wrap.pack(fill="x", padx=0, pady=0)
         self._meta_wrap.pack_propagate(False)
         self._meta_icon = tk.Label(self._meta_wrap, bg=T["field"],
                                    bd=0, highlightthickness=0)
-        self._meta_icon.pack(side="left", padx=(10, 6))
+        self._meta_icon.pack(side="left", padx=0)
         self._meta = tk.Label(self._meta_wrap, text="预览", bg=T["field"],
                               fg=T["label2"], font=("Microsoft YaHei UI", 9),
-                              anchor="w", padx=0, pady=6)
+                              anchor="w", padx=8, pady=6)
         self._meta.pack(side="left", fill="x", expand=True)
         self._host = tk.Frame(self.frame, bg=self.BG)
         self._host.pack(fill="both", expand=True, padx=8, pady=(6, 4))
@@ -3211,7 +3220,7 @@ class DetailPane:
         source_name, source_color, _style = self.panel._source_app(row["source"])
         from PIL import ImageTk
         icon = ImageTk.PhotoImage(self.panel._source_code_tile(
-            row["source"], max(20, int(round(22 * self.panel._dpi)))))
+            row["source"], max(24, int(round(28 * self.panel._dpi)))))
         self._meta_icon.configure(image=icon)
         self._meta_icon.image = icon
 

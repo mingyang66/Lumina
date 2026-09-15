@@ -253,6 +253,24 @@ class Database:
             (like, like, like, n),
         ).fetchall()
 
+    def count(self, query="", category=None, pinned=False):
+        """Count records for the history status line."""
+        clauses = []
+        params = []
+        query = (query or "").strip()
+        if query:
+            like = f"%{query}%"
+            clauses.append("(content LIKE ? OR tags LIKE ? OR source LIKE ?)")
+            params.extend((like, like, like))
+        if pinned:
+            clauses.append("pinned=1")
+        elif category:
+            clauses.append("category=?")
+            params.append(category)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM clipboard" + where, params).fetchone()[0]
+
     def set_pinned(self, clip_id, pinned=True):
         with self.conn:
             cur = self.conn.execute(
