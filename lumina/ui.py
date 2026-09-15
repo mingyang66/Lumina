@@ -2061,7 +2061,7 @@ class HistoryPanel:
         return self.db.get(row["id"]) if row else None
 
     def _on_enter(self, _event=None):
-        """搜索框内按 Enter = 粘贴当前选中项（拦截，避免与刷新重复触发）。"""
+        """搜索框内按 Enter = 回贴当前选中项（拦截，避免与刷新重复触发）。"""
         self.paste_back()
         return "break"
 
@@ -2266,7 +2266,7 @@ class HistoryPanel:
         footer = tk.Frame(self._cmp_root, bg=win_bg)
         footer.pack(fill="x", padx=14, pady=(0, 6))
         tk.Label(footer, bg=win_bg, fg=T["label3"], font=self._font(8),
-                 text="Enter 粘贴 · Ctrl+C 复制 · Ctrl+P 收藏 · Del 删除 · Ctrl+1-9 快速"
+                 text="Enter 回贴 · Ctrl+C 复制 · Ctrl+P 收藏 · Del 删除 · Ctrl+1-9 快速"
                  ).pack(side="left")
         self._cmp_status = tk.Label(footer, textvariable=self.status_var,
                                     bg=win_bg, fg=T["label2"], font=self._font(8))
@@ -3236,20 +3236,61 @@ class DetailPane:
 
         def btn(label, cmd, fg=None, primary=False):
             fg = fg or T["accent"]
-            bg = T["accent"] if primary else T["card_bg"]
-            active_bg = T["accent"] if primary else T["accent_soft"]
-            active_fg = T["accent_fg"] if primary else fg
-            b = tk.Button(self._actions, text=label, command=cmd, relief="flat",
-                          bd=0, font=("Microsoft YaHei UI", 9, "bold" if primary else "normal"),
-                          bg=bg, fg=T["accent_fg"] if primary else fg,
-                          activebackground=active_bg,
-                          activeforeground=active_fg, padx=10 if primary else 8, pady=4,
-                          cursor="hand2", highlightthickness=0)
-            b.pack(side="right" if label == "删除" else "left",
-                   padx=(2, 0))
-            return b
+            if primary:
+                fill = T["accent_soft"]
+                hover = T["accent"]
+                pressed = "#005FCC"
+                text = T["accent"]
+            elif label == "删除":
+                fill = "#FFF0F0" if not self.panel._dark else "#452326"
+                hover = "#FFD9D9" if not self.panel._dark else "#633034"
+                pressed = "#F5B8B8" if not self.panel._dark else "#7A3B40"
+                text = fg
+            else:
+                fill, hover, pressed, text = T["field"], T["fill_hover"], \
+                    T["separator"], fg
 
-        btn("粘贴", self._paste_this, primary=True)
+            font = ("Microsoft YaHei UI", 9, "bold" if primary else "normal")
+            text_width = max(30, self.panel._measure(label, font))
+            width = text_width + (24 if primary else 20)
+            height = max(30, int(round(30 * self.panel._dpi)))
+            radius = max(7, int(round(9 * self.panel._dpi)))
+
+            from PIL import Image, ImageDraw, ImageTk
+
+            def pill(color):
+                image = Image.new("RGBA", (width * 2, height * 2), (0, 0, 0, 0))
+                ImageDraw.Draw(image).rounded_rectangle(
+                    (0, 0, width * 2 - 1, height * 2 - 1),
+                    radius=radius * 2, fill=self.panel._hex_to_rgb(color) + (255,))
+                return ImageTk.PhotoImage(image.resize((width, height), Image.LANCZOS))
+
+            normal_photo = pill(fill)
+            hover_photo = pill(hover)
+            pressed_photo = pill(pressed)
+            canvas = tk.Canvas(self._actions, width=width, height=height,
+                               bg=self.BG, bd=0, highlightthickness=0,
+                               cursor="hand2")
+            bg_id = canvas.create_image(width // 2, height // 2, image=normal_photo)
+            text_id = canvas.create_text(width // 2, height // 2, text=label,
+                                         fill=text, font=font)
+            canvas._action_refs = (normal_photo, hover_photo, pressed_photo)
+
+            canvas.bind("<Enter>", lambda _e: (
+                canvas.itemconfigure(bg_id, image=hover_photo),
+                canvas.itemconfigure(text_id, fill=text)))
+            canvas.bind("<Leave>", lambda _e: (
+                canvas.itemconfigure(bg_id, image=normal_photo),
+                canvas.itemconfigure(text_id, fill=text)))
+            canvas.bind("<ButtonPress-1>", lambda _e: canvas.itemconfigure(
+                bg_id, image=pressed_photo))
+            canvas.bind("<ButtonRelease-1>", lambda _e: (
+                canvas.itemconfigure(bg_id, image=hover_photo), cmd()))
+            canvas.pack(side="right" if label == "删除" else "left",
+                        padx=(4, 0), pady=0)
+            return canvas
+
+        btn("回贴", self._paste_this, primary=True)
         btn("复制", self._copy)
         if self.cat == "image":
             btn("钉图", self._pin_it)
@@ -3588,7 +3629,7 @@ class DetailPane:
         except Exception:
             traceback.print_exc()
 
-    # ---------- 滚轮 / 粘贴 ----------
+    # ---------- 滚轮 / 回贴 ----------
     def _on_wheel(self, e):
         try:
             body = self._body
@@ -3649,7 +3690,7 @@ class DetailPane:
                       ("在资源管理器中显示", lambda: self._reveal_path(path))]
         items += [("复制路径", lambda: self._copy_text(path)),
                   ("复制全部路径", self._copy),
-                   ("粘贴  (Enter)", self._paste_this), None,
+                   ("回贴  (Enter)", self._paste_this), None,
                   ("导出…", self._save_as)]
         self._in_menu = True
         self._flat_menu = FlatMenu(self.panel.tk, self.panel.win, items,
@@ -3670,21 +3711,21 @@ class DetailPane:
     def _menu(self, e):
         if self.cat == "image":
             items = [("复制图片", self._copy),
-                     ("粘贴  (Enter)", self._paste_this),
+                     ("回贴  (Enter)", self._paste_this),
                      ("钉图", self._pin_it),
                      ("另存为…", self._save_as)]
         elif self.cat == "file":
             items = [("打开", self._open_file),
                      ("在资源管理器中显示", self._reveal_file),
                      ("复制路径", self._copy),
-                     ("粘贴  (Enter)", self._paste_this), None,
+                     ("回贴  (Enter)", self._paste_this), None,
                      ("导出…", self._save_as)]
         else:
             items = []
             if self._urls:
                 items.append(("打开链接", lambda: self._open_url(self._urls[0])))
             items += [("复制选中", self._copy_sel), ("复制全部", self._copy),
-                       ("粘贴  (Enter)", self._paste_this), None,
+                       ("回贴  (Enter)", self._paste_this), None,
                       ("导出…", self._save_as)]
         self._in_menu = True
         self._flat_menu = FlatMenu(self.panel.tk, self.panel.win, items,
