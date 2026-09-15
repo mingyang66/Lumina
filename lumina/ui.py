@@ -1105,6 +1105,14 @@ class HistoryPanel:
         canvas = self._active_canvas()
         if canvas is None or event.widget is not canvas:
             return
+        for item in reversed(canvas.find_overlapping(
+                event.x, event.y, event.x, event.y)):
+            tags = canvas.gettags(item)
+            favorite_tag = next((tag for tag in tags
+                                 if tag.startswith("favorite:")), None)
+            if favorite_tag:
+                self._favorite_click(int(favorite_tag.split(":", 1)[1]))
+                return "break"
         clip_id = self._get_clip_id_from_event(canvas, event)
         if clip_id is None:
             return
@@ -1677,9 +1685,6 @@ class HistoryPanel:
             canvas.create_image(favorite_x, y + row_h // 2, image=favorite,
                                 anchor="e", tags=("card", cid, "favorite",
                                                    favorite_tag))
-            canvas.tag_bind(
-                favorite_tag, "<Button-1>",
-                lambda _event, favorite_id=int(cid): self._favorite_click(favorite_id))
             y += row_h + gap
 
         canvas.configure(scrollregion=(0, 0, cw, y + int(round(4 * self._dpi))))
