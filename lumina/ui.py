@@ -844,7 +844,6 @@ class HistoryPanel:
         self._cardbg_cache = {}
         self._marker_cache = {}
         self._preview_cache = {}
-        self._fileicon_cache = {}
         self._drag_off = None
         self._maxed = False
         self._normal_geom = None
@@ -939,6 +938,33 @@ class HistoryPanel:
         name = s[:-4] if s.lower().endswith(".exe") else s
         return (name or "未知来源", "gray", "app")
 
+    def _source_mark(self, source):
+        """Return a compact source mark for the detail header."""
+        key = (source or "").strip().lower()
+        marks = {
+            "explorer.exe": "EX",
+            "code.exe": "<>" ,
+            "devenv.exe": "VS",
+            "idea64.exe": "IJ",
+            "pycharm64.exe": "PC",
+            "webstorm64.exe": "WS",
+            "goland64.exe": "GO",
+            "clion64.exe": "CL",
+            "rider64.exe": "RD",
+            "studio64.exe": "AS",
+            "wechat.exe": "WX",
+            "weixin.exe": "WX",
+            "chrome.exe": "CH",
+            "msedge.exe": "ED",
+            "firefox.exe": "FF",
+            "powershell.exe": "PS",
+            "cmd.exe": "CMD",
+        }
+        if key in marks:
+            return marks[key]
+        name = self._source_app(source)[0]
+        return (name[:2] or "?").upper()
+
     def _font(self, size, weight="normal"):
         return (self.FONT_FAMILY, size, weight)
 
@@ -965,7 +991,7 @@ class HistoryPanel:
             pass
         for cache in (self._thumb_cache, self._tile_cache,
                       self._cardbg_cache, self._marker_cache,
-                      self._preview_cache, self._fileicon_cache):
+                      self._preview_cache):
             cache.clear()
         self.__init__(root, tk, ui)
         self._sel_id = sel
@@ -1039,6 +1065,35 @@ class HistoryPanel:
         dr.text(((s - tw) / 2 - bbox[0], (s - th) / 2 - bbox[1]),
                 mark, font=font, fill=fg)
         out = im.resize((size, size), Image.LANCZOS)
+        self._tile_cache[key] = out
+        return out
+
+    def _file_extension_tile(self, ext, size, exists=True):
+        """Create the shared file-extension tile used by list and preview."""
+        from PIL import Image, ImageDraw, ImageTk
+
+        ext = (ext or "").lower()
+        label = "文件夹" if ext == "folder" else (ext.lstrip(".").upper()[:4] or "文件")
+        color_name = "gray" if not exists else DetailPane.EXT_COLORS.get(
+            ext, "teal")
+        key = ("file-ext", ext, label, size, exists, self._is_dark_mode())
+        hit = self._tile_cache.get(key)
+        if hit is not None:
+            return hit
+        size = max(8, int(size))
+        ss = 2
+        s = size * ss
+        color = self._hex_to_rgb(self._sys(color_name))
+        image = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((0, 0, s - 1, s - 1), radius=int(s * 0.22),
+                               fill=color + (255,))
+        font = self._load_font(max(8, int(s * (0.25 if len(label) > 3 else 0.34))))
+        bbox = draw.textbbox((0, 0), label, font=font)
+        draw.text(((s - bbox[2] + bbox[0]) / 2,
+                   (s - bbox[3] + bbox[1]) / 2), label,
+                  font=font, fill=(255, 255, 255, 255))
+        out = ImageTk.PhotoImage(image.resize((size, size), Image.LANCZOS))
         self._tile_cache[key] = out
         return out
 
@@ -1740,10 +1795,22 @@ class HistoryPanel:
                 self._thumb_cache.pop(next(iter(self._thumb_cache)))
             self._thumb_cache[key] = photo
             return photo
+        if cat == "file":
+            source = r["source"] if "source" in r.keys() else ""
+            full = self.db.get_text(r["id"])
+            first_path = (full["content"].splitlines()[0].strip()
+                          if full and full["content"] else "")
+            ext = os.path.splitext(first_path)[1].lower() or "folder"
+            key = f"tile:file-ext:{ext}:{size}:{dark}"
+            hit = self._thumb_cache.get(key)
+            if hit is None:
+                hit = self._file_extension_tile(ext, size, bool(first_path))
+                self._thumb_cache[key] = hit
+            return hit
         if cat == "code":
             source = r["source"] if "source" in r.keys() else ""
             source_key = (source or "").lower()
-            key = f"tile:code:{source_key}:{size}:{dark}"
+            key = f"tile:{cat}:{source_key}:{size}:{dark}"
             hit = self._thumb_cache.get(key)
             if hit is None:
                 hit = ImageTk.PhotoImage(self._source_code_tile(source, size))
@@ -3009,7 +3076,6 @@ class DetailPane:
         self._photo = None
         self._urls = []
         self._url_down = None
-        self._file_photos = []
         self._in_menu = False
         self._flat_menu = None
         self._body = None
@@ -3017,31 +3083,30 @@ class DetailPane:
         self.frame = tk.Frame(parent, bg=self.BG, width=width)
         self.frame.pack(side="left", fill="y")
         self.frame.pack_propagate(False)
-        # 顶部工具栏：与左侧搜索胶囊同高、顶端对齐；
-        # 左侧是当前记录操作，右侧是窗口控制区域。
-        self._toolbar = tk.Frame(self.frame, bg=self.BG,
-                                 height=getattr(panel, "_sh_h", 30))
-        self._toolbar.pack(fill="x")
-        self._toolbar.pack_propagate(False)
-        self.win_bar = tk.Frame(self._toolbar, bg=self.BG)
-        self.win_bar.pack(side="right", padx=(0, 2))
-        self._actions = tk.Frame(self._toolbar, bg=self.BG)
-        self._actions.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        self._meta = tk.Label(self.frame, text="预览", bg=T["field"],
+        # 三段式详情：顶部元信息、中部预览、底部固定操作栏。
+        self._meta_wrap = tk.Frame(self.frame, bg=T["field"], height=38)
+        self._meta_wrap.pack(fill="x", padx=8, pady=(4, 0))
+        self._meta_wrap.pack_propagate(False)
+        self._meta_icon = tk.Label(self._meta_wrap, bg=T["field"],
+                                   bd=0, highlightthickness=0)
+        self._meta_icon.pack(side="left", padx=(10, 6))
+        self._meta = tk.Label(self._meta_wrap, text="预览", bg=T["field"],
                               fg=T["label2"], font=("Microsoft YaHei UI", 9),
-                              anchor="w", padx=12, pady=6)
-        self._meta.pack(fill="x")
+                              anchor="w", padx=0, pady=6)
+        self._meta.pack(side="left", fill="x", expand=True)
         self._host = tk.Frame(self.frame, bg=self.BG)
-        self._host.pack(fill="both", expand=True, padx=4, pady=(2, 4))
-        for w in (self.frame, self._toolbar, self._meta, self._host):
+        self._host.pack(fill="both", expand=True, padx=8, pady=(6, 4))
+        self._action_separator = tk.Frame(self.frame, bg=T["hairline"], height=1)
+        self._action_separator.pack(fill="x", padx=8)
+        self._actions = tk.Frame(self.frame, bg=self.BG, height=42)
+        self._actions.pack(fill="x", padx=8, pady=(4, 6))
+        self._actions.pack_propagate(False)
+        for w in (self.frame, self._meta_wrap, self._meta, self._host, self._actions):
             w.bind("<MouseWheel>", self._on_wheel)
         self.frame.bind("<Return>", self._paste_key)
-        self._meta.bind("<Button-3>", self._menu)
-        # 工具栏/meta 空白区域可拖动窗口（接替原顶栏拖拽区）；
-        # 子按钮自带事件处理，Tk 不冒泡，故绑定互不干扰
-        for w in (self._toolbar, self._actions, self._meta):
-            w.bind("<ButtonPress-1>", panel._hdr_press)
-            w.bind("<B1-Motion>", panel._hdr_move)
+        self._meta_wrap.bind("<Button-3>", self._menu)
+        self._meta_wrap.bind("<ButtonPress-1>", panel._hdr_press)
+        self._meta_wrap.bind("<B1-Motion>", panel._hdr_move)
         self.show_placeholder()
 
     # ---------- 渲染调度 ----------
@@ -3103,7 +3168,6 @@ class DetailPane:
         self._photo = None
         self._urls = []
         self._url_down = None
-        self._file_photos = []
         kind = full["kind"]
         try:
             self.cat = full["category"] or (
@@ -3114,14 +3178,8 @@ class DetailPane:
         for w in self._host.winfo_children():
             w.destroy()
         if kind == "image" and full["image"]:
-            s_name, s_color, s_style = self.panel._source_app(full["source"])
-            if s_style in ("chat", "browser", "ide", "term", "office"):
-                self._source_header(self._host, s_name, s_color, full, self.tk)
             self._build_image_body(self._host, full, self.tk)
         elif self.cat == "file":
-            s_name, s_color, s_style = self.panel._source_app(full["source"])
-            if s_style in ("chat", "browser", "ide", "term", "office"):
-                self._source_header(self._host, s_name, s_color, full, self.tk)
             self._build_file_body(self._host, full, self.tk)
         else:
             self._build_text_body(self._host, full, self.tk)
@@ -3134,13 +3192,14 @@ class DetailPane:
         self.row = None
         self._photo = None
         self._urls = []
-        self._file_photos = []
         self._body = None
         for w in self._host.winfo_children():
             w.destroy()
         for w in self._actions.winfo_children():
             w.destroy()
         self._meta.configure(text="预览")
+        self._meta_icon.configure(image="")
+        self._meta_icon.image = None
         tk = self.tk
         T = self.T
         from PIL import ImageTk
@@ -3168,6 +3227,19 @@ class DetailPane:
         if row["tags"]:
             meta += f" · {row['tags'][:16]}"
         self._meta.configure(text=meta)
+        source_name, source_color, _style = self.panel._source_app(row["source"])
+        if self.cat == "file":
+            first_path = ((row["content"] or "").splitlines() or [""])[0].strip()
+            ext = os.path.splitext(first_path)[1].lower() or "folder"
+            icon = self.panel._file_extension_tile(
+                ext, max(20, int(round(22 * self.panel._dpi))),
+                bool(first_path))
+        else:
+            icon = self._app_tile(
+                source_color, self.panel._source_mark(row["source"]),
+                max(20, int(round(22 * self.panel._dpi))))
+        self._meta_icon.configure(image=icon)
+        self._meta_icon.image = icon
 
     # ---------- 动作栏 ----------
     def _update_actions(self):
@@ -3190,7 +3262,8 @@ class DetailPane:
                           activebackground=active_bg,
                           activeforeground=active_fg, padx=10 if primary else 8, pady=4,
                           cursor="hand2", highlightthickness=0)
-            b.pack(side="left", padx=(2, 0))
+            b.pack(side="right" if label == "删除" else "left",
+                   padx=(2, 0))
             return b
 
         btn("粘贴", self._paste_this, primary=True)
@@ -3262,20 +3335,16 @@ class DetailPane:
         dark = p._is_dark_mode()
 
         if chat:
-            self._source_header(outer, src_name, src_color, row, tk)
             bg = self._mix(p._sys(src_color), T["card_bg"],
                            0.14 if not dark else 0.30)
             fg, font = T["label"], ("Microsoft YaHei UI", 11)
             padx, pady = 12, 10
         elif console:
-            self._source_header(outer, src_name, src_color, row, tk)
             bg, fg, font = "#1F1F1F", "#E8E8E8", ("Consolas", 10)
             padx, pady = 10, 8
         else:
             if src_style == "browser":
                 self._browser_bar(outer, content, src_name, src_color, tk)
-            elif src_style == "ide":
-                self._source_header(outer, src_name, src_color, row, tk)
             bg, fg = self.BG, T["label"]
             font = ("Consolas", 10) if is_code else ("Microsoft YaHei UI", 10)
             padx, pady = 8, 6
@@ -3348,26 +3417,7 @@ class DetailPane:
                  (s - (bb[3] - bb[1])) / 2 - bb[1]),
                 letter, font=font, fill=(255, 255, 255, 255))
         photo = ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
-        self._file_photos.append(photo)
         return photo
-
-    def _source_header(self, outer, name, color, row, tk):
-        """来源应用行：彩色 tile + 应用名 + 时间（chat/term/ide 风格顶部）。"""
-        T = self.T
-        p = self.panel
-        bar = tk.Frame(outer, bg=self.BG)
-        bar.pack(fill="x", padx=4, pady=(2, 6))
-        size = max(18, int(round(22 * p._dpi)))
-        tile = self._app_tile(color, (name[:1] or "?").upper(), size)
-        lb = tk.Label(bar, image=tile, bg=self.BG)
-        lb.image = tile
-        lb.pack(side="left", padx=(2, 6))
-        tk.Label(bar, text=name, bg=self.BG, fg=T["label"],
-                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
-        tk.Label(bar, text=(row["created_at"] or "")[:16], bg=self.BG,
-                 fg=T["label3"],
-                 font=("Microsoft YaHei UI", 8)).pack(side="right", padx=4)
-        bar.bind("<MouseWheel>", self._on_wheel)
 
     def _browser_bar(self, outer, content, name, color, tk):
         """浏览器来源：地址栏风格行，检出首个 URL 可点击直达。"""
@@ -3423,12 +3473,11 @@ class DetailPane:
     def _file_row(self, parent, tk, path, T):
         exists = os.path.exists(path)
         is_dir = os.path.isdir(path)
+        row_h = max(30, int(round(30 * self.panel._dpi)))
         fr = tk.Frame(parent, bg=self.BG,
-                      cursor="hand2" if exists else "arrow")
+                      cursor="hand2" if exists else "arrow", height=row_h)
         fr.pack(fill="x", padx=2, pady=1)
-        icon = self._file_icon(path, is_dir, exists)
-        il = tk.Label(fr, image=icon, bg=self.BG)
-        il.pack(side="left", padx=(4, 6), pady=2)
+        fr.pack_propagate(False)
         name = os.path.basename(path.rstrip("\\/")) or path
         d = self.panel._dpi
         hw = self.frame.winfo_reqwidth()
@@ -3452,65 +3501,10 @@ class DetailPane:
         if info:
             tk.Label(fr, text=info, bg=self.BG, fg=T["label3"],
                      font=("Microsoft YaHei UI", 8)).pack(side="right", padx=4)
-        for w in (fr, il, nl):
+        for w in (fr, nl):
             w.bind("<Double-Button-1>", lambda e, p=path: self._open_path(p))
             w.bind("<Button-3>", lambda e, p=path: self._file_menu(p, e))
             w.bind("<MouseWheel>", self._on_wheel)
-
-    def _file_icon(self, path, is_dir, exists):
-        from PIL import ImageTk
-        p = self.panel
-        size = max(16, int(round(20 * p._dpi)))
-        ext = "" if is_dir else os.path.splitext(path)[1].lower()
-        try:
-            mt = os.path.getmtime(path) if exists else 0
-        except OSError:
-            mt = 0
-        cache = p._fileicon_cache
-        key = (path, size, mt)
-        hit = cache.get(key)
-        if hit is not None:
-            return hit
-        img = None
-        if exists and not is_dir and ext in self.IMG_EXTS:
-            try:
-                from PIL import Image
-                img = Image.open(path)
-                img.thumbnail((size, size))
-                img = img.convert("RGBA")
-            except Exception:
-                img = None
-        if img is None:
-            img = self._ext_tile("folder" if is_dir else ext, size, exists)
-        photo = ImageTk.PhotoImage(img)
-        if len(cache) > 64:
-            cache.pop(next(iter(cache)))
-        cache[key] = photo
-        self._file_photos.append(photo)
-        return photo
-
-    def _ext_tile(self, ext, size, exists=True):
-        from PIL import Image, ImageDraw
-        p = self.panel
-        color = ("gray" if not exists or not ext
-                 else self.EXT_COLORS.get(ext, "teal"))
-        rgb = p._hex_to_rgb(p._sys(color))
-        ss = 2
-        s = size * ss
-        im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        dr = ImageDraw.Draw(im)
-        dr.rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.22),
-                             fill=rgb + (255,))
-        if ext == "folder":
-            p._draw_glyph(dr, "folder", s, (255, 255, 255, 255))
-        else:
-            label = ext.lstrip(".").upper()[:4] or "?"
-            font = p._load_font(int(s * 0.40))
-            bb = dr.textbbox((0, 0), label, font=font)
-            dr.text(((s - (bb[2] - bb[0])) / 2 - bb[0],
-                     (s - (bb[3] - bb[1])) / 2 - bb[1]),
-                    label, font=font, fill=(255, 255, 255, 255))
-        return im.resize((size, size), Image.LANCZOS)
 
     # ---------- 代码着色 / 链接 ----------
     def _highlight_code(self, content, console=False):
