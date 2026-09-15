@@ -1022,29 +1022,27 @@ class HistoryPanel:
         return out
 
     def _source_code_tile(self, source, size):
-        """Brand-like code tile using the source application's short mark."""
+        """Source tile showing the complete application name."""
         dark = self._is_dark_mode()
         app_name, color_name, _style = self._source_app(source)
         source_key = (source or "").lower()
-        marks = {
-            "idea64.exe": ("IJ", "#FF7A00"),
-            "pycharm64.exe": ("PC", "#21D789"),
-            "webstorm64.exe": ("WS", "#00B8F5"),
-            "goland64.exe": ("GO", "#20D5C2"),
-            "clion64.exe": ("CL", "#F2C94C"),
-            "rider64.exe": ("RD", "#9B51E0"),
-            "datagrip64.exe": ("DG", "#FF5C7A"),
-            "dataspell64.exe": ("DS", "#FF9F43"),
-            "studio64.exe": ("AS", "#3DDC84"),
-            "code.exe": ("<>", "#1683FF"),
-            "cursor.exe": ("C", "#6C63FF"),
-            "devenv.exe": ("VS", "#8B5CF6"),
-            "sublime_text.exe": ("S", "#FF9800"),
+        colors = {
+            "idea64.exe": "#FF7A00",
+            "pycharm64.exe": "#21D789",
+            "webstorm64.exe": "#00B8F5",
+            "goland64.exe": "#20D5C2",
+            "clion64.exe": "#F2C94C",
+            "rider64.exe": "#9B51E0",
+            "datagrip64.exe": "#FF5C7A",
+            "dataspell64.exe": "#FF9F43",
+            "studio64.exe": "#3DDC84",
+            "code.exe": "#1683FF",
+            "cursor.exe": "#6C63FF",
+            "devenv.exe": "#8B5CF6",
+            "sublime_text.exe": "#FF9800",
         }
-        mark, fallback = marks.get(source_key, ("</>", self._sys("orange")))
-        if source_key not in marks:
-            mark = "</>" if app_name == "未知来源" else app_name[:2].upper()
-        color = fallback if source_key in marks else self._sys(color_name)
+        mark = app_name
+        color = colors.get(source_key, self._sys(color_name))
         key = ("source", source_key, mark, size, dark)
         hit = self._tile_cache.get(key)
         if hit is not None:
@@ -1058,7 +1056,14 @@ class HistoryPanel:
         bg = self._hex_to_rgb(color)
         dr.rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.24),
                              fill=bg + (255,))
-        font = self._load_font(max(10, int(s * 0.30)))
+        font_size = max(8, int(s * 0.32))
+        font = self._load_font(font_size)
+        while font_size > 8:
+            bbox = dr.textbbox((0, 0), mark, font=font)
+            if bbox[2] - bbox[0] <= s * 0.86 and bbox[3] - bbox[1] <= s * 0.72:
+                break
+            font_size -= 1
+            font = self._load_font(font_size)
         bbox = dr.textbbox((0, 0), mark, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         fg = (255, 255, 255, 255)
@@ -1783,34 +1788,10 @@ class HistoryPanel:
         """行首图标：图片类=圆角缩略图，其余=分类彩色 tile。返回 PhotoImage。"""
         from PIL import ImageTk
         dark = self._is_dark_mode()
-        if cat == "image":
-            key = f"thumb:{r['id']}:{size}:{dark}"
-            hit = self._thumb_cache.get(key)
-            if hit is not None:
-                return hit
-            thumb = self._image_thumb(r["id"], size)
-            base = thumb if thumb is not None else self._category_tile("image", size)
-            photo = ImageTk.PhotoImage(base)
-            if len(self._thumb_cache) > 200:
-                self._thumb_cache.pop(next(iter(self._thumb_cache)))
-            self._thumb_cache[key] = photo
-            return photo
-        if cat == "file":
-            source = r["source"] if "source" in r.keys() else ""
-            full = self.db.get_text(r["id"])
-            first_path = (full["content"].splitlines()[0].strip()
-                          if full and full["content"] else "")
-            ext = os.path.splitext(first_path)[1].lower() or "folder"
-            key = f"tile:file-ext:{ext}:{size}:{dark}"
-            hit = self._thumb_cache.get(key)
-            if hit is None:
-                hit = self._file_extension_tile(ext, size, bool(first_path))
-                self._thumb_cache[key] = hit
-            return hit
-        if cat == "code":
+        if cat in ("image", "code", "file", "text", "link"):
             source = r["source"] if "source" in r.keys() else ""
             source_key = (source or "").lower()
-            key = f"tile:{cat}:{source_key}:{size}:{dark}"
+            key = f"tile:source:{source_key}:{size}:{dark}"
             hit = self._thumb_cache.get(key)
             if hit is None:
                 hit = ImageTk.PhotoImage(self._source_code_tile(source, size))
@@ -3228,16 +3209,9 @@ class DetailPane:
             meta += f" · {row['tags'][:16]}"
         self._meta.configure(text=meta)
         source_name, source_color, _style = self.panel._source_app(row["source"])
-        if self.cat == "file":
-            first_path = ((row["content"] or "").splitlines() or [""])[0].strip()
-            ext = os.path.splitext(first_path)[1].lower() or "folder"
-            icon = self.panel._file_extension_tile(
-                ext, max(20, int(round(22 * self.panel._dpi))),
-                bool(first_path))
-        else:
-            icon = self._app_tile(
-                source_color, self.panel._source_mark(row["source"]),
-                max(20, int(round(22 * self.panel._dpi))))
+        from PIL import ImageTk
+        icon = ImageTk.PhotoImage(self.panel._source_code_tile(
+            row["source"], max(20, int(round(22 * self.panel._dpi)))))
         self._meta_icon.configure(image=icon)
         self._meta_icon.image = icon
 
@@ -3343,8 +3317,6 @@ class DetailPane:
             bg, fg, font = "#1F1F1F", "#E8E8E8", ("Consolas", 10)
             padx, pady = 10, 8
         else:
-            if src_style == "browser":
-                self._browser_bar(outer, content, src_name, src_color, tk)
             bg, fg = self.BG, T["label"]
             font = ("Consolas", 10) if is_code else ("Microsoft YaHei UI", 10)
             padx, pady = 8, 6
