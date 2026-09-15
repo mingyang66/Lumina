@@ -11,8 +11,8 @@
   "copy_screenshot_to_clipboard": true,
   "cleanup_interval_minutes": 60,
   "popup_enabled": true,
-  "popup_seconds": 3,
+  "popup_seconds": 3.0,
   "panel_enabled": true,
-  "hide_panel_on_capture": true,
+  "hide_panel_on_capture": false,
   "download_dir": ""
 }

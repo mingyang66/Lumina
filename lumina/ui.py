@@ -1498,6 +1498,11 @@ class HistoryPanel:
                 command=lambda: self._popup_action(self._cleanup_now), **btn_kw)
             trash_button.image = trash_photo
             trash_button.pack(fill="x", padx=4, pady=(1, 4))
+            tk.Frame(frame, bg=T["separator"], height=1).pack(
+                fill="x", padx=6, pady=(3, 4))
+            tk.Button(frame, text="设置…",
+                      command=lambda: self._popup_action(self._open_settings_dialog),
+                      **btn_kw).pack(fill="x", padx=4, pady=(0, 4))
         pop.bind("<Escape>", lambda e: self._close_popup_menu())
         btn = self._menu_anchor
         btn.update_idletasks()
@@ -1537,6 +1542,138 @@ class HistoryPanel:
         background.place(x=0, y=0, relwidth=1, relheight=1)
         background.lower()
         pop.configure(bg=theme["card_bg"])
+
+    def _open_settings_dialog(self):
+        """Open the editable config.json settings dialog."""
+        from .config import DEFAULTS
+        tk = self.tk
+        T, _dark = self._theme()
+        dialog = tk.Toplevel(self.win)
+        dialog.title("Lumina 偏好设置")
+        dialog.transient(self.win)
+        dialog.configure(bg=T["window_bg"])
+        dialog.resizable(False, False)
+        dialog.geometry("680x760")
+        shell = tk.Frame(dialog, bg=T["window_bg"])
+        shell.pack(fill="both", expand=True, padx=18, pady=16)
+        content = tk.Frame(shell, bg=T["window_bg"])
+        content.pack(fill="both", expand=True)
+        canvas = tk.Canvas(content, bg=T["window_bg"], highlightthickness=0,
+                           bd=0)
+        scrollbar = tk.Scrollbar(content, orient="vertical",
+                                 command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y", padx=(8, 0))
+        body = tk.Frame(canvas, bg=T["window_bg"])
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda _e: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(
+            body_window, width=e.width))
+        canvas.bind("<MouseWheel>",
+                    lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+        fields = {}
+
+        def section(title):
+            card = tk.Frame(body, bg=T["card_bg"],
+                            highlightbackground=T["separator"],
+                            highlightthickness=1)
+            card.pack(fill="x", pady=(10, 4))
+            tk.Label(card, text=title, bg=T["card_bg"], fg=T["accent"],
+                     font=self._font(10, "bold"), anchor="w").pack(
+                         fill="x", padx=14, pady=(10, 4))
+            return card
+
+        def add_row(label, key, kind="text", parent=body):
+            line = tk.Frame(parent, bg=T["card_bg"])
+            line.pack(fill="x", padx=14, pady=4)
+            tk.Label(line, text=label, width=19, anchor="w",
+                     bg=T["card_bg"], fg=T["label"],
+                     font=self._font(9)).pack(side="left")
+            if kind == "bool":
+                var = tk.BooleanVar(value=bool(self.ui.config.get(key, False)))
+                tk.Checkbutton(line, text="启用", variable=var,
+                               bg=T["card_bg"], activebackground=T["card_bg"],
+                               selectcolor=T["field"], highlightthickness=0,
+                               fg=T["label"], font=self._font(9)).pack(side="left")
+            else:
+                var = tk.StringVar(value=str(self.ui.config.get(key, "")))
+                tk.Entry(line, textvariable=var, width=28, relief="flat",
+                         bg=T["field"], fg=T["label"],
+                         insertbackground=T["label"],
+                         font=self._font(9)).pack(side="left")
+            fields[key] = (var, kind)
+
+        shortcut_card = section("快捷键")
+        add_row("全屏截图", "hotkey_capture", parent=shortcut_card)
+        add_row("区域截图", "hotkey_region", parent=shortcut_card)
+        add_row("打开面板", "hotkey_panel", parent=shortcut_card)
+        capture_card = section("通知与截图")
+        add_row("启用通知", "popup_enabled", "bool", capture_card)
+        add_row("通知时长（秒）", "popup_seconds", parent=capture_card)
+        add_row("启用面板", "panel_enabled", "bool", capture_card)
+        add_row("截图时隐藏窗口", "hide_panel_on_capture", "bool", capture_card)
+        add_row("截图后复制到剪贴板", "copy_screenshot_to_clipboard", "bool", capture_card)
+        add_row("截图显示器", "capture_monitor", parent=capture_card)
+        add_row("下载目录", "download_dir", parent=capture_card)
+        data_card = section("数据保留")
+        add_row("保留天数", "retention_days", parent=data_card)
+        add_row("最大记录数", "max_rows", parent=data_card)
+        add_row("清理间隔（分钟）", "cleanup_interval_minutes", parent=data_card)
+        add_row("最大文本（KB）", "max_text_kb", parent=data_card)
+        add_row("最大图片（MB）", "max_image_mb", parent=data_card)
+
+        buttons = tk.Frame(shell, bg=T["window_bg"])
+        buttons.pack(fill="x", pady=(14, 0))
+
+        def reset_defaults():
+            for key, (var, kind) in fields.items():
+                value = DEFAULTS.get(key, "")
+                var.set(bool(value) if kind == "bool" else str(value))
+
+        def save():
+            numeric = {"popup_seconds": float, "capture_monitor": int,
+                       "retention_days": int, "max_rows": int,
+                       "cleanup_interval_minutes": int, "max_text_kb": int,
+                       "max_image_mb": int}
+            values = {}
+            try:
+                for key, (var, kind) in fields.items():
+                    value = var.get()
+                    values[key] = bool(value) if kind == "bool" else value
+                    if key in numeric:
+                        values[key] = numeric[key](value)
+                        if values[key] < 0 or (key == "popup_seconds" and values[key] > 60):
+                            raise ValueError
+                self.ui.actions.save_settings(values)
+            except (ValueError, TypeError, OSError):
+                from tkinter import messagebox
+                messagebox.showerror("设置无效", "请检查数值范围和配置文件权限。",
+                                     parent=dialog)
+                return
+            self.ui.config.update(values)
+            self.toast_enabled = bool(self.ui.config.get("popup_enabled", True))
+            self.toast_seconds = float(self.ui.config.get("popup_seconds", 3))
+            self.status_var.set("设置已保存，快捷键重启后生效")
+            dialog.destroy()
+
+        tk.Button(buttons, text="恢复默认值", command=reset_defaults, relief="flat",
+                  bd=0, bg=T["window_bg"], fg=T["label2"], padx=8, pady=6,
+                  cursor="hand2").pack(side="left")
+        tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat",
+                  bd=0, bg=T["field"], fg=T["label"], padx=14, pady=6,
+                  cursor="hand2").pack(side="right", padx=(6, 0))
+        tk.Button(buttons, text="保存", command=save, relief="flat", bd=0,
+                  bg=T["accent"], fg="#FFFFFF", padx=14, pady=6,
+                  cursor="hand2").pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        px = self.win.winfo_rootx() + max(0, (self.win.winfo_width() - dialog.winfo_width()) // 2)
+        py = self.win.winfo_rooty() + max(0, (self.win.winfo_height() - dialog.winfo_height()) // 2)
+        dialog.geometry(f"+{px}+{py}")
+        dialog.grab_set()
+        dialog.focus_force()
 
     def _popup_action(self, fn):
         self._close_popup_menu()
@@ -2152,9 +2289,9 @@ class HistoryPanel:
         title_bar.pack_propagate(False)
         title_bar.bind("<ButtonPress-1>", self._hdr_press)
         title_bar.bind("<B1-Motion>", self._hdr_move)
-        self._title_icon = self._make_lumina_title_icon(max(20, int(round(24 * dpi))))
-        tk.Label(title_bar, image=self._title_icon, bg=win_bg,
-                 bd=0, highlightthickness=0).pack(side="left", padx=(6, 8))
+        tk.Label(title_bar, text="Lumina", bg=win_bg, fg=T["accent"],
+                 font=("Segoe UI", max(13, int(round(14 * dpi))), "bold"),
+                 anchor="w").pack(side="left", padx=(10, 14))
         menu_btn_kw = dict(
             bd=0, bg=win_bg, activebackground=T["fill_hover"],
             activeforeground=T["label"], relief="flat", cursor="hand2",
