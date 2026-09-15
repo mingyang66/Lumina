@@ -343,7 +343,7 @@ class RegionSelector:
     保证输出的是全分辨率区域。
     """
 
-    HINT = "拖拽框选区域 · 松手后 ✓保存(Enter) / 钉图 / ✕取消(Esc)"
+    HINT = "拖拽框选区域 · 松手后 ✓保存(Enter) / 📌钉图 / ✕取消(Esc)"
 
     def __init__(self, ui, frozen_png, on_done):
         from PIL import Image, ImageEnhance, ImageTk
