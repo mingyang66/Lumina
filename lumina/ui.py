@@ -9,6 +9,7 @@ import ctypes
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 import traceback
@@ -398,6 +399,11 @@ class RegionSelector:
         self._redo = []
         self._edit_items = []
         self._text_editor = None
+        self._ocr_panel = None
+        self._ocr_panel_item = None
+        self._ocr_photo = None
+        self._ocr_bg_photo = None
+        self._ocr_popup = None
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
@@ -463,6 +469,7 @@ class RegionSelector:
         self._tool = None
         self._start = (max(0, min(e.x, self.sw)), max(0, min(e.y, self.sh)))
         self._sel_box = None
+        self._clear_ocr_panel()
         if self._coord_id is not None:
             self.canvas.itemconfigure(self._coord_id, state="hidden")
         self._clear_toolbar()
@@ -526,7 +533,7 @@ class RegionSelector:
         self._sel_box = (x0, y0, x1, y1)
         self._show_toolbar()
 
-    def _crop_box(self):
+    def _crop_box(self, include_annotations=True):
         """按当前选区从原始冻结图裁剪（DPI 换算到物理像素）。"""
         if not self._sel_box:
             return None
@@ -539,6 +546,10 @@ class RegionSelector:
             return None
         from PIL import ImageDraw, ImageFont
         result = self.src.crop(box).convert("RGBA")
+        if not include_annotations:
+            buf = io.BytesIO()
+            result.convert("RGB").save(buf, "PNG")
+            return buf.getvalue()
         scale_x = result.width / max(1, x1 - x0)
         scale_y = result.height / max(1, y1 - y0)
         draw = ImageDraw.Draw(result)
@@ -747,15 +758,63 @@ class RegionSelector:
                     dr.ellipse((cx - radius, cy - radius, cx + radius, cy + radius),
                                fill=text_color)
             elif kind == "ocr":
-                dr.rectangle((m, m, s - m, s - m), outline=color, width=w)
-                dr.line((s * .36, s * .50, s * .47, s * .61, s * .68, s * .36), fill=color, width=w)
+                # OCR：四角扫描框 + 中央“文”，直接表达提取文字功能。
+                scan_color = "#6f808c"
+                corner = s * .23
+                edge = s * .78
+                arm = s * .14
+                scan_w = max(2, s // 12)
+                for x, y, dx, dy in ((corner, corner, 1, 1),
+                                     (edge, corner, -1, 1),
+                                     (corner, edge, 1, -1),
+                                     (edge, edge, -1, -1)):
+                    dr.line((x, y, x + dx * arm, y), fill=scan_color, width=scan_w)
+                    dr.line((x, y, x, y + dy * arm), fill=scan_color, width=scan_w)
+                try:
+                    ocr_font = ImageFont.truetype("msyh.ttc", int(s * .30))
+                except Exception:
+                    ocr_font = ImageFont.load_default()
+                label = "文"
+                bbox = dr.textbbox((0, 0), label, font=ocr_font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+                dr.text(((s - text_w) / 2 - bbox[0], (s - text_h) / 2 - bbox[1]),
+                        label, font=ocr_font, fill=scan_color)
             elif kind in ("undo", "redo"):
-                start, end = (35, 315) if kind == "undo" else (225, 145)
-                dr.arc((m, m, s - m, s - m), start, end, fill=color, width=w)
-                if kind == "undo":
-                    dr.polygon(((s * .22, s * .42), (s * .22, s * .18), (s * .44, s * .30)), fill=color)
+                # 微信风格回转箭头整体旋转：撤销顺时针 90 度，恢复逆时针 90 度。
+                arrow_color = "#647581"
+                curve = [(s * .30, s * .36), (s * .38, s * .27),
+                         (s * .51, s * .24), (s * .65, s * .29),
+                         (s * .74, s * .40), (s * .76, s * .55),
+                         (s * .72, s * .68)]
+                center = s / 2
+
+                def rotate(point, clockwise):
+                    px, py = point[0] - center, point[1] - center
+                    if clockwise:
+                        return (center - py, center + px)
+                    return (center + py, center - px)
+
+                if kind == "redo":
+                    curve = [(s - x, y) for x, y in curve]
+                    clockwise = False
                 else:
-                    dr.polygon(((s * .78, s * .42), (s * .78, s * .18), (s * .56, s * .30)), fill=color)
+                    clockwise = True
+                curve = [rotate(point, clockwise) for point in curve]
+                dr.line(curve, fill=arrow_color, width=w, joint="curve")
+                # 在最终旋转后的方向上延长箭头，避免旋转前调整导致方向不明显。
+                tip_x, tip_y = curve[0]
+                head_length = s * .26
+                head_width = s * .13
+                if kind == "undo":
+                    head = ((tip_x - head_length, tip_y),
+                            (tip_x, tip_y - head_width),
+                            (tip_x, tip_y + head_width))
+                else:
+                    head = ((tip_x + head_length, tip_y),
+                            (tip_x, tip_y - head_width),
+                            (tip_x, tip_y + head_width))
+                dr.polygon(head, fill=arrow_color)
             return finalize(im)
 
         self._tb_icons = {
@@ -877,23 +936,279 @@ class RegionSelector:
             self._redraw_annotations()
 
     def _extract_text(self):
+        from tkinter import messagebox
         try:
             import pytesseract
             from PIL import Image
-            text = pytesseract.image_to_string(Image.open(io.BytesIO(self._crop_box())), lang="chi_sim+eng").strip()
+            # Windows 安装程序不一定会自动把 Tesseract 加入 PATH。
+            candidates = (
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            )
+            # 优先使用已确认的 Windows 安装路径，避免 pythonw 进程未继承最新 PATH。
+            tesseract = next((p for p in candidates if os.path.isfile(p)), None)
+            if not tesseract:
+                tesseract = shutil.which("tesseract")
+            if not tesseract:
+                raise pytesseract.pytesseract.TesseractNotFoundError(
+                    "Tesseract OCR executable was not found")
+            pytesseract.pytesseract.tesseract_cmd = tesseract
+
+            png = self._crop_box()
+            if not png:
+                messagebox.showwarning("提取文字", "当前没有有效的截图选区。请重新框选文字区域。", parent=self.win)
+                return
+            image = Image.open(io.BytesIO(png)).convert("RGB")
+            ocr_png = self._crop_box(include_annotations=False)
+            if ocr_png:
+                image = Image.open(io.BytesIO(ocr_png)).convert("RGB")
+            from PIL import ImageEnhance, ImageFilter, ImageOps
+            image = ImageOps.autocontrast(image.convert("L"))
+            image = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
+            image = ImageEnhance.Contrast(image).enhance(1.35)
+            image = image.filter(ImageFilter.SHARPEN)
+            languages = set(pytesseract.get_languages(config=""))
+            lang = "chi_sim+eng" if "chi_sim" in languages else "eng"
+            if lang == "eng":
+                messagebox.showwarning(
+                    "提取文字",
+                    "未找到中文识别模型 chi_sim，请先安装中文语言包后重试。",
+                    parent=self.win)
+                return
+            text = pytesseract.image_to_string(image, lang=lang, config="--psm 6").strip()
             if text:
-                self.ui._tk.clipboard_clear()
-                self.ui._tk.clipboard_append(text)
-                from tkinter import messagebox
-                messagebox.showinfo("提取文字", "文字已复制到剪贴板。", parent=self.win)
+                try:
+                    self._show_ocr_panel(text, png)
+                except Exception as exc:
+                    traceback.print_exc()
+                    messagebox.showerror("OCR 结果面板", f"识别成功，但结果面板显示失败：{exc}", parent=self.win)
             else:
-                from tkinter import messagebox
                 messagebox.showinfo("提取文字", "未识别到文字。", parent=self.win)
         except ImportError:
-            from tkinter import messagebox
             messagebox.showwarning("提取文字", "请安装 pytesseract 和 Tesseract OCR 后重试。", parent=self.win)
-        except Exception:
+        except Exception as exc:
+            if exc.__class__.__name__ == "TesseractNotFoundError":
+                messagebox.showwarning(
+                    "提取文字",
+                    "未找到 Tesseract OCR。请安装 Tesseract，并将其加入 PATH，\n"
+                    "或安装到 C:\\Program Files\\Tesseract-OCR。",
+                    parent=self.win)
+                return
             traceback.print_exc()
+            messagebox.showerror(
+                "提取文字失败",
+                f"OCR 识别失败：{exc}",
+                parent=self.win)
+
+    def _show_ocr_panel(self, text, png):
+        """显示微信风格的截图预览与 OCR 文字并排结果卡片。"""
+        self._clear_ocr_panel()
+        from PIL import Image, ImageDraw, ImageTk
+        tk = self.ui._tk
+        preview = Image.open(io.BytesIO(png)).convert("RGB")
+        image_ratio = preview.width / max(1, preview.height)
+        # 预览区按原图比例计算，避免横图被压得过高或竖图占满整个面板。
+        preview_max_w = min(420, max(250, int(self.sw * .32)))
+        preview_max_h = min(380, max(220, int(self.sh * .40)))
+        if image_ratio >= 1:
+            preview_w = preview_max_w
+            preview_h = max(100, int(preview_w / image_ratio))
+            if preview_h > preview_max_h:
+                preview_h = preview_max_h
+                preview_w = max(150, int(preview_h * image_ratio))
+        else:
+            preview_h = preview_max_h
+            preview_w = max(150, int(preview_h * image_ratio))
+        # 横向截图的原图高度较小，不能让它把文字栏也压扁；为文字阅读保留固定基准高度。
+        content_h = max(preview_h, min(440, max(300, int(self.sh * .48))))
+        panel_h = min(max(360, content_h + 96), int(self.sh * .88))
+        text_w = min(420, max(300, int(self.sw * .26)))
+        panel_w = min(max(580, preview_w + text_w + 48), max(620, int(self.sw * .88)))
+        x0, y0, x1, y1 = self._sel_box
+        px = x1 + 18
+        if px + panel_w > self.sw:
+            px = max(12, x0 - panel_w - 18)
+        if px + panel_w > self.sw:
+            px = max(12, (self.sw - panel_w) // 2)
+        py = max(12, min(y0, self.sh - panel_h - 12))
+
+        # OCR 结果卡片独立展示，移除底层原选区和工具栏，避免重复框叠在结果上。
+        self._clear_toolbar()
+        for item_id in (self._rect_id, self._shot_id, self._size_id):
+            if item_id is not None:
+                self.canvas.delete(item_id)
+        self._rect_id = self._shot_id = self._size_id = None
+        self._shot_photo = None
+        for item_id in self._edit_items:
+            self.canvas.delete(item_id)
+        self._edit_items = []
+        self._sel_box = None
+
+        # 使用独立透明窗口，避免全屏遮罩 Canvas 的矩形背景露在圆角卡片外。
+        popup = tk.Toplevel(self.ui._root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        transparent = "#010203"
+        popup.configure(bg=transparent)
+        popup.geometry(f"{panel_w}x{panel_h}+{px}+{py}")
+        try:
+            popup.attributes("-transparentcolor", transparent)
+        except tk.TclError:
+            pass
+        panel = tk.Canvas(popup, width=panel_w, height=panel_h,
+                          bg=transparent, bd=0, highlightthickness=0)
+        panel.pack(fill="both", expand=True)
+        bg = Image.new("RGBA", (panel_w * 2, panel_h * 2), (0, 0, 0, 0))
+        ImageDraw.Draw(bg).rounded_rectangle(
+            (1, 1, panel_w * 2 - 2, panel_h * 2 - 2), radius=12 * 2,
+            fill="#ffffff", outline="#d5dbe2", width=2)
+        self._ocr_bg_photo = ImageTk.PhotoImage(
+            bg.resize((panel_w, panel_h), Image.Resampling.LANCZOS))
+        panel.create_image(0, 0, image=self._ocr_bg_photo, anchor="nw")
+        surface = tk.Frame(panel, bg="#ffffff", bd=0, highlightthickness=0)
+        # 内容层避开圆角区域，避免白色矩形在四角露出直角。
+        inset = 11
+        panel.create_window(inset, inset, window=surface, anchor="nw",
+                           width=panel_w - inset * 2, height=panel_h - inset * 2)
+        header = tk.Frame(surface, bg="#ffffff", height=20)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        drag = {}
+
+        def begin_drag(event):
+            drag["x"] = event.x_root - popup.winfo_x()
+            drag["y"] = event.y_root - popup.winfo_y()
+
+        def move_drag(event):
+            popup.geometry(f"+{event.x_root - drag['x']}+{event.y_root - drag['y']}")
+
+        header.configure(cursor="fleur")
+        header.bind("<ButtonPress-1>", begin_drag)
+        header.bind("<B1-Motion>", move_drag)
+        tk.Frame(surface, bg="#edf0f2", height=1).pack(fill="x")
+        body = tk.Frame(surface, bg="#f7f8fa")
+        body.pack(fill="both", expand=True, padx=8, pady=8)
+
+        preview_w = max(180, min(preview_w + 30, int(panel_w * .50)))
+        preview_frame = tk.Frame(body, bg="#f1f3f5", bd=0,
+                                 highlightthickness=0)
+        preview_frame.pack(side="left", fill="both", padx=(0, 10))
+        preview_frame.configure(width=preview_w)
+        preview_frame.pack_propagate(False)
+        preview_box = tk.Frame(preview_frame, bg="#f0f2f4")
+        preview_box.pack(fill="both", expand=True, padx=9, pady=9)
+        preview.thumbnail((preview_w - 28, panel_h - 88), Image.LANCZOS)
+        self._ocr_photo = ImageTk.PhotoImage(preview)
+        tk.Label(preview_box, image=self._ocr_photo, bg="#f0f2f4").pack(expand=True, padx=10, pady=10)
+
+        text_frame = tk.Frame(body, bg="#ffffff", bd=0, highlightthickness=0)
+        text_frame.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(text_frame, relief="flat", bd=0,
+                                 bg="#d5dadd", troughcolor="#ffffff",
+                                 activebackground="#aeb5bb", width=7)
+        scrollbar.pack(side="right", fill="y", padx=(0, 4), pady=5)
+        text_box = tk.Text(text_frame, wrap="word", undo=False, bd=0,
+                           bg="#ffffff", fg="#263238",
+                           insertbackground="#07c160", selectbackground="#ccebd9",
+                           padx=13, pady=11, spacing1=2, spacing3=4,
+                           font=("Microsoft YaHei UI", 11),
+                           yscrollcommand=scrollbar.set)
+        text_box.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=3)
+        scrollbar.config(command=text_box.yview)
+        text_box.insert("1.0", text)
+
+        def copy_selected(_event=None):
+            try:
+                selected = text_box.get("sel.first", "sel.last")
+            except tk.TclError:
+                selected = ""
+            if selected:
+                self._copy_ocr_text(selected)
+            return "break"
+
+        def select_all(_event=None):
+            text_box.tag_add("sel", "1.0", "end-1c")
+            text_box.mark_set("insert", "end-1c")
+            return "break"
+
+        def block_edit(_event):
+            return "break"
+
+        # 保持只读，但允许 Tk 原生选择、Ctrl+C 和 Ctrl+A。
+        text_box.configure(state="normal")
+        text_box.configure(exportselection=False)
+        text_box.bind("<Control-c>", copy_selected, add="+")
+        text_box.bind("<Control-C>", copy_selected, add="+")
+        text_box.bind("<Control-a>", select_all, add="+")
+        text_box.bind("<Control-A>", select_all, add="+")
+        text_box.bind("<<Copy>>", copy_selected, add="+")
+        for sequence in ("<BackSpace>", "<Delete>", "<Return>", "<Tab>"):
+            text_box.bind(sequence, block_edit, add="+")
+        footer = tk.Frame(surface, bg="#ffffff", height=50)
+        footer.pack(fill="x", padx=14, pady=(0, 9))
+        tk.Label(footer, text="可滚动查看 · 内容不会自动复制", bg="#ffffff", fg="#a0a8b0",
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(2, 0), pady=8)
+        tk.Button(footer, text="复制文字", command=lambda: self._copy_ocr_text(text),
+                  bd=0, bg="#07c160", activebackground="#06ad56", fg="#ffffff",
+                  font=("Microsoft YaHei UI", 10, "bold"), relief="flat",
+                  cursor="hand2", padx=14, pady=6,
+                  highlightthickness=0).pack(side="right", pady=4)
+        # 关闭按钮使用稳定的 Tk 控件，避免透明 Canvas 在 Windows 颜色键窗口上报错。
+        close_button = tk.Button(
+            popup, text="×", command=self.cancel,
+            bd=0, relief="flat", highlightthickness=0,
+            bg="#ffffff", activebackground="#f1f3f5",
+            fg="#7e8994", activeforeground="#d14343",
+            font=("Microsoft YaHei UI", 18, "bold"), cursor="hand2",
+            padx=0, pady=0)
+        close_button.place(x=panel_w - inset - 30, y=max(3, inset - 9),
+                           width=30, height=30)
+        close_button.lift()
+
+        self._ocr_popup = popup
+        self._ocr_panel = panel
+        # 根窗口常驻隐藏，结果窗口不能设置 transient，否则会被隐藏根窗口连带隐藏。
+        popup.deiconify()
+        popup.update_idletasks()
+        popup.attributes("-topmost", True)
+        popup.lift()
+        # 不抢焦点，避免鼠标释放事件回到全屏选区窗口后触发清理。
+        popup.after(20, popup.lift)
+        # OCR 结果已经独立显示，隐藏全屏截图遮罩，让屏幕恢复正常亮度。
+        self.win.withdraw()
+
+    def _copy_ocr_text(self, text):
+        self.win.clipboard_clear()
+        self.win.clipboard_append(text)
+        self.win.update()
+
+    def _clear_ocr_panel(self):
+        # OCR 面板关闭后退出截图选择状态，恢复普通鼠标光标。
+        try:
+            self.canvas.configure(cursor="arrow")
+            self.win.configure(cursor="arrow")
+        except Exception:
+            pass
+        if self._ocr_panel_item is not None:
+            try:
+                self.canvas.delete(self._ocr_panel_item)
+            except Exception:
+                pass
+            self._ocr_panel_item = None
+        if self._ocr_popup is not None:
+            try:
+                self._ocr_popup.destroy()
+            except Exception:
+                pass
+            self._ocr_popup = None
+        if self._ocr_panel is not None:
+            try:
+                self._ocr_panel.destroy()
+            except Exception:
+                pass
+            self._ocr_panel = None
+        self._ocr_photo = None
+        self._ocr_bg_photo = None
 
     def _show_toolbar(self):
         """圆角工具栏：PIL 画圆角矩形背景图放到 canvas，按钮直接叠在上面。
@@ -1054,6 +1369,7 @@ class RegionSelector:
         if self.done:
             return
         self.done = True
+        self._clear_ocr_panel()
         try:
             self.win.destroy()
         except Exception:
