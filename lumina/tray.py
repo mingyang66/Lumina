@@ -63,8 +63,8 @@ class TrayIcon:
         image = image.resize((48, 48), Image.Resampling.LANCZOS)
 
         menu = pystray.Menu(
-            pystray.MenuItem("显示/最小化面板", self._toggle_panel, default=True),
-            pystray.MenuItem("最小化面板", self._hide_panel),
+            pystray.MenuItem("显示面板", self._toggle_panel,
+                             checked=self._panel_is_visible, default=True),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出 Lumina", self._quit),
         )
@@ -85,6 +85,20 @@ class TrayIcon:
 
     def _toggle_panel(self, _icon, _item):
         self.app.ui.toggle_panel()
+        # Panel visibility is applied asynchronously on the Tk thread. Refresh
+        # after that queue has been processed so the checkmark uses new state.
+        threading.Timer(0.2, self._refresh_menu).start()
+
+    def _panel_is_visible(self, _item):
+        return bool(self.app.ui.panel_visible)
+
+    def _refresh_menu(self):
+        icon = self._icon
+        if icon is not None:
+            try:
+                icon.update_menu()
+            except Exception:
+                pass
 
     def _hide_panel(self, _icon, _item):
         self.app.ui.request_hide_panel()

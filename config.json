@@ -16,5 +16,6 @@
   "popup_seconds": 3.0,
   "panel_enabled": true,
   "hide_panel_on_capture": false,
-  "download_dir": ""
+  "download_dir": "",
+  "autostart": true
 }

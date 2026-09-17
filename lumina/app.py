@@ -9,7 +9,7 @@ from PIL import Image
 
 from . import win32clip
 from .classify import classify_text
-from .config import save_config
+from .config import save_config, set_autostart
 from .db import Database
 from .imaging import grab_screen, image_to_dib, to_png
 from .listener import ClipboardListener
@@ -205,6 +205,8 @@ class LuminaApp:
 
     def save_settings(self, values):
         """Persist settings edited by the UI settings dialog."""
+        if "autostart" in values:
+            set_autostart(values["autostart"], self.config_path)
         self.config.update(values)
         if self.config_path:
             save_config(self.config, self.config_path)

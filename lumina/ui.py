@@ -2715,6 +2715,7 @@ class HistoryPanel:
         add_row("截图后复制到剪贴板", "copy_screenshot_to_clipboard", "bool", capture_card)
         add_row("截图显示器", "capture_monitor", parent=capture_card)
         add_row("归档复制的文件", "archive_files", "bool", capture_card)
+        add_row("开机自动启动", "autostart", "bool", capture_card)
         add_row("单文件上限（MB）", "max_file_mb", parent=capture_card)
         add_row("下载目录", "download_dir", parent=capture_card)
         data_card = section("数据保留")
