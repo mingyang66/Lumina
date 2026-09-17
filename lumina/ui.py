@@ -405,6 +405,10 @@ class RegionSelector:
         self._text_caret_job = None
         self._text_input_proxy = None
         self._text_click_binding = None
+        self._text_style_popup = None
+        self._text_tool_anchor = None
+        self._text_font_size = 18
+        self._text_color = "#ff3b30"
         self._ocr_panel = None
         self._ocr_panel_item = None
         self._ocr_photo = None
@@ -619,13 +623,15 @@ class RegionSelector:
                         draw.rectangle((px - radius, py - radius, px + radius, py + radius),
                                        fill=color)
             elif kind == "text":
-                _, pos, text = item
+                pos, text = item[1], item[2]
                 try:
-                    font = ImageFont.truetype("msyh.ttc", max(14, int(20 * min(scale_x, scale_y))))
+                    font_size = item[3] if len(item) > 3 else 20
+                    font = ImageFont.truetype("msyh.ttc", max(14, int(font_size * min(scale_x, scale_y))))
                 except Exception:
                     font = ImageFont.load_default()
+                color = item[4] if len(item) > 4 else "#ff3b30"
                 draw.text((int((pos[0] - x0) * scale_x), int((pos[1] - y0) * scale_y)), text,
-                          fill="#ff3b30", font=font)
+                          fill=color, font=font)
         buf = io.BytesIO()
         result.convert("RGB").save(buf, "PNG")
         return buf.getvalue()
@@ -870,7 +876,125 @@ class RegionSelector:
 
     def _select_tool(self, tool):
         self._tool = tool
+        if tool == "text":
+            if self._text_tool_anchor is not None:
+                self._show_text_style_popup(*self._text_tool_anchor, offset=8)
+            else:
+                self._hide_text_style_popup()
+        else:
+            self._hide_text_style_popup()
         self.canvas.configure(cursor="crosshair" if tool else "arrow")
+
+    def _show_text_style_popup(self, x=None, y=None, offset=42):
+        self._hide_text_style_popup()
+        tk = self.ui._tk
+        from PIL import Image, ImageDraw, ImageTk
+        popup = tk.Toplevel(self.win)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        transparent = "#010203"
+        popup.configure(bg=transparent)
+        try:
+            popup.attributes("-transparentcolor", transparent)
+        except tk.TclError:
+            pass
+        frame = tk.Frame(popup, bg="#ffffff", bd=0,
+                         highlightthickness=0)
+        frame.pack(padx=8, pady=(10, 8))
+        block_size = 28
+        for label, size in (("小", 14), ("中", 18), ("大", 26)):
+            selected = size == self._text_font_size
+            holder = tk.Frame(frame, bg="#3478f6" if selected else "#ffffff",
+                              width=block_size, height=block_size)
+            holder.pack(side="left", padx=2)
+            holder.pack_propagate(False)
+            button = tk.Button(
+                holder, text=label,
+                command=lambda value=size: self._set_text_size(value),
+                bg="#e8f1ff" if selected else "#ffffff",
+                activebackground="#dbeaff", fg="#263238",
+                bd=0, relief="flat",
+                highlightthickness=0, width=1, height=1,
+                padx=0, pady=0, font=("Microsoft YaHei UI", 9, "bold"),
+                cursor="hand2")
+            button.pack(fill="both", expand=True, padx=2 if selected else 0,
+                        pady=2 if selected else 0)
+        tk.Frame(frame, bg="#e1e5ea", width=1, height=block_size).pack(side="left", padx=6)
+        for color in ("#ff3b30", "#111111", "#1677ff", "#07c160", "#ff9500"):
+            selected = color.lower() == self._text_color.lower()
+            holder = tk.Frame(frame, bg="#3478f6" if selected else "#ffffff",
+                              width=block_size, height=block_size)
+            holder.pack(side="left", padx=2)
+            holder.pack_propagate(False)
+            color_button = tk.Button(holder, bg=color, activebackground=color,
+                      bd=0, relief="flat",
+                      width=1, height=1,
+                      padx=0, pady=0, cursor="hand2",
+                      text="✓" if selected else "",
+                      fg="#ffffff" if selected else color,
+                      font=("Microsoft YaHei UI", 10, "bold"),
+                      command=lambda value=color: self._set_text_color(value))
+            color_button.pack(fill="both", expand=True, padx=3 if selected else 1,
+                              pady=3 if selected else 1)
+        self._text_style_popup = popup
+        popup.update_idletasks()
+        popup_w = max(1, popup.winfo_reqwidth())
+        popup_h = max(1, popup.winfo_reqheight())
+        chrome = tk.Canvas(popup, width=popup_w, height=popup_h,
+                           bg=transparent, bd=0, highlightthickness=0)
+        chrome.place(x=0, y=0, width=popup_w, height=popup_h)
+        bg = Image.new("RGBA", (popup_w * 2, popup_h * 2), (0, 0, 0, 0))
+        ImageDraw.Draw(bg).rounded_rectangle(
+            (1, 1, popup_w * 2 - 2, popup_h * 2 - 2), radius=10 * 2,
+            fill="#ffffff", outline="#d6dce4", width=2)
+        popup._text_style_bg = ImageTk.PhotoImage(
+            bg.resize((popup_w, popup_h), Image.Resampling.LANCZOS))
+        bg_item = chrome.create_image(0, 0, image=popup._text_style_bg, anchor="nw")
+        chrome.create_polygon(popup_w // 2, 0, popup_w // 2 - 6, 9,
+                              popup_w // 2 + 6, 9, fill="#ffffff", outline="")
+        # lower() 是窗口控件方法；这里需要降低 Canvas 内部图元，不能降低 Canvas 控件本身。
+        chrome.tag_lower(bg_item)
+        frame.lift()
+        if x is None or y is None:
+            x = self.win.winfo_rootx() + 12
+            y = self.win.winfo_rooty() + 12
+        else:
+            x = self.win.winfo_rootx() + int(x)
+            y = self.win.winfo_rooty() + int(y) + offset
+        sw = popup.winfo_screenwidth()
+        sh = popup.winfo_screenheight()
+        x -= popup.winfo_width() // 2
+        x = max(4, min(x, sw - popup.winfo_width() - 4))
+        y = max(4, min(y, sh - popup.winfo_height() - 4))
+        popup.geometry(f"+{x}+{y}")
+        # 箭头固定在属性栏顶部中央，位置只由文字工具按钮决定，不随鼠标移动。
+        popup.deiconify()
+        popup.update_idletasks()
+        popup.lift()
+        popup.after(30, popup.lift)
+
+    def _hide_text_style_popup(self):
+        if self._text_style_popup is not None:
+            try:
+                self._text_style_popup.destroy()
+            except Exception:
+                pass
+            self._text_style_popup = None
+
+    def _set_text_size(self, size):
+        self._text_font_size = size
+        if self._text_live_item is not None:
+            self.canvas.itemconfigure(self._text_live_item,
+                                      font=("Microsoft YaHei UI", size, "bold"))
+        if self._tool == "text" and self._text_tool_anchor is not None:
+            self._show_text_style_popup(*self._text_tool_anchor, offset=8)
+
+    def _set_text_color(self, color):
+        self._text_color = color
+        if self._text_live_item is not None:
+            self.canvas.itemconfigure(self._text_live_item, fill=color)
+        if self._tool == "text" and self._text_tool_anchor is not None:
+            self._show_text_style_popup(*self._text_tool_anchor, offset=8)
 
     def _begin_annotation(self, e):
         if self._tool == "text":
@@ -881,12 +1005,13 @@ class RegionSelector:
                 try:
                     if self.canvas.type(item_id) != "text":
                         continue
-                    coords = self.canvas.coords(item_id)
-                    value = self.canvas.itemcget(item_id, "text")
-                    for index in range(len(self._annotations) - 1, -1, -1):
+                    tags = self.canvas.gettags(item_id)
+                    index_tag = next((tag for tag in tags
+                                      if tag.startswith("annotation-text:")), None)
+                    if index_tag is not None:
+                        index = int(index_tag.split(":", 1)[1])
                         item = self._annotations[index]
-                        if (item[0] == "text" and item[1] == tuple(coords[:2])
-                                and item[2] == value):
+                        if item[0] == "text":
                             existing = (index, item)
                             break
                 except Exception:
@@ -897,6 +1022,8 @@ class RegionSelector:
                 index, item = existing
                 self._annotations.pop(index)
                 self._redraw_annotations()
+                self._text_font_size = item[3] if len(item) > 3 else 18
+                self._text_color = item[4] if len(item) > 4 else "#ff3b30"
                 self._open_text_editor(item[1][0], item[1][1], item[2])
             else:
                 self._open_text_editor(e.x, e.y)
@@ -968,7 +1095,7 @@ class RegionSelector:
         for item_id in self._edit_items:
             self.canvas.delete(item_id)
         self._edit_items = []
-        for item in self._annotations:
+        for annotation_index, item in enumerate(self._annotations):
             kind = item[0]
             if kind in ("rect", "oval", "arrow"):
                 _, a, b = item
@@ -992,9 +1119,11 @@ class RegionSelector:
                         *[p for point in points for p in point], fill="#ff3b30",
                         width=5, capstyle="round", smooth=True))
             elif kind == "text":
-                _, pos, text = item
+                pos, text = item[1], item[2]
                 self._edit_items.append(self.canvas.create_text(*pos, text=text, anchor="nw",
-                                                               fill="#ff3b30", font=("Microsoft YaHei UI", 18, "bold")))
+                                                               fill=item[4] if len(item) > 4 else "#ff3b30",
+                                                               font=("Microsoft YaHei UI", item[3] if len(item) > 3 else 18, "bold"),
+                                                               tags=("annotation-text", f"annotation-text:{annotation_index}")))
         for item_id in self._edit_items:
             self.canvas.tag_raise(item_id)
 
@@ -1019,12 +1148,15 @@ class RegionSelector:
             x, y, x + 132, y + 40,
             outline="#ff3b30", width=2, fill="")
         live_item = self.canvas.create_text(
-            text_x, text_y, text=initial_text, anchor="nw", fill="#ff3b30",
-            font=("Microsoft YaHei UI", 18, "bold"))
+            text_x, text_y, text=initial_text, anchor="nw", fill=self._text_color,
+            font=("Microsoft YaHei UI", self._text_font_size, "bold"))
         self._text_editor = live_item
         self._text_live_item = live_item
-        caret = self.canvas.create_line(text_x, text_y + 1, text_x, text_y + 27,
-                                        fill="#ff3b30", width=2)
+        # 属性栏固定在工具栏的“文字”按钮下方，不跟随截图中的编辑光标移动。
+        if self._text_tool_anchor is not None:
+            self._show_text_style_popup(*self._text_tool_anchor, offset=8)
+        caret = self.canvas.create_line(text_x, text_y + 1, text_x, text_y + self._text_font_size + 9,
+                                        fill=self._text_color, width=2)
         tk = self.ui._tk
         input_var = tk.StringVar(self.canvas, value=initial_text)
         input_proxy = tk.Entry(self.canvas, textvariable=input_var, width=1,
@@ -1036,10 +1168,10 @@ class RegionSelector:
         if initial_text:
             bbox = self.canvas.bbox(live_item)
             if bbox:
-                _, _, right, bottom = bbox
+                _, top, right, bottom = bbox
                 self.canvas.coords(input_box, x, y,
                                   max(x + 132, right + 6), max(y + 40, bottom + 6))
-                self.canvas.coords(caret, right + 2, text_y + 1, right + 2, text_y + 27)
+                self.canvas.coords(caret, right + 2, top, right + 2, bottom)
 
         def blink_caret(visible=True):
             if self._text_editor != live_item:
@@ -1088,7 +1220,8 @@ class RegionSelector:
             self._text_commit = None
             self._text_live_item = None
             if commit and text:
-                self._record_annotation(("text", (x, y), text))
+                self._record_annotation(("text", (x, y), text,
+                                          self._text_font_size, self._text_color))
             return "break"
 
         def commit(_event=None):
@@ -1108,10 +1241,14 @@ class RegionSelector:
                 self.canvas.coords(input_box, x, y,
                                   max(x + 132, right + 6), max(y + 40, bottom + 6))
                 caret_x = right + 2
+                caret_top = top
+                caret_bottom = bottom
             else:
                 self.canvas.coords(input_box, x, y, x + 132, y + 40)
                 caret_x = text_x
-            self.canvas.coords(caret, caret_x, text_y + 1, caret_x, text_y + 27)
+                caret_top = y + 7
+                caret_bottom = y + 33
+            self.canvas.coords(caret, caret_x, caret_top, caret_x, caret_bottom)
             self.canvas.itemconfigure(caret, state="normal")
             input_proxy.place(x=caret_x, y=text_y + 8, width=2, height=2)
 
@@ -1507,6 +1644,11 @@ class RegionSelector:
             tx, ty, image=self._tb_bg_photo, anchor="nw")]
         inner_x = tx + border_w + pad
         inner_y = ty + border_w + pad
+        text_index = next((i for i, item in enumerate(buttons) if item[0] == "text"), None)
+        if text_index is not None:
+            self._text_tool_anchor = (
+                inner_x + text_index * (size + gap) + size // 2,
+                inner_y + size)
         for i, (key, cmd, tip) in enumerate(buttons):
             row, col = divmod(i, columns)
             photo = self._tb_icons[key][0]
@@ -1565,6 +1707,8 @@ class RegionSelector:
     def _confirm(self):
         if self.done or not self._sel_box:
             return
+        if self._text_commit is not None:
+            self._text_commit()
         png = self._crop_box()
         if png is None:
             self.cancel()
@@ -1574,6 +1718,8 @@ class RegionSelector:
     def _pin(self):
         if self.done or not self._sel_box:
             return
+        if self._text_commit is not None:
+            self._text_commit()
         png = self._crop_box()
         if png is None:
             self.cancel()
@@ -1584,6 +1730,8 @@ class RegionSelector:
         """另存为对话框下载当前选区；取消则保留选区可继续操作。"""
         if self.done or not self._sel_box:
             return
+        if self._text_commit is not None:
+            self._text_commit()
         png = self._crop_box()
         if png is None:
             self.cancel()
