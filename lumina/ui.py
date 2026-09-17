@@ -1963,9 +1963,10 @@ class HistoryPanel:
 
         self.win.bind("<F5>", lambda e: self.refresh())
         self.win.bind("<Escape>", lambda e: self.hide())
-        self.win.bind("<Delete>", lambda e: self.delete_selected())
-        self.win.bind("<Control-p>", lambda e: self.toggle_pin())
-        self.win.bind("<Control-c>", lambda e: self.copy_only())
+        self.win.bind("<Delete>", lambda e: (self.delete_selected(), "break")[1])
+        self.win.bind("<Control-p>", lambda e: (self.toggle_pin(), "break")[1])
+        self.win.bind("<Control-P>", lambda e: (self.toggle_pin(), "break")[1])
+        self.win.bind("<Control-c>", lambda e: (self.copy_only(), "break")[1])
         self.win.bind("<Return>", lambda e: self.paste_back())
         self.win.bind("<Up>", lambda e: (self._move_selection(-1), "break")[1])
         self.win.bind("<Down>", lambda e: (self._move_selection(1), "break")[1])
@@ -2244,6 +2245,18 @@ class HistoryPanel:
         canvas = self._active_canvas()
         if canvas is None or event.widget is not canvas:
             return
+        # 星标图像含透明区域，Canvas 的图元命中在不同 Tk 版本上不稳定。
+        # 用每行右侧固定热区兜底，确保点击星标始终能触发收藏。
+        clip_id = self._get_clip_id_from_event(canvas, event)
+        try:
+            canvas_x = canvas.canvasx(event.x)
+            favorite_zone = self._card_w - max(44, int(round(30 * self._dpi)))
+            if (clip_id is not None and
+                    canvas_x >= int(round(12 * self._dpi)) + favorite_zone):
+                self._favorite_click(clip_id)
+                return "break"
+        except (TypeError, ValueError):
+            pass
         for item in reversed(canvas.find_overlapping(
                 event.x, event.y, event.x, event.y)):
             tags = canvas.gettags(item)
@@ -2252,7 +2265,6 @@ class HistoryPanel:
             if favorite_tag:
                 self._favorite_click(int(favorite_tag.split(":", 1)[1]))
                 return "break"
-        clip_id = self._get_clip_id_from_event(canvas, event)
         if clip_id is None:
             return
         self._select(clip_id)
@@ -2930,6 +2942,10 @@ class HistoryPanel:
         card_w = max(80, cw - 2 * margin)
         gap = int(round(8 * self._dpi))
         self._card_w, self._row_h = card_w, row_h
+        # 收藏按钮是 Canvas 上的真实 Tk 控件，重绘前必须销毁旧控件。
+        for child in canvas.winfo_children():
+            child.destroy()
+        self._favorite_buttons = {}
         canvas.delete("all")
         self._scroll_ind = None
 
@@ -2983,10 +2999,25 @@ class HistoryPanel:
             favorite_x = margin + card_w - int(round(12 * self._dpi))
             favorite = self._favorite_marker(bool(r["pinned"]), favorite_size)
             self._card_photos.append(favorite)
-            favorite_tag = f"favorite:{cid}"
-            canvas.create_image(favorite_x, y + row_h // 2, image=favorite,
-                                anchor="e", tags=("card", cid, "favorite",
-                                                   favorite_tag))
+            favorite_button = self.tk.Button(
+                canvas, image=favorite, command=lambda item_id=int(cid):
+                self._favorite_click(item_id), relief="flat", bd=0,
+                highlightthickness=0, padx=0, pady=0, cursor="hand2",
+                bg=T["window_bg"], activebackground=T["window_bg"])
+            favorite_button.image = favorite
+            favorite_button._favorite_id = str(cid)
+            favorite_button.bind(
+                "<Enter>", lambda _e, b=favorite_button:
+                self._set_favorite_button_bg(b, "hover"))
+            favorite_button.bind(
+                "<Leave>", lambda _e, b=favorite_button:
+                self._set_favorite_button_bg(b, "normal"))
+            self._favorite_buttons[str(cid)] = favorite_button
+            canvas.create_window(
+                favorite_x, y + row_h // 2, window=favorite_button,
+                anchor="e", width=favorite_size, height=favorite_size,
+                tags=("card", cid, "favorite"))
+            self._set_favorite_button_bg(favorite_button)
             y += row_h + gap
 
         canvas.configure(scrollregion=(0, 0, cw, y + int(round(4 * self._dpi))))
@@ -3000,8 +3031,21 @@ class HistoryPanel:
     def _favorite_click(self, clip_id):
         """Toggle a row's favorite state without triggering paste-back."""
         self._select(clip_id)
-        self.toggle_pin()
+        self.toggle_pin(clip_id)
         return "break"
+
+    def _set_favorite_button_bg(self, button, state=None):
+        if not button or not button.winfo_exists():
+            return
+        cid = str(getattr(button, "_favorite_id", ""))
+        if state is None:
+            state = ("selected" if cid == self._sel_id else
+                     "hover" if cid == self._hover_id else "normal")
+        T, _ = self._theme()
+        color = {"selected": T["accent_soft"],
+                 "hover": T["fill_hover"],
+                 "normal": T["card_bg"]}.get(state, T["card_bg"])
+        button.configure(bg=color, activebackground=color)
 
     # ---------- 行内容/图标 ----------
     def _row_main(self, r, cat):
@@ -3218,6 +3262,8 @@ class HistoryPanel:
         try:
             canvas.itemconfigure(item, image=self._row_card_bg(
                 self._card_w, self._row_h, state))
+            button = getattr(self, "_favorite_buttons", {}).get(cid)
+            self._set_favorite_button_bg(button, state)
         except Exception:
             pass
 
@@ -3329,15 +3375,26 @@ class HistoryPanel:
         ok = self.ui.actions.copy_to_clipboard(full)
         self.status_var.set("已复制到剪贴板" if ok else "复制失败")
 
-    def toggle_pin(self):
-        row = self._selected_row()
+    def toggle_pin(self, clip_id=None):
+        row = self.db.get(clip_id) if clip_id is not None else None
+        if row is None:
+            selected = self._selected_row()
+            row = self.db.get(selected["id"]) if selected else None
         if not row:
             self.status_var.set("未选中记录")
-            return
-        self.db.set_pinned(row["id"], not row["pinned"])
+            return False
+        new_pinned = not bool(row["pinned"])
+        if not self.db.set_pinned(row["id"], new_pinned):
+            self.status_var.set(f"#{row['id']} 收藏状态更新失败")
+            return False
+        selected_id = row["id"]
+        self._sel_id = str(selected_id)
         self.refresh()
+        if self._sel_id in self._row_bg_items:
+            self._apply_row_bg(self._sel_id)
         self.status_var.set(
-            f"#{row['id']} {'已收藏（不可清除）' if not row['pinned'] else '已取消收藏'}")
+            f"#{row['id']} {'已收藏（不可清除）' if new_pinned else '已取消收藏'}")
+        return True
 
     def delete_selected(self):
         row = self._selected_row()
