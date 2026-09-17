@@ -6,6 +6,7 @@ Tk 解释器。因此 toast 与面板共用这里的一个 UI 线程，通过队
 import io
 import gc
 import ctypes
+import json
 import os
 import queue
 import re
@@ -2631,9 +2632,9 @@ class HistoryPanel:
         dialog.transient(self.win)
         dialog.configure(bg=T["window_bg"])
         dialog.resizable(False, False)
-        dialog.geometry("680x760")
+        dialog.geometry("520x540")
         shell = tk.Frame(dialog, bg=T["window_bg"])
-        shell.pack(fill="both", expand=True, padx=18, pady=16)
+        shell.pack(fill="both", expand=True, padx=12, pady=10)
         content = tk.Frame(shell, bg=T["window_bg"])
         content.pack(fill="both", expand=True)
         canvas = tk.Canvas(content, bg=T["window_bg"], highlightthickness=0,
@@ -2653,34 +2654,44 @@ class HistoryPanel:
                     lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
         fields = {}
 
+        def scroll_settings(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        def bind_scroll(widget):
+            widget.bind("<MouseWheel>", scroll_settings, add="+")
+            for child in widget.winfo_children():
+                bind_scroll(child)
+
         def section(title):
-            card = tk.Frame(body, bg=T["card_bg"],
-                            highlightbackground=T["separator"],
-                            highlightthickness=1)
-            card.pack(fill="x", pady=(10, 4))
-            tk.Label(card, text=title, bg=T["card_bg"], fg=T["accent"],
-                     font=self._font(10, "bold"), anchor="w").pack(
-                         fill="x", padx=14, pady=(10, 4))
-            return card
+            # 连续表单布局：模块不显示标题，仅保留少量间距。
+            section_frame = tk.Frame(body, bg=T["window_bg"])
+            section_frame.pack(fill="x", pady=(5, 0))
+            return section_frame
 
         def add_row(label, key, kind="text", parent=body):
-            line = tk.Frame(parent, bg=T["card_bg"])
+            row_bg = T["window_bg"]
+            line = tk.Frame(parent, bg=row_bg)
             line.pack(fill="x", padx=14, pady=4)
-            tk.Label(line, text=label, width=19, anchor="w",
-                     bg=T["card_bg"], fg=T["label"],
+            tk.Label(line, text=label, width=17, anchor="w",
+                     bg=row_bg, fg=T["label"],
                      font=self._font(9)).pack(side="left")
             if kind == "bool":
                 var = tk.BooleanVar(value=bool(self.ui.config.get(key, False)))
                 tk.Checkbutton(line, text="启用", variable=var,
-                               bg=T["card_bg"], activebackground=T["card_bg"],
-                               selectcolor=T["field"], highlightthickness=0,
-                               fg=T["label"], font=self._font(9)).pack(side="left")
+                               onvalue=True, offvalue=False, indicatoron=True,
+                               bg=row_bg, activebackground=row_bg,
+                               selectcolor="#DCEBFF", highlightthickness=0,
+                               activeforeground=T["label"], fg=T["label"],
+                               cursor="hand2", font=self._font(9)).pack(side="left")
             else:
                 var = tk.StringVar(value=str(self.ui.config.get(key, "")))
-                tk.Entry(line, textvariable=var, width=28, relief="flat",
+                tk.Entry(line, textvariable=var, width=24, relief="flat",
                          bg=T["field"], fg=T["label"],
                          insertbackground=T["label"],
-                         font=self._font(9)).pack(side="left")
+                         highlightthickness=1, highlightbackground=T["separator"],
+                         highlightcolor=T["accent"],
+                         font=self._font(9)).pack(side="left", ipady=2)
             fields[key] = (var, kind)
 
         shortcut_card = section("快捷键")
@@ -2688,10 +2699,7 @@ class HistoryPanel:
         add_row("区域截图", "hotkey_region", parent=shortcut_card)
         add_row("打开面板", "hotkey_panel", parent=shortcut_card)
         capture_card = section("通知与截图")
-        add_row("启用通知", "popup_enabled", "bool", capture_card)
-        add_row("通知时长（秒）", "popup_seconds", parent=capture_card)
         add_row("启用面板", "panel_enabled", "bool", capture_card)
-        add_row("截图时隐藏窗口", "hide_panel_on_capture", "bool", capture_card)
         add_row("截图后复制到剪贴板", "copy_screenshot_to_clipboard", "bool", capture_card)
         add_row("截图显示器", "capture_monitor", parent=capture_card)
         add_row("下载目录", "download_dir", parent=capture_card)
@@ -2701,9 +2709,10 @@ class HistoryPanel:
         add_row("清理间隔（分钟）", "cleanup_interval_minutes", parent=data_card)
         add_row("最大文本（KB）", "max_text_kb", parent=data_card)
         add_row("最大图片（MB）", "max_image_mb", parent=data_card)
+        bind_scroll(body)
 
         buttons = tk.Frame(shell, bg=T["window_bg"])
-        buttons.pack(fill="x", pady=(14, 0))
+        buttons.pack(fill="x", pady=(7, 0))
 
         def reset_defaults():
             for key, (var, kind) in fields.items():
@@ -2719,7 +2728,10 @@ class HistoryPanel:
             try:
                 for key, (var, kind) in fields.items():
                     value = var.get()
-                    values[key] = bool(value) if kind == "bool" else value
+                    if kind == "bool":
+                        values[key] = value if isinstance(value, bool) else str(value).lower() in ("1", "true", "yes", "on")
+                    else:
+                        values[key] = value
                     if key in numeric:
                         values[key] = numeric[key](value)
                         if values[key] < 0 or (key == "popup_seconds" and values[key] > 60):
@@ -2737,14 +2749,17 @@ class HistoryPanel:
             dialog.destroy()
 
         tk.Button(buttons, text="恢复默认值", command=reset_defaults, relief="flat",
-                  bd=0, bg=T["window_bg"], fg=T["label2"], padx=8, pady=6,
-                  cursor="hand2").pack(side="left")
+                  bd=0, bg=T["window_bg"], fg=T["label3"], padx=8, pady=7,
+                  cursor="hand2", activebackground=T["window_bg"],
+                  activeforeground=T["accent"]).pack(side="left")
         tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat",
-                  bd=0, bg=T["field"], fg=T["label"], padx=14, pady=6,
-                  cursor="hand2").pack(side="right", padx=(6, 0))
+                  bd=0, bg=T["field"], fg=T["label2"], padx=18, pady=7,
+                  cursor="hand2", activebackground=T["fill_hover"],
+                  activeforeground=T["label"]).pack(side="right", padx=(8, 0))
         tk.Button(buttons, text="保存", command=save, relief="flat", bd=0,
-                  bg=T["accent"], fg="#FFFFFF", padx=14, pady=6,
-                  cursor="hand2").pack(side="right")
+                  bg=T["accent"], fg="#FFFFFF", padx=20, pady=7,
+                  cursor="hand2", activebackground="#005FCC",
+                  activeforeground="#FFFFFF").pack(side="right")
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         dialog.update_idletasks()
         px = self.win.winfo_rootx() + max(0, (self.win.winfo_width() - dialog.winfo_width()) // 2)
@@ -2814,9 +2829,9 @@ class HistoryPanel:
             return
         if self._hide_on_capture.get():
             self.hide()
-            delay = 0.35  # 等面板真正从屏幕消失再抓，避免拍进截图
+            delay = 0.35
         else:
-            delay = 0.15  # 只等菜单收起
+            delay = 0.15
         threading.Timer(delay, self._safe_action, args=(fn,)).start()
 
     def capture_region(self):
@@ -4505,8 +4520,30 @@ class DetailPane:
             btn("打开", self._open_file)
         if self._urls:
             btn("打开链接", lambda: self._open_url(self._urls[0]))
+        if self.cat in ("text", "code") and (self.row["content"] or "").strip():
+            btn("JSON", self._format_json)
         btn("导出", self._save_as)
         btn("删除", self._delete, fg=danger)
+
+    def _format_json(self):
+        """格式化当前文本预览中的 JSON，不改写数据库原始剪贴板内容。"""
+        if self.row is None:
+            return
+        raw = self.row["content"] or ""
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            self.panel.status_var.set(f"JSON 格式错误：第 {exc.lineno} 行，第 {exc.colno} 列")
+            return
+        formatted = json.dumps(value, ensure_ascii=False, indent=2)
+        formatted_row = dict(zip(self.row.keys(), self.row)) \
+            if hasattr(self.row, "keys") else dict(self.row)
+        formatted_row["content"] = formatted
+        for widget in self._host.winfo_children():
+            widget.destroy()
+        self._build_text_body(self._host, formatted_row, self.tk)
+        self._body.bind("<Button-3>", self._menu)
+        self.panel.status_var.set("已格式化 JSON（仅预览，原始内容未修改）")
 
     def _delete(self):
         row = self.row

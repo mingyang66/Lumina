@@ -121,7 +121,8 @@ def cmd_stats(cfg):
 def main():
     parser = argparse.ArgumentParser(prog="lumina",
                                      description="clipboard & screenshot archiver (SQLite)")
-    parser.add_argument("-c", "--config", default="config.json", help="config file path")
+    default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    parser.add_argument("-c", "--config", default=default_config, help="config file path")
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("run", help="start monitoring (default)")
     p_list = sub.add_parser("list", help="list recent records")

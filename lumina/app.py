@@ -86,11 +86,7 @@ class LuminaApp:
 
     # ---------- 截图 ----------
     def _hide_panel_for_capture(self):
-        """热键截图路径：勾选「隐藏此窗口」且面板可见时，先隐藏再等画面刷新。
-
-        面板菜单触发的截图已在菜单动作里自行隐藏，此时 panel_visible 为 False，
-        这里不会重复等待。
-        """
+        """热键截图路径：面板可见且启用隐藏时，先隐藏再等待画面刷新。"""
         if (self.config.get("hide_panel_on_capture", True)
                 and self.ui.panel_visible):
             self.ui.request_hide_panel()
