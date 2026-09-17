@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS clipboard (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL CHECK(kind IN ('text','image')),
     content TEXT,
-    image BLOB,
+    data BLOB,
+    file_status TEXT NOT NULL DEFAULT 'none',
     hash TEXT NOT NULL,
     source TEXT DEFAULT '',
     pinned INTEGER NOT NULL DEFAULT 0,
@@ -38,13 +39,13 @@ END;
 
 LIST_COLUMNS = (
     "id, kind, category, source, pinned, tags, created_at, "
-    "CASE WHEN content IS NULL THEN length(image) ELSE length(content) END AS size, "
+    "CASE WHEN content IS NULL THEN length(data) ELSE length(content) END AS size, "
     "substr(replace(replace(content, char(13), ' '), char(10), ' '), 1, 60) AS preview "
 )
 
 JOIN_COLUMNS = (
     "c.id, c.kind, c.category, c.source, c.pinned, c.tags, c.created_at, "
-    "CASE WHEN c.content IS NULL THEN length(c.image) "
+    "CASE WHEN c.content IS NULL THEN length(c.data) "
     "ELSE length(c.content) END AS size, "
     "substr(replace(replace(c.content, char(13), ' '), char(10), ' '), 1, 60) AS preview "
 )
@@ -96,6 +97,43 @@ class Database:
             # 不动 CHECK 约束，避免整表重建。
             self.conn.execute(
                 "ALTER TABLE clipboard ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        for name, definition in (
+                ("file_status", "TEXT NOT NULL DEFAULT 'none'"),
+                ):
+            if name not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE clipboard ADD COLUMN {name} {definition}")
+        if "data" not in cols:
+            self.conn.execute("ALTER TABLE clipboard ADD COLUMN data BLOB")
+        sources = [name for name in ("image", "file_data") if name in cols]
+        if sources:
+            self.conn.execute(
+                "UPDATE clipboard SET data=COALESCE(" + ",".join(sources) + ") "
+                "WHERE data IS NULL")
+        for old_name in ("image", "file_data"):
+            if old_name in cols:
+                try:
+                    self.conn.execute(f"ALTER TABLE clipboard DROP COLUMN {old_name}")
+                except sqlite3.OperationalError:
+                    pass
+        for old_name in ("file_name", "file_error"):
+            if old_name in cols:
+                try:
+                    self.conn.execute(f"ALTER TABLE clipboard DROP COLUMN {old_name}")
+                except sqlite3.OperationalError:
+                    pass
+        if "file_size" in cols:
+            try:
+                self.conn.execute("ALTER TABLE clipboard DROP COLUMN file_size")
+            except sqlite3.OperationalError:
+                pass
+        if "file_path" in cols:
+            # 文件路径与 content 重复，统一从 content 读取后删除旧列。
+            try:
+                self.conn.execute("ALTER TABLE clipboard DROP COLUMN file_path")
+            except sqlite3.OperationalError:
+                # 旧版 SQLite 不支持 DROP COLUMN；新记录已经不再使用该列。
+                pass
         self.conn.commit()
 
     def _backfill_category(self):
@@ -150,9 +188,9 @@ class Database:
         except sqlite3.OperationalError:
             self._fts = False
 
-    def _add(self, kind, category, content, image, source):
-        data = content.encode("utf-8") if content is not None else image
-        h = hashlib.sha256(data).hexdigest()
+    def _add(self, kind, category, content, blob, source):
+        digest_data = content.encode("utf-8") if content is not None else blob
+        h = hashlib.sha256(digest_data).hexdigest()
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             row = self.conn.execute(
@@ -169,10 +207,10 @@ class Database:
                 self.conn.commit()
                 return row["id"]
             cur = self.conn.execute(
-                "INSERT INTO clipboard(kind, category, content, image, hash, "
+                "INSERT INTO clipboard(kind, category, content, data, hash, "
                 "source, created_at) "
                 "VALUES (?,?,?,?,?,?,strftime('%Y-%m-%d %H:%M:%f','now','localtime'))",
-                (kind, category, content, image, h, source or ""),
+                (kind, category, content, blob, h, source or ""),
             )
             self.conn.commit()
             return cur.lastrowid
@@ -193,12 +231,34 @@ class Database:
         return self._add("image", "image", None, png, source)
 
     def add_files(self, paths, source="", max_bytes=512 * 1024):
-        """记录资源管理器复制的文件（存路径列表，kind 仍为 text）。"""
-        content = "\n".join(paths)
-        data = content.encode("utf-8")
-        if len(data) > max_bytes:
-            content = data[:max_bytes].decode("utf-8", "ignore")
-        return self._add("text", "file", content, None, source)
+        """兼容旧接口：记录一批文件路径，不归档文件内容。"""
+        return [self.add_file_pending(path, source) for path in paths]
+
+    def add_file_pending(self, path, source="", status="pending"):
+        """Insert file metadata quickly; the worker fills file_data later."""
+        path = os.path.abspath(path)
+        h = hashlib.sha256(path.encode("utf-8")).hexdigest()
+        cur = self.conn.execute(
+            "INSERT INTO clipboard(kind, category, content, "
+            "file_status, hash, source, created_at) "
+            "VALUES ('text', 'file', ?, ?, ?, ?, "
+            "strftime('%Y-%m-%d %H:%M:%f','now','localtime'))",
+            (path, status, h, source or ""))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def complete_file(self, clip_id, data):
+        digest = hashlib.sha256(data).hexdigest()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE clipboard SET data=?, file_status='ready', hash=? "
+                "WHERE id=?",
+                (data, digest, clip_id))
+
+    def fail_file(self, clip_id, error):
+        with self.conn:
+            self.conn.execute(
+                "UPDATE clipboard SET file_status='failed' WHERE id=?", (clip_id,))
 
     def cleanup(self, retention_days, max_rows):
         deleted = 0
@@ -309,10 +369,17 @@ class Database:
         ).fetchone()
 
     def get_text(self, clip_id):
-        """文本类记录的轻量读取：不含 image blob，供预览/回贴使用。"""
+        """文本和文件记录的轻量读取，不加载图片或文件 BLOB。"""
         return self.conn.execute(
-            "SELECT id, kind, category, source, pinned, tags, created_at, content "
+            "SELECT id, kind, category, source, pinned, tags, created_at, content, "
+            "file_status, length(data) AS data_size "
             "FROM clipboard WHERE id=?", (clip_id,)
+        ).fetchone()
+
+    def get_file_data(self, clip_id):
+        return self.conn.execute(
+            "SELECT content AS file_path, data, file_status "
+            "FROM clipboard WHERE id=? AND category='file'", (clip_id,)
         ).fetchone()
 
     def stats(self):

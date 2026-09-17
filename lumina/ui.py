@@ -2702,6 +2702,8 @@ class HistoryPanel:
         add_row("启用面板", "panel_enabled", "bool", capture_card)
         add_row("截图后复制到剪贴板", "copy_screenshot_to_clipboard", "bool", capture_card)
         add_row("截图显示器", "capture_monitor", parent=capture_card)
+        add_row("归档复制的文件", "archive_files", "bool", capture_card)
+        add_row("单文件上限（MB）", "max_file_mb", parent=capture_card)
         add_row("下载目录", "download_dir", parent=capture_card)
         data_card = section("数据保留")
         add_row("保留天数", "retention_days", parent=data_card)
@@ -2721,6 +2723,7 @@ class HistoryPanel:
 
         def save():
             numeric = {"popup_seconds": float, "capture_monitor": int,
+                       "max_file_mb": int,
                        "retention_days": int, "max_rows": int,
                        "cleanup_interval_minutes": int, "max_text_kb": int,
                        "max_image_mb": int}
@@ -3046,10 +3049,10 @@ class HistoryPanel:
     def _image_thumb(self, clip_id, size):
         from PIL import Image, ImageDraw
         full = self.db.get(clip_id)
-        if not full or not full["image"]:
+        if not full or not full["data"]:
             return None
         try:
-            img = Image.open(io.BytesIO(full["image"])).convert("RGBA")
+            img = Image.open(io.BytesIO(full["data"])).convert("RGBA")
         except Exception:
             return None
         img.thumbnail((size - 4, size - 4), Image.LANCZOS)
@@ -3987,7 +3990,7 @@ class HistoryPanel:
                 parent=self.win, title="导出图片", defaultextension=".png",
                 initialfile=f"clip_{full['id']}.png",
                 filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")])
-            data = full["image"]
+            data = full["data"]
         else:
             path = filedialog.asksaveasfilename(
                 parent=self.win, title="导出文本", defaultextension=".txt",
@@ -4299,21 +4302,29 @@ class DetailPane:
         self._in_menu = False
         self._flat_menu = None
         self._body = None
+        self._image_click_after = None
         tk = self.tk
         self.frame = tk.Frame(parent, bg=self.BG, width=width)
         self.frame.pack(side="left", fill="y")
         self.frame.pack_propagate(False)
         # 三段式详情：顶部元信息、中部预览、底部固定操作栏。
-        self._meta_wrap = tk.Frame(self.frame, bg=T["field"], height=44)
+        self._meta_wrap = tk.Frame(self.frame, bg=T["field"], height=58)
         self._meta_wrap.pack(fill="x", padx=0, pady=0)
         self._meta_wrap.pack_propagate(False)
         self._meta_icon = tk.Label(self._meta_wrap, bg=T["field"],
                                    bd=0, highlightthickness=0)
         self._meta_icon.pack(side="left", padx=0)
-        self._meta = tk.Label(self._meta_wrap, text="预览", bg=T["field"],
-                              fg=T["label2"], font=("Microsoft YaHei UI", 9),
-                              anchor="w", padx=8, pady=6)
-        self._meta.pack(side="left", fill="x", expand=True)
+        meta_text = tk.Frame(self._meta_wrap, bg=T["field"])
+        meta_text.pack(side="left", fill="both", expand=True, padx=8, pady=6)
+        self._meta_title = tk.Label(meta_text, text="预览", bg=T["field"],
+                                    fg=T["label"],
+                                    font=("Microsoft YaHei UI", 10, "bold"),
+                                    anchor="w")
+        self._meta_title.pack(fill="x")
+        self._meta = tk.Label(meta_text, text="", bg=T["field"],
+                              fg=T["label2"], font=("Microsoft YaHei UI", 8),
+                              anchor="w")
+        self._meta.pack(fill="x")
         self._host = tk.Frame(self.frame, bg=self.BG)
         self._host.pack(fill="both", expand=True, padx=8, pady=(6, 4))
         self._action_separator = tk.Frame(self.frame, bg=T["hairline"], height=1)
@@ -4397,7 +4408,7 @@ class DetailPane:
         self._update_meta(full, kind)
         for w in self._host.winfo_children():
             w.destroy()
-        if kind == "image" and full["image"]:
+        if kind == "image" and full["data"]:
             self._build_image_body(self._host, full, self.tk)
         elif self.cat == "file":
             self._build_file_body(self._host, full, self.tk)
@@ -4417,7 +4428,8 @@ class DetailPane:
             w.destroy()
         for w in self._actions.winfo_children():
             w.destroy()
-        self._meta.configure(text="预览")
+        self._meta_title.configure(text="预览")
+        self._meta.configure(text="选择一条记录查看详情")
         self._meta_icon.configure(image="")
         self._meta_icon.image = None
         tk = self.tk
@@ -4436,16 +4448,35 @@ class DetailPane:
 
     def _update_meta(self, row, kind):
         cat_label = HistoryPanel.CATEGORY_LABELS.get(self.cat, self.cat)
-        nbytes = (len(row["image"]) if kind == "image" and row["image"]
-                  else len((row["content"] or "").encode("utf-8")))
-        size_txt = f"{nbytes // 1024} KB" if nbytes >= 1024 else f"{nbytes} B"
-        meta = (f"#{row['id']} · {cat_label} · "
-                f"{size_txt} · {(row['created_at'] or '')[:19]}"
-                f" · {self.panel._source_app(row['source'])[0][:18]}")
+        if self.cat == "file":
+            nbytes = row["data_size"] or 0
+        else:
+            nbytes = (len(row["data"]) if kind == "image" and row["data"]
+                      else len((row["content"] or "").encode("utf-8")))
+        if nbytes >= 1024 * 1024:
+            size_txt = f"{nbytes / 1024 / 1024:.1f} MB"
+        elif nbytes >= 1024:
+            size_txt = f"{nbytes / 1024:.1f} KB"
+        else:
+            size_txt = f"{nbytes} B"
+        source_name = self.panel._source_app(row["source"])[0][:18]
+        title = cat_label
+        if self.cat == "file":
+            path = (row["content"] or "").splitlines()[0].strip()
+            title = os.path.basename(path.rstrip("\\/")) or path or "文件"
+        elif self.cat == "link" and row["content"]:
+            title = row["content"].splitlines()[0].strip()[:64]
+        elif row["content"]:
+            title = " ".join(row["content"].split())[:64]
+        meta = (f"{cat_label} · {size_txt} · "
+                f"{(row['created_at'] or '')[:19]} · {source_name}")
         if row["pinned"]:
             meta = "[已收藏] " + meta
         if row["tags"]:
             meta += f" · {row['tags'][:16]}"
+        if self.cat == "file":
+            meta += f" · 归档：{row['file_status'] or 'none'}"
+        self._meta_title.configure(text=title)
         self._meta.configure(text=meta)
         source_name, source_color, _style = self.panel._source_app(row["source"])
         from PIL import ImageTk
@@ -4578,7 +4609,7 @@ class DetailPane:
         key = (row["id"], img_max)
         photo = cache.get(key)
         if photo is None:
-            img = Image.open(io.BytesIO(row["image"]))
+            img = Image.open(io.BytesIO(row["data"]))
             img.thumbnail(img_max)
             photo = ImageTk.PhotoImage(img)
             if len(cache) > 8:
@@ -4587,8 +4618,70 @@ class DetailPane:
         self._photo = photo
         self._body = tk.Label(outer, image=photo, bg=self.BG, cursor="hand2")
         self._body.pack(expand=True, padx=6, pady=6)
-        self._body.bind("<Double-Button-1>", lambda e: self._paste_this())
+        self._body.bind("<ButtonRelease-1>", self._image_click)
+        self._body.bind("<Double-Button-1>", self._image_double_click)
         self._body.bind("<MouseWheel>", self._on_wheel)
+
+    def _image_click(self, _event=None):
+        """延迟处理单击，给双击回贴保留判定时间。"""
+        if self._image_click_after is not None:
+            try:
+                self.frame.after_cancel(self._image_click_after)
+            except Exception:
+                pass
+        self._image_click_after = self.frame.after(220, self._show_image_zoom)
+
+    def _image_double_click(self, _event=None):
+        """双击不执行动作，仅取消单击放大，避免重复触发。"""
+        if self._image_click_after is not None:
+            try:
+                self.frame.after_cancel(self._image_click_after)
+            except Exception:
+                pass
+            self._image_click_after = None
+
+    def _show_image_zoom(self):
+        self._image_click_after = None
+        if self.row is None or not self.row["data"]:
+            return
+        from PIL import Image, ImageTk
+        try:
+            image = Image.open(io.BytesIO(self.row["data"])).convert("RGB")
+        except Exception:
+            self.panel.status_var.set("图片无法预览")
+            return
+
+        win = self.tk.Toplevel(self.panel.win)
+        win.title("图片预览")
+        win.configure(bg="#111111")
+        win.transient(self.panel.win)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        def close_zoom(_event=None):
+            # 等当前鼠标事件处理完再销毁，避免事件落到底层原图再次放大。
+            win.after_idle(win.destroy)
+            return "break"
+
+        win.bind("<ButtonRelease-1>", close_zoom)
+
+        screen_w = win.winfo_screenwidth()
+        screen_h = win.winfo_screenheight()
+        max_w = max(320, int(screen_w * 0.88))
+        max_h = max(240, int(screen_h * 0.82))
+        scale = min(max_w / image.width, max_h / image.height, 1.0)
+        shown = image.resize((max(1, int(image.width * scale)),
+                              max(1, int(image.height * scale))), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(shown)
+        # Windows Tk 不支持 zoom-out 光标，使用通用手形光标。
+        label = self.tk.Label(win, image=photo, bg="#111111", cursor="hand2")
+        label.image = photo
+        label.pack(padx=12, pady=12)
+        label.bind("<ButtonRelease-1>", close_zoom)
+        win.update_idletasks()
+        x = max(0, (screen_w - win.winfo_width()) // 2)
+        y = max(0, (screen_h - win.winfo_height()) // 2)
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+        win.focus_force()
 
     def _build_text_body(self, outer, row, tk):
         T = self.T
@@ -4723,16 +4816,79 @@ class DetailPane:
         T = self.T
         paths = [ln.strip() for ln in (row["content"] or "").splitlines()
                  if ln.strip()]
+        path = paths[0] if paths else ""
+        name = os.path.basename(path.rstrip("\\/")) or path or "未命名文件"
+        status = row["file_status"] or "none"
+        status_text = {
+            "pending": "等待归档",
+            "ready": "已归档到数据库",
+            "failed": "归档失败",
+            "skipped": "未启用归档",
+            "none": "未归档",
+        }.get(status, status)
+        status_color = {
+            "ready": self.panel._sys("green"),
+            "failed": self.panel._sys("red"),
+            "pending": self.panel._sys("orange"),
+        }.get(status, T["label3"])
+
+        def size_text(value):
+            if not value:
+                return "未归档"
+            units = ("B", "KB", "MB", "GB")
+            n = float(value)
+            unit = units[0]
+            for unit in units:
+                if n < 1024 or unit == units[-1]:
+                    break
+                n /= 1024
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+
         body = tk.Frame(outer, bg=self.BG)
         self._body = body
-        shown = paths[:self.FILE_MAX_ROWS]
-        for path in shown:
-            self._file_row(body, tk, path, T)
-        if len(paths) > len(shown):
-            tk.Label(body, text=f"+ 其余 {len(paths) - len(shown)} 项",
-                     bg=self.BG, fg=T["label3"],
+
+        card = tk.Frame(body, bg=T["card_bg"],
+                        highlightbackground=T["separator"],
+                        highlightthickness=1)
+        card.pack(fill="x", padx=8, pady=(8, 6))
+
+        head = tk.Frame(card, bg=T["card_bg"])
+        head.pack(fill="x", padx=14, pady=(12, 8))
+        icon = tk.Label(head, text="FILE", bg=self.panel._sys("green"),
+                        fg="#FFFFFF", font=("Microsoft YaHei UI", 8, "bold"),
+                        padx=6, pady=3)
+        icon.pack(side="left", padx=(0, 10))
+        tk.Label(head, text=name, bg=T["card_bg"], fg=T["label"],
+                 font=("Microsoft YaHei UI", 12, "bold"), anchor="w"
+                 ).pack(side="left", fill="x", expand=True)
+        tk.Label(head, text=status_text, bg=T["card_bg"], fg=status_color,
+                 font=("Microsoft YaHei UI", 9, "bold"), anchor="e"
+                 ).pack(side="right")
+
+        tk.Frame(card, bg=T["separator"], height=1).pack(fill="x")
+        info = tk.Frame(card, bg=T["card_bg"])
+        info.pack(fill="x", padx=14, pady=(9, 12))
+
+        def info_row(label, value, color=None):
+            line = tk.Frame(info, bg=T["card_bg"])
+            line.pack(fill="x", pady=2)
+            tk.Label(line, text=label, width=8, anchor="w",
+                     bg=T["card_bg"], fg=T["label3"],
+                     font=("Microsoft YaHei UI", 9)).pack(side="left")
+            tk.Label(line, text=value or "-", anchor="w", justify="left",
+                     bg=T["card_bg"], fg=color or T["label2"],
                      font=("Microsoft YaHei UI", 9),
-                     anchor="w").pack(fill="x", padx=6, pady=(0, 4))
+                     wraplength=max(180, int(self.frame.winfo_reqwidth() * .55))
+                     ).pack(side="left", fill="x", expand=True)
+
+        info_row("文件名", name, T["label"])
+        info_row("源文件路径", path)
+        info_row("文件大小", size_text(row["data_size"]))
+
+        if not path:
+            tk.Label(body, text="没有可用的源文件路径", bg=self.BG,
+                     fg=T["label3"], font=("Microsoft YaHei UI", 9),
+                     anchor="w").pack(fill="x", padx=10, pady=10)
         body.pack(fill="both", expand=True, padx=2, pady=2)
         body.bind("<MouseWheel>", self._on_wheel)
 
@@ -4764,10 +4920,16 @@ class DetailPane:
                 info = f"{n // 1024} KB" if n >= 1024 else f"{n} B"
             except OSError:
                 info = ""
+        info_label = None
         if info:
-            tk.Label(fr, text=info, bg=self.BG, fg=T["label3"],
-                     font=("Microsoft YaHei UI", 8)).pack(side="right", padx=4)
-        for w in (fr, nl):
+            info_label = tk.Label(fr, text=info, bg=self.BG, fg=T["label3"],
+                                  font=("Microsoft YaHei UI", 8),
+                                  cursor="hand2" if exists else "arrow")
+            info_label.pack(side="right", padx=4)
+        for w in (fr, nl, info_label):
+            if w is None:
+                continue
+            w.bind("<Button-1>", lambda e, p=path: self._open_path(p))
             w.bind("<Double-Button-1>", lambda e, p=path: self._open_path(p))
             w.bind("<Button-3>", lambda e, p=path: self._file_menu(p, e))
             w.bind("<MouseWheel>", self._on_wheel)
@@ -5041,7 +5203,7 @@ class DetailPane:
 
     def _pin_it(self):
         try:
-            png = self.row["image"]
+            png = self.row["data"]
             x = self.panel.win.winfo_rootx() + self.panel.win.winfo_width() // 2
             y = self.panel.win.winfo_rooty() + 80
             self.ui._pins.append(PinWindow(self.ui, png, (x, y)))
@@ -5056,7 +5218,17 @@ class DetailPane:
                 parent=self.panel.win, title="保存图片", defaultextension=".png",
                 initialfile=f"clip_{row['id']}.png",
                 filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")])
-            data = row["image"]
+            data = row["data"]
+        elif self.cat == "file":
+            file_row = self.panel.db.get_file_data(row["id"])
+            data = file_row["data"] if file_row else None
+            if not data:
+                self.panel.status_var.set("文件尚未归档或归档失败")
+                return
+            path = filedialog.asksaveasfilename(
+                parent=self.panel.win, title="恢复文件",
+                initialfile=os.path.basename(row["content"] or "") or f"file_{row['id']}",
+                filetypes=[("所有文件", "*.*")])
         else:
             path = filedialog.asksaveasfilename(
                 parent=self.panel.win, title="导出文本", defaultextension=".txt",

@@ -1,5 +1,6 @@
 import io
 import os
+import queue
 import threading
 import time
 import traceback
@@ -36,6 +37,10 @@ class LuminaApp:
         )
         self._stop = threading.Event()
         self._capture_lock = threading.Lock()
+        self._file_queue = queue.Queue()
+        self._file_worker = threading.Thread(
+            target=self._file_archive_loop, name="lumina-file-archive", daemon=True)
+        self._file_worker.start()
         self._cleaner_thread = None
         self.tray = TrayIcon(self)
 
@@ -57,14 +62,49 @@ class LuminaApp:
                        source=source)
 
     def _on_files(self, files, source):
-        clip_id = self.db.add_files(files, source=source)
-        names = [os.path.basename(f.rstrip("\\/")) or f for f in files]
+        self._log(f"clipboard files detected: {len(files)}")
+        clip_ids = []
+        names = []
+        archive = bool(self.config.get("archive_files", True))
+        for path in files:
+            clip_id = self.db.add_file_pending(
+                path, source=source, status="pending" if archive else "skipped")
+            clip_ids.append(clip_id)
+            names.append(os.path.basename(path.rstrip("\\/")) or path)
+            if archive:
+                self._file_queue.put((clip_id, path))
+                self._log(f"file #{clip_id} queued: {path}")
+            else:
+                self._log(f"file #{clip_id} archive skipped by config")
         preview = "、".join(names[:3])
         if len(names) > 3:
             preview += f" 等{len(names)}项"
-        self._log(f"file #{clip_id} saved ({len(files)} path(s)) "
+        self._log(f"file #{','.join(map(str, clip_ids))} saved ({len(files)} path(s)) "
                   f"from {source or '?'}")
-        self.ui.notify("file", clip_id, preview=preview[:200], source=source)
+        if clip_ids:
+            self.ui.notify("file", clip_ids[-1], preview=preview[:200], source=source)
+
+    def _file_archive_loop(self):
+        while True:
+            item = self._file_queue.get()
+            if item is None:
+                self._file_queue.task_done()
+                return
+            clip_id, path = item
+            try:
+                size = os.path.getsize(path)
+                max_bytes = int(self.config.get("max_file_mb", 100)) * 1024 * 1024
+                if max_bytes > 0 and size > max_bytes:
+                    raise ValueError(f"file exceeds {max_bytes // 1024 // 1024} MB limit")
+                with open(path, "rb") as stream:
+                    data = stream.read()
+                self.db.complete_file(clip_id, data)
+                self._log(f"file #{clip_id} archived ({size // 1024} KB)")
+            except Exception as exc:
+                self.db.fail_file(clip_id, exc)
+                self._log(f"file #{clip_id} archive failed: {exc}")
+            finally:
+                self._file_queue.task_done()
 
     def _on_image(self, png, source):
         clip_id = self._store_image(png, source)
@@ -176,7 +216,7 @@ class LuminaApp:
         """
         try:
             if row["kind"] == "image":
-                img = Image.open(io.BytesIO(row["image"]))
+                img = Image.open(io.BytesIO(row["data"]))
                 payload = image_to_dib(img)
                 writer = win32clip.set_clipboard_dib
             else:
@@ -244,6 +284,7 @@ class LuminaApp:
             print("\n[lumina] shutting down...")
         finally:
             self._stop.set()
+            self._file_queue.put(None)
             self.tray.stop()
             if self.listener.ident is not None:
                 self.listener.stop()
@@ -251,5 +292,6 @@ class LuminaApp:
             self.ui.stop()
             if self._cleaner_thread:
                 self._cleaner_thread.join(timeout=2)
+            self._file_worker.join(timeout=5)
             self.db.checkpoint()
             self.db.close()

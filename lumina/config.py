@@ -7,6 +7,8 @@ DEFAULTS = {
     "max_rows": 5000,
     "max_text_kb": 512,
     "max_image_mb": 64,
+    "archive_files": True,
+    "max_file_mb": 100,
     "hotkey_capture": "ctrl+alt+a",
     "hotkey_region": "ctrl+alt+s",
     "hotkey_panel": "ctrl+alt+h",

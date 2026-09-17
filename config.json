@@ -1,9 +1,11 @@
 {
   "db_path": "data/lumina.db",
   "retention_days": 30,
-  "max_rows": 5000,
+  "max_rows": 0,
   "max_text_kb": 512,
   "max_image_mb": 64,
+  "archive_files": true,
+  "max_file_mb": 100,
   "hotkey_capture": "ctrl+alt+v",
   "hotkey_region": "ctrl+alt+s",
   "hotkey_panel": "ctrl+alt+h",

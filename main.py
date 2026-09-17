@@ -82,7 +82,11 @@ def cmd_export(cfg, clip_id, out):
         if row["kind"] == "image":
             out = out or f"clip_{clip_id}.png"
             with open(out, "wb") as f:
-                f.write(row["image"])
+                f.write(row["data"])
+        elif row["category"] == "file" and row["data"]:
+            out = out or os.path.basename(row["content"] or "") or f"file_{clip_id}"
+            with open(out, "wb") as f:
+                f.write(row["data"])
         else:
             out = out or f"clip_{clip_id}.txt"
             with open(out, "w", encoding="utf-8") as f:
