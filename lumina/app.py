@@ -212,13 +212,32 @@ class LuminaApp:
     def copy_to_clipboard(self, row):
         """面板回贴/复制：写入剪贴板并抑制自身监听（内容已在库中）。
 
-        代码/链接/文件的内容都以文本存储，按文本写回（文件=路径列表）。
+        图片记录写回为图片；归档文件如果实际是图片，也写回为图片，
+        否则按文本写回文件路径。
         """
         try:
+            # 历史列表使用轻量字段查询，复制时需要补充图片/文件数据。
+            data = row["data"] if "data" in row.keys() else None
+            if data is None and row["id"]:
+                full_row = self.db.get(row["id"])
+                if full_row is not None:
+                    row = full_row
+                    data = row["data"]
+
             if row["kind"] == "image":
-                img = Image.open(io.BytesIO(row["data"]))
+                img = Image.open(io.BytesIO(data))
                 payload = image_to_dib(img)
                 writer = win32clip.set_clipboard_dib
+            elif row["category"] == "file" and data:
+                try:
+                    img = Image.open(io.BytesIO(data))
+                    img.load()
+                except (OSError, SyntaxError, ValueError):
+                    payload = row["content"] or ""
+                    writer = win32clip.set_clipboard_text
+                else:
+                    payload = image_to_dib(img)
+                    writer = win32clip.set_clipboard_dib
             else:
                 payload = row["content"] or ""
                 writer = win32clip.set_clipboard_text

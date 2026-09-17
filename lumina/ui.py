@@ -4697,19 +4697,23 @@ class DetailPane:
                 pass
             self._image_click_after = None
 
-    def _show_image_zoom(self):
+    def _show_image_zoom(self, data=None, title="图片预览"):
         self._image_click_after = None
-        if self.row is None or not self.row["data"]:
+        if data is None:
+            if self.row is None:
+                return
+            data = self.row["data"]
+        if not data:
             return
         from PIL import Image, ImageTk
         try:
-            image = Image.open(io.BytesIO(self.row["data"])).convert("RGB")
+            image = Image.open(io.BytesIO(data)).convert("RGB")
         except Exception:
             self.panel.status_var.set("图片无法预览")
             return
 
         win = self.tk.Toplevel(self.panel.win)
-        win.title("图片预览")
+        win.title(title)
         win.configure(bg="#111111")
         win.transient(self.panel.win)
         win.bind("<Escape>", lambda _e: win.destroy())
@@ -4942,12 +4946,37 @@ class DetailPane:
         info_row("源文件路径", path)
         info_row("文件大小", size_text(row["data_size"]))
 
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+        if (status == "ready" and path
+                and os.path.splitext(path)[1].lower() in image_exts):
+            file_row = self.panel.db.get_file_data(row["id"])
+            image_data = file_row["data"] if file_row else None
+            if image_data:
+                try:
+                    from PIL import Image, ImageTk
+                    image = Image.open(io.BytesIO(image_data)).convert("RGB")
+                    image.thumbnail((max(220, int(self.frame.winfo_reqwidth() * .72)), 260))
+                    photo = ImageTk.PhotoImage(image)
+                    preview = tk.Frame(card, bg=T["field"])
+                    preview.pack(fill="x", padx=14, pady=(0, 12))
+                    image_label = tk.Label(preview, image=photo, bg=T["field"],
+                                           cursor="hand2")
+                    image_label.image = photo
+                    image_label.pack(padx=8, pady=8)
+                    image_label.bind(
+                        "<ButtonRelease-1>",
+                        lambda _e, data=image_data: (
+                            self._show_image_zoom(data, "图片文件预览"), "break")[1])
+                except Exception:
+                    pass
+
         if not path:
             tk.Label(body, text="没有可用的源文件路径", bg=self.BG,
                      fg=T["label3"], font=("Microsoft YaHei UI", 9),
                      anchor="w").pack(fill="x", padx=10, pady=10)
         body.pack(fill="both", expand=True, padx=2, pady=2)
         body.bind("<MouseWheel>", self._on_wheel)
+
 
     def _file_row(self, parent, tk, path, T):
         exists = os.path.exists(path)
