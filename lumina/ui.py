@@ -388,6 +388,7 @@ class RegionSelector:
         self._last_draw = 0.0
         self._sel_box = None      # 松手后的选区（逻辑坐标）
         self._tb_buttons = []     # 工具栏按钮
+        self._tb_button_map = {}
         self._tb_item_ids = []    # 工具栏 canvas 项（圆角背景图 + 按钮窗口）
         self._tb_bg_photo = None  # 圆角背景 PhotoImage（防 GC）
         self._tb_icons = {}       # 图标 PhotoImage 引用（防 GC）
@@ -884,6 +885,19 @@ class RegionSelector:
         else:
             self._hide_text_style_popup()
         self.canvas.configure(cursor="crosshair" if tool else "arrow")
+        self._update_tool_button_state()
+
+    def _update_tool_button_state(self):
+        """用浅蓝选中态区分当前编辑工具，避免工具栏看起来像一排相同按钮。"""
+        for key, button in self._tb_button_map.items():
+            selected = key == self._tool
+            try:
+                button.configure(
+                    bg="#e8f1ff" if selected else "#ffffff",
+                    activebackground="#dbeaff" if selected else "#f1f4f8",
+                    relief="flat", bd=0)
+            except Exception:
+                pass
 
     def _show_text_style_popup(self, x=None, y=None, offset=42):
         self._hide_text_style_popup()
@@ -1631,7 +1645,7 @@ class RegionSelector:
         bg = Image.new("RGBA", (bw * ss, bh * ss), (0, 0, 0, 0))
         dr = ImageDraw.Draw(bg)
         dr.rounded_rectangle([0, 0, bw * ss - 1, bh * ss - 1], radius=radius * ss,
-                             fill="#ffffff", outline="#c9cdd4", width=border_w * ss)
+                              fill="#fbfcfe", outline="#c3cbd5", width=border_w * ss)
         self._tb_bg_photo = ImageTk.PhotoImage(bg.resize((bw, bh), Image.LANCZOS))
 
         x0, y0, x1, y1 = self._sel_box
@@ -1649,6 +1663,13 @@ class RegionSelector:
             self._text_tool_anchor = (
                 inner_x + text_index * (size + gap) + size // 2,
                 inner_y + size)
+        # 以细分隔线划分编辑、识别、撤销和输出四组操作。
+        for boundary in (6, 7, 9):
+            sep_x = inner_x + boundary * (size + gap) - gap // 2
+            self._tb_item_ids.append(self.canvas.create_line(
+                sep_x, inner_y + 4, sep_x, inner_y + size - 4,
+                fill="#dfe5ec", width=1))
+        self._tb_button_map = {}
         for i, (key, cmd, tip) in enumerate(buttons):
             row, col = divmod(i, columns)
             photo = self._tb_icons[key][0]
@@ -1672,9 +1693,11 @@ class RegionSelector:
             b.bind("<Enter>", lambda _event, text=tip: self._show_tooltip(text))
             b.bind("<Leave>", lambda _event: self._hide_tooltip())
             self._tb_buttons.append(b)
+            self._tb_button_map[key] = b
             self._tb_item_ids.append(self.canvas.create_window(
                 inner_x + col * (size + gap), inner_y + row * (size + gap), window=b, anchor="nw",
                 width=size, height=size))
+        self._update_tool_button_state()
 
     def _show_tooltip(self, text):
         self._hide_tooltip()
@@ -1702,6 +1725,7 @@ class RegionSelector:
             except Exception:
                 pass
         self._tb_buttons = []
+        self._tb_button_map = {}
         self._tb_bg_photo = None
 
     def _confirm(self):
@@ -4426,24 +4450,16 @@ class DetailPane:
         danger = self.panel._sys("red")
 
         def btn(label, cmd, fg=None, primary=False):
-            fg = fg or T["accent"]
-            if primary:
-                fill = T["accent_soft"]
-                hover = T["accent"]
-                pressed = "#005FCC"
-                text = T["accent"]
-            elif label == "删除":
-                fill = "#FFF0F0" if not self.panel._dark else "#452326"
-                hover = "#FFD9D9" if not self.panel._dark else "#633034"
-                pressed = "#F5B8B8" if not self.panel._dark else "#7A3B40"
-                text = fg
+            # 统一深色按钮底，悬停使用蓝色高亮；删除保留独立红色警示。
+            if label == "删除":
+                fill, hover, pressed = "#B42318", "#DC2626", "#991B1B"
             else:
-                fill, hover, pressed, text = T["field"], T["fill_hover"], \
-                    T["separator"], fg
+                fill, hover, pressed = "#334155", "#3B82F6", "#1D4ED8"
+            text = "#FFFFFF"
 
-            font = ("Microsoft YaHei UI", 9, "bold" if primary else "normal")
+            font = ("Microsoft YaHei UI", 9, "normal")
             text_width = max(30, self.panel._measure(label, font))
-            width = text_width + (24 if primary else 20)
+            width = text_width + 20
             height = max(30, int(round(30 * self.panel._dpi)))
             radius = max(7, int(round(9 * self.panel._dpi)))
 
@@ -4817,6 +4833,8 @@ class DetailPane:
             import webbrowser
             webbrowser.open(url)
             self.panel.status_var.set(f"已打开 {url[:60]}")
+            # 浏览器会抢前台，但剪贴板面板保持可见并回到上层。
+            self.panel.win.after(450, self.panel.win.lift)
         except Exception:
             traceback.print_exc()
 
@@ -4842,9 +4860,11 @@ class DetailPane:
             panel = self.panel
             full = self.row
             prev = panel._prev_hwnd
-            panel.hide()
             threading.Thread(target=panel._do_paste_back, args=(full, prev),
                              daemon=True).start()
+            # 回贴需要临时激活原窗口，完成后把剪贴板面板重新显示到上层。
+            panel.win.after(500, panel.win.deiconify)
+            panel.win.after(520, panel.win.lift)
         except Exception:
             traceback.print_exc()
 
