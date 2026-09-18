@@ -1,5 +1,5 @@
 {
-  "db_path": "data/lumina.db",
+  "db_path": "lumina.db",
   "retention_days": 30,
   "max_rows": 0,
   "max_text_kb": 512,

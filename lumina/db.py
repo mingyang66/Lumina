@@ -64,10 +64,9 @@ class Database:
             os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
             conn = sqlite3.connect(self.path, timeout=30)
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("PRAGMA synchronous=FULL")
             conn.execute("PRAGMA temp_store=MEMORY")
-            conn.execute("PRAGMA wal_autocheckpoint=250")
             conn.execute("PRAGMA busy_timeout=30000")
             self._local.conn = conn
         return conn
@@ -352,10 +351,8 @@ class Database:
         return cur.rowcount > 0
 
     def checkpoint(self):
-        try:
-            self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        except sqlite3.OperationalError:
-            pass
+        # Kept as a compatibility no-op; DELETE journal mode has no WAL checkpoint.
+        return None
 
     def close(self):
         conn = getattr(self._local, "conn", None)
