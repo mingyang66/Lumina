@@ -1124,7 +1124,7 @@ class RegionSelector:
                 _, points = item
                 if kind == "mosaic":
                     radius = 6
-                    for index, (px, py) in enumerate(points):
+                    for px, py in points:
                         self._edit_items.append(self.canvas.create_rectangle(
                             px - radius, py - radius, px + radius, py + radius,
                             fill=self._mosaic_color(px, py, radius),
@@ -2127,7 +2127,7 @@ class HistoryPanel:
         hit = self._tile_cache.get(key)
         if hit is not None:
             return hit
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
         size = max(8, int(size))
         ss = 2
         s = size * ss
@@ -2538,7 +2538,6 @@ class HistoryPanel:
                     fill=c, width=w)
             dr.line([(s * 0.34, s * 0.82), (s * 0.66, s * 0.82)],
                     fill=c, width=w)
-            m = s * 0.10
             corner = s * 0.19
             for x, y, dx, dy in (
                     (s * 0.30, s * 0.36, 1, 1),
@@ -3710,56 +3709,6 @@ class HistoryPanel:
         draw_fn(ImageDraw.Draw(im), s, rgb, max(2, int(round(s * weight))))
         return ImageTk.PhotoImage(im.resize((box, box), Image.LANCZOS))
 
-    def _make_header_icons(self, dpi, color_hex):
-        """窗口控制按钮图标：苹果 SF Symbols 风格，线细、比例优雅、统一圆端线帽。"""
-        box = max(22, int(round(28 * dpi)))
-        weight = 0.062
-
-        def close(dr, s, c, w):
-            w = int(round(w))
-            m = s * 0.24
-            dr.line([(m, m), (s - m, s - m)], fill=c, width=w, joint="curve")
-            dr.line([(s - m, m), (m, s - m)], fill=c, width=w, joint="curve")
-
-        def gear(dr, s, c, w):
-            import math
-            w = int(round(w))
-            cx, cy = s*0.5, s*0.5
-            r_out, r_in = s*0.26, s*0.11
-            dr.ellipse([cx-r_out, cy-r_out, cx+r_out, cy+r_out], outline=c, width=w)
-            for k in range(8):
-                a = math.pi*2*k/8
-                dr.line([(cx+math.cos(a)*r_out*0.72, cy+math.sin(a)*r_out*0.72),
-                         (cx+math.cos(a)*r_out*1.05, cy+math.sin(a)*r_out*1.05)],
-                        fill=c, width=w)
-            dr.ellipse([cx-r_in, cy-r_in, cx+r_in, cy+r_in], outline=c, width=max(1, w-1))
-            for k in range(4):
-                a = math.pi*2*k/4
-                dr.line([(cx+math.cos(a)*r_in*1.2, cy+math.sin(a)*r_in*1.2),
-                         (cx+math.cos(a)*r_out*0.6, cy+math.sin(a)*r_out*0.6)],
-                        fill=c, width=max(1, round(w*0.8)))
-
-        def expand(dr, s, c, w):
-            dr.line([(s*0.28, s*0.72), (s*0.28, s*0.28), (s*0.72, s*0.28)],
-                    fill=c, width=round(w*1.2), joint="curve")
-
-        def minimize(dr, s, c, w):
-            w = int(round(w))
-            x1, x2 = s * 0.22, s * 0.78
-            y = s * 0.50
-            dr.line([(x1, y), (x2, y)], fill=c, width=round(w*1.4), joint="curve")
-
-        def restore(dr, s, c, w):
-            w = int(round(w))
-            dr.line([(s*0.72, s*0.28), (s*0.72, s*0.72), (s*0.28, s*0.72)],
-                    fill=c, width=round(w*1.2), joint="curve")
-
-        return {"close": self._mono_icon(close, box, color_hex),
-                "minimize": self._mono_icon(minimize, box, color_hex),
-                "gear": self._mono_icon(gear, box, color_hex),
-                "expand": self._mono_icon(expand, box, color_hex),
-                "restore": self._mono_icon(restore, box, color_hex)}
-
     def _make_search_icon(self, dpi, color_hex):
         from PIL import Image, ImageDraw, ImageTk
         box = max(14, int(round(16 * dpi)))
@@ -4550,7 +4499,6 @@ class DetailPane:
         if self.row is None:
             return
         tk = self.tk
-        T = self.T
         danger = self.panel._sys("red")
 
         def btn(label, cmd, fg=None, primary=False):
