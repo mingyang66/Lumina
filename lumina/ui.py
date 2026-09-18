@@ -1908,6 +1908,19 @@ class HistoryPanel:
         "file":  ("green",  "folder"),
     }
     FONT_FAMILY = "Microsoft YaHei UI"
+    RESIZE_GRIP = 12
+    WM_NCHITTEST = 0x0084
+    HTCLIENT = 1
+    HTLEFT = 10
+    HTRIGHT = 11
+    HTTOP = 12
+    HTTOPLEFT = 13
+    HTTOPRIGHT = 14
+    HTBOTTOM = 15
+    HTBOTTOMLEFT = 16
+    HTBOTTOMRIGHT = 17
+    GWL_STYLE = -16
+    WS_THICKFRAME = 0x00040000
 
     def __init__(self, root, tk, ui):
         self.ui = ui
@@ -1936,6 +1949,13 @@ class HistoryPanel:
         self._rows_displayed = []
         self._canvas_w = None
         self._relayout_id = None
+        self._resize_state = None
+        self._resize_start = None
+        self._resize_geometry = None
+        self._bg_resize_job = None
+        self._resize_grips = {}
+        self._native_wndproc = None
+        self._native_wndproc_ref = None
         self._detail = None
         self._detail_hover_id = None
         self._flat_menu = None
@@ -3409,14 +3429,21 @@ class HistoryPanel:
         self._cw = int(round(self.COMPACT_W * dpi))
         self._ch = int(round(self.COMPACT_H * dpi))
 
-        # 圆角背景（transparentcolor 键色透出 = 圆角）
-        self._bg_canvas = tk.Canvas(self.win, bg=self.TRANS_COLOR,
+        # 圆角由 Windows 原生窗口区域裁剪，Canvas 只负责绘制背景和边框。
+        self._bg_canvas = tk.Canvas(self.win, bg=self._c("window_bg"),
                                     highlightthickness=0, bd=0)
         self._rounded_bg = self._make_rounded_bg(self._cw, self._ch)
         self._bg_item = self._bg_canvas.create_image(
             0, 0, image=self._rounded_bg, anchor="nw")
-        self._bg_canvas.bind("<ButtonPress-1>", self._hdr_press)
-        self._bg_canvas.bind("<B1-Motion>", self._hdr_move)
+        self._bg_canvas.bind("<Motion>", self._border_motion)
+        self._bg_canvas.bind("<ButtonPress-1>", self._border_press)
+        self._bg_canvas.bind("<B1-Motion>", self._border_move)
+        self._bg_canvas.bind("<ButtonRelease-1>", self._border_release)
+        self._bg_canvas.bind("<Configure>", self._schedule_background_resize)
+        self.win.bind_all("<Motion>", self._global_border_motion, add="+")
+        self.win.bind_all("<ButtonPress-1>", self._global_border_press, add="+")
+        self.win.bind_all("<B1-Motion>", self._global_border_move, add="+")
+        self.win.bind_all("<ButtonRelease-1>", self._global_border_release, add="+")
 
         T, dark = self._theme()
         win_bg = T["window_bg"]
@@ -3556,6 +3583,7 @@ class HistoryPanel:
         self._cmp_status = tk.Label(footer, textvariable=self.status_var,
                                     bg=win_bg, fg=T["label2"], font=self._font(8))
         self._cmp_status.pack(side="right")
+        self._create_resize_grips(win_bg)
 
     # ---------- 双栏比例 ----------
     LEFT_RATIO = 0.38
@@ -3926,22 +3954,13 @@ class HistoryPanel:
             self._layout_chips()
 
     def _make_rounded_bg(self, w, h):
-        """窗口材质：圆角背景 + 发丝描边，填充随主题。
-
-        注意：-transparentcolor 是"颜色键"透明（精确匹配、二值），不支持半透明。
-        若画投影或做超采样抗锯齿，半透明/混合像素会被颜色键当作不透明深色，
-        在外框形成一圈黑边。因此这里用纯 RGB、硬边缘（不超采样缩放），
-        透明区=键色，圆角干净无黑边。
-        """
+        """绘制矩形窗口背景。"""
         from PIL import Image, ImageDraw, ImageTk
-        key = self._hex_to_rgb(self.TRANS_COLOR)
         win_bg = self._hex_to_rgb(self._c("window_bg"))
-        hair = self._hex_to_rgb(self._c("hairline"))
-        im = Image.new("RGB", (w, h), key)
-        ImageDraw.Draw(im).rounded_rectangle(
-            [0, 0, w - 1, h - 1], radius=18,
-            fill=win_bg, outline=hair, width=1)
-        return ImageTk.PhotoImage(im)
+        image = Image.new("RGB", (w, h), win_bg)
+        ImageDraw.Draw(image).rectangle(
+            [0, 0, w - 1, h - 1], fill=win_bg)
+        return ImageTk.PhotoImage(image)
 
     def _set_filter(self, key):
         self._filter = key
@@ -3955,6 +3974,235 @@ class HistoryPanel:
     def _hdr_press(self, e):
         self._drag_off = (e.x_root - self.win.winfo_x(),
                           e.y_root - self.win.winfo_y())
+
+    def _resize_edges(self, e):
+        """Return the window edges under the pointer (n/s/e/w)."""
+        if self._maxed:
+            return ""
+        border = max(5, int(round(self.RESIZE_GRIP * self._dpi)))
+        x = e.x_root - self.win.winfo_x()
+        y = e.y_root - self.win.winfo_y()
+        w, h = self.win.winfo_width(), self.win.winfo_height()
+        edges = ""
+        if 0 <= x <= border:
+            edges += "w"
+        elif w - border <= x <= w:
+            edges += "e"
+        if 0 <= y <= border:
+            edges += "n"
+        elif h - border <= y <= h:
+            edges += "s"
+        return edges
+
+    @staticmethod
+    def _resize_cursor(edges):
+        return {
+            "n": "size_ns", "s": "size_ns", "e": "size_we", "w": "size_we",
+            "ne": "size_ne_sw", "sw": "size_ne_sw",
+            "nw": "size_nw_se", "se": "size_nw_se",
+        }.get(edges, "arrow")
+
+    def _create_resize_grips(self, background):
+        """Place corner hit areas at the actual outer window edges."""
+        size = max(10, int(round(self.RESIZE_GRIP * self._dpi)))
+        positions = {
+            "nw": dict(x=0, y=0),
+            "ne": dict(relx=1, x=-size, y=0),
+            "sw": dict(x=0, rely=1, y=-size),
+            "se": dict(relx=1, rely=1, x=-size, y=-size),
+        }
+        for edges, place_options in positions.items():
+            grip = self.tk.Frame(
+                self.win, bg=background, width=size, height=size,
+                cursor=self._resize_cursor(edges),
+                highlightthickness=0, bd=0)
+            grip.place(**place_options)
+            grip.bind("<ButtonPress-1>", self._grip_press)
+            grip.bind("<B1-Motion>", self._grip_move)
+            grip.bind("<ButtonRelease-1>", self._grip_release)
+            self._resize_grips[edges] = grip
+
+    def _grip_press(self, event):
+        edges = next((key for key, grip in self._resize_grips.items()
+                      if grip is event.widget), "")
+        if not edges:
+            return
+        self._resize_state = edges
+        self._resize_start = (event.x_root, event.y_root)
+        self._resize_geometry = (
+            self.win.winfo_x(), self.win.winfo_y(),
+            self.win.winfo_width(), self.win.winfo_height())
+        self._drag_off = None
+        return "break"
+
+    def _grip_move(self, event):
+        if self._resize_state:
+            return self._border_move(event)
+
+    def _grip_release(self, event):
+        if self._resize_state:
+            return self._border_release(event)
+
+    def _border_motion(self, e):
+        if self._resize_state:
+            return
+        cursor = self._resize_cursor(self._resize_edges(e))
+        self._bg_canvas.configure(cursor=cursor)
+        self.win.configure(cursor=cursor)
+
+    def _global_border_motion(self, e):
+        if not self.is_visible() or self._resize_state:
+            return
+        x0, y0 = self.win.winfo_x(), self.win.winfo_y()
+        x1, y1 = x0 + self.win.winfo_width(), y0 + self.win.winfo_height()
+        if x0 <= e.x_root <= x1 and y0 <= e.y_root <= y1:
+            cursor = self._resize_cursor(self._resize_edges(e))
+            self._bg_canvas.configure(cursor=cursor)
+            self.win.configure(cursor=cursor)
+
+    def _global_border_press(self, e):
+        if not self.is_visible() or self._resize_state:
+            return
+        x0, y0 = self.win.winfo_x(), self.win.winfo_y()
+        x1, y1 = x0 + self.win.winfo_width(), y0 + self.win.winfo_height()
+        if x0 <= e.x_root <= x1 and y0 <= e.y_root <= y1 \
+                and self._resize_edges(e):
+            self._border_press(e)
+            return "break"
+
+    def _global_border_move(self, e):
+        if self._resize_state:
+            return self._border_move(e)
+
+    def _global_border_release(self, e):
+        if self._resize_state:
+            return self._border_release(e)
+
+    def _border_press(self, e):
+        edges = self._resize_edges(e)
+        if not edges:
+            self._hdr_press(e)
+            return
+        self._resize_state = edges
+        self._resize_start = (e.x_root, e.y_root)
+        self._resize_geometry = (
+            self.win.winfo_x(), self.win.winfo_y(),
+            self.win.winfo_width(), self.win.winfo_height())
+        self._drag_off = None
+        return "break"
+
+    def _border_move(self, e):
+        if not self._resize_state:
+            self._hdr_move(e)
+            return
+        dx = e.x_root - self._resize_start[0]
+        dy = e.y_root - self._resize_start[1]
+        x, y, w, h = self._resize_geometry
+        min_w = max(720, int(round(720 * self._dpi)))
+        min_h = max(480, int(round(480 * self._dpi)))
+        if "e" in self._resize_state:
+            w = max(min_w, w + dx)
+        if "s" in self._resize_state:
+            h = max(min_h, h + dy)
+        if "w" in self._resize_state:
+            new_w = max(min_w, w - dx)
+            x += w - new_w
+            w = new_w
+        if "n" in self._resize_state:
+            new_h = max(min_h, h - dy)
+            y += h - new_h
+            h = new_h
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
+        self._resize_background(w, h)
+        return "break"
+
+    def _border_release(self, _e):
+        self._resize_state = None
+        self._resize_start = None
+        self._resize_geometry = None
+        self._bg_canvas.configure(cursor="arrow")
+        self.win.configure(cursor="arrow")
+        return "break"
+
+    def _schedule_background_resize(self, e):
+        if self._bg_resize_job is not None:
+            try:
+                self.win.after_cancel(self._bg_resize_job)
+            except Exception:
+                pass
+        self._bg_resize_job = self.win.after(
+            50, lambda width=e.width, height=e.height:
+            self._resize_background(width, height))
+
+    def _resize_background(self, width, height):
+        self._bg_resize_job = None
+        if width > 1 and height > 1:
+            self._rounded_bg = self._make_rounded_bg(width, height)
+            self._bg_canvas.itemconfigure(self._bg_item, image=self._rounded_bg)
+
+    def _install_native_resize(self):
+        """Let Windows perform edge/corner resizing like a native window."""
+        if os.name != "nt" or self._native_wndproc_ref is not None:
+            return
+        user32 = ctypes.windll.user32
+        hwnd = self.win.winfo_id()
+        get_style = user32.GetWindowLongPtrW
+        set_style = user32.SetWindowLongPtrW
+        call_proc = user32.CallWindowProcW
+        get_style.restype = ctypes.c_void_p
+        get_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        set_style.restype = ctypes.c_void_p
+        set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        call_proc.restype = ctypes.c_ssize_t
+        call_proc.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                              ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+        wndproc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.c_size_t, ctypes.c_ssize_t)
+        old_style = get_style(hwnd, self.GWL_STYLE)
+        set_style(hwnd, self.GWL_STYLE,
+                  ctypes.c_void_p(old_style | self.WS_THICKFRAME))
+        old_proc = get_style(hwnd, -4)
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+        user32.GetWindowRect.restype = ctypes.c_bool
+
+        def wndproc(window, message, wparam, lparam):
+            if message == self.WM_NCHITTEST and not self._maxed:
+                x = ctypes.c_short(lparam & 0xFFFF).value
+                y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+                rect = RECT()
+                if user32.GetWindowRect(window, ctypes.byref(rect)):
+                    grip = max(5, int(round(self.RESIZE_GRIP * self._dpi)))
+                    left = x - rect.left
+                    right = rect.right - x
+                    top = y - rect.top
+                    bottom = rect.bottom - y
+                    if left <= grip and top <= grip:
+                        return self.HTTOPLEFT
+                    if right <= grip and top <= grip:
+                        return self.HTTOPRIGHT
+                    if left <= grip and bottom <= grip:
+                        return self.HTBOTTOMLEFT
+                    if right <= grip and bottom <= grip:
+                        return self.HTBOTTOMRIGHT
+                    if left <= grip:
+                        return self.HTLEFT
+                    if right <= grip:
+                        return self.HTRIGHT
+                    if top <= grip:
+                        return self.HTTOP
+                    if bottom <= grip:
+                        return self.HTBOTTOM
+            return call_proc(old_proc, window, message, wparam, lparam)
+
+        self._native_wndproc_ref = wndproc_type(wndproc)
+        self._native_wndproc = set_style(
+            hwnd, -4, ctypes.cast(self._native_wndproc_ref, ctypes.c_void_p))
 
     def _search_press(self, e):
         self._activate_search()
@@ -4093,15 +4341,12 @@ class HistoryPanel:
 
     def apply_mode(self):
         self.win.overrideredirect(True)
-        try:
-            self.win.attributes("-transparentcolor", self.TRANS_COLOR)
-        except self.tk.TclError:
-            pass
-        self.win.configure(bg=self.TRANS_COLOR)
+        self._install_native_resize()
+        self.win.configure(bg=self._c("window_bg"))
         self.win.minsize(1, 1)
         self._bg_canvas.pack(fill="both", expand=True)
-        self._cmp_root.place(x=4, y=4, relwidth=1.0, relheight=1.0,
-                             width=-8, height=-8)
+        self._cmp_root.place(x=8, y=8, relwidth=1.0, relheight=1.0,
+                             width=-16, height=-16)
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
         w = min(self._cw, sw)
