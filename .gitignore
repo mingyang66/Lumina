@@ -10,7 +10,6 @@ ENV/
 
 # PyInstaller
 build/
-dist/
 data/
 *.spec
 !matrix_dash.spec
