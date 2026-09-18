@@ -2635,7 +2635,6 @@ class HistoryPanel:
 
     def _open_settings_dialog(self):
         """Open the editable config.json settings dialog."""
-        from .settings import DEFAULTS
         tk = self.tk
         T, _dark = self._theme()
         dialog = tk.Toplevel(self.win)
@@ -2728,11 +2727,6 @@ class HistoryPanel:
         buttons = tk.Frame(shell, bg=T["window_bg"])
         buttons.pack(fill="x", pady=(7, 0))
 
-        def reset_defaults():
-            for key, (var, kind) in fields.items():
-                value = DEFAULTS.get(key, "")
-                var.set(bool(value) if kind == "bool" else str(value))
-
         def save():
             numeric = {"popup_seconds": float, "capture_monitor": int,
                        "max_file_mb": int,
@@ -2763,10 +2757,6 @@ class HistoryPanel:
             self.status_var.set("设置已保存，快捷键重启后生效")
             dialog.destroy()
 
-        tk.Button(buttons, text="恢复默认值", command=reset_defaults, relief="flat",
-                  bd=0, bg=T["window_bg"], fg=T["label3"], padx=8, pady=7,
-                  cursor="hand2", activebackground=T["window_bg"],
-                  activeforeground=T["accent"]).pack(side="left")
         tk.Button(buttons, text="取消", command=dialog.destroy, relief="flat",
                   bd=0, bg=T["field"], fg=T["label2"], padx=18, pady=7,
                   cursor="hand2", activebackground=T["fill_hover"],

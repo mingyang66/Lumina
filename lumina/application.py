@@ -11,7 +11,7 @@ from . import clipboard_api
 from .clipboard_listener import ClipboardListener
 from .media import grab_screen, image_to_dib, to_png
 from .settings import save_config, set_autostart
-from .storage import Database
+from .database import Database
 from .system_tray import TrayIcon
 from .text_classifier import classify_text
 from .ui import UiServer

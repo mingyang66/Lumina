@@ -4,7 +4,7 @@ import sys
 
 from lumina.application import LuminaApp
 from lumina.settings import load_config
-from lumina.storage import Database
+from lumina.database import Database
 
 
 def cmd_run(cfg, config_path=None):
