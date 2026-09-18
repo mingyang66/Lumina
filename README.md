@@ -3,7 +3,7 @@
 使用 PyInstaller 将 Lumina 打包为 Windows 应用程序：
 
 ```powershell
-python -m PyInstaller --clean --noconfirm --windowed --name "Lumina" `
+python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Lumina" `
     --add-data "config.json;." `
     --hidden-import "tkinter" `
     --hidden-import "_tkinter" `
@@ -18,12 +18,13 @@ python -m PyInstaller --clean --noconfirm --windowed --name "Lumina" `
 - `--clean`：清理 PyInstaller 的临时缓存后再开始构建，避免旧缓存影响打包结果。
 - `--noconfirm`：自动确认覆盖并删除已有的输出目录，不再显示确认提示。
 - `--windowed`：生成窗口程序，运行 GUI 应用时不显示命令行窗口。该参数也可以写成 `--noconsole`。
+- `--onefile`：将程序及其依赖打包成一个独立的 `Lumina.exe` 文件。
 - `--name "Lumina"`：将生成的应用程序命名为 `Lumina`。
 - `--add-data "config.json;."`：将 `config.json` 一起复制到打包程序的顶层目录。Windows 使用分号分隔源文件和目标目录。
 - `--hidden-import`：显式包含动态导入的 `tkinter`、`_tkinter` 和 Pillow 模块。
 - `main.py`：指定应用程序的入口文件。
 
-打包结果默认生成在 `dist/Lumina/` 目录中，可执行文件为 `dist/Lumina/Lumina.exe`。
+打包结果默认生成在 `dist/` 目录中，可执行文件为 `dist/Lumina.exe`。
 
 # Lumina Clipboard Manager - Database Documentation
 
