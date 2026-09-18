@@ -3472,7 +3472,9 @@ class HistoryPanel:
         self._minimize_btn.pack(side="right", padx=(2, 0), fill="y")
 
         # ---------- 双栏布局：左(搜索+列表) / 右(详情) ----------
-        detail_w = self._detail_width(self._cw - 60)  # 60 = cmp_root内缩32 + body padx28
+        body_w = self._cw - 60  # cmp_root 内缩32 + body padx28
+        left_w = self._left_width(body_w)
+        detail_w = self._detail_width(body_w)
 
         body_split = tk.Frame(self._cmp_root, bg=win_bg)
         body_split.pack(fill="both", expand=True, padx=14, pady=(10, 0))
@@ -3480,7 +3482,10 @@ class HistoryPanel:
         body_split.bind("<ButtonPress-1>", self._hdr_press)
         body_split.bind("<B1-Motion>", self._hdr_move)
         left = tk.Frame(body_split, bg=win_bg)
-        left.pack(side="left", fill="both", expand=True)
+        self._left_frame = left
+        left.configure(width=left_w)
+        left.pack(side="left", fill="both")
+        left.pack_propagate(False)
         left.bind("<ButtonPress-1>", self._hdr_press)
         left.bind("<B1-Motion>", self._hdr_move)
 
@@ -3553,26 +3558,38 @@ class HistoryPanel:
         self._cmp_status.pack(side="right")
 
     # ---------- 双栏比例 ----------
-    DETAIL_RATIO = 0.64
+    LEFT_RATIO = 0.38
+    LEFT_MIN = 400
+    LEFT_MAX = 640
     DETAIL_MIN = 380
-    DETAIL_MAX = 840
 
-    def _detail_width(self, total):
-        """按 42:58 计算详情栏宽（total=双栏区总宽，含 21px 分隔区）。"""
+    def _left_width(self, total):
+        """计算列表栏宽度，限制最大值避免最大化时左栏过宽。"""
         avail = max(0, total - 21)
         d = self._dpi
-        return int(min(max(avail * self.DETAIL_RATIO,
-                           self.DETAIL_MIN * d), self.DETAIL_MAX * d))
+        minimum = self.LEFT_MIN * d
+        maximum = self.LEFT_MAX * d
+        detail_min = self.DETAIL_MIN * d
+        return int(min(max(avail * self.LEFT_RATIO, minimum),
+                       maximum, max(minimum, avail - detail_min)))
+
+    def _detail_width(self, total):
+        """详情栏占用左栏和分隔线之外的剩余宽度。"""
+        avail = max(0, total - 21)
+        return int(max(self.DETAIL_MIN * self._dpi,
+                       avail - self._left_width(total)))
 
     def _left_col_width(self):
         """左栏（列表画布）宽度推导：画布尚未映射时的首帧渲染兜底。"""
-        body = max(200, self._cw - 60)  # 60 = cmp_root内缩32 + body padx28
-        return max(200, body - 21 - self._detail_width(body))
+        body = max(200, self._cw - 60)  # cmp_root 内缩32 + body padx28
+        return self._left_width(body)
 
     def _on_split_configure(self, e):
         """窗口尺寸变化（含全屏切换）时详情栏跟随比例伸缩。"""
+        left_w = self._left_width(e.width)
         dw = self._detail_width(e.width)
         try:
+            self._left_frame.configure(width=left_w)
             changed = self._detail.frame.winfo_width() != dw
             if changed:
                 self._detail.frame.configure(width=dw)
