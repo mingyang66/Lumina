@@ -30,7 +30,7 @@ python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Lumina" `
 
 ## Overview
 
-Lumina uses a single SQLite database (`data/lumina.db`) to store clipboard history items. The database is created automatically on first run and is located at the path specified in `config.py` (`data/lumina.db` by default).
+Lumina uses a single SQLite database (`data/lumina.db`) to store clipboard history items. The database is created automatically on first run and is located at the path specified in `settings.py` (`data/lumina.db` by default).
 
 ## Schema
 
@@ -59,7 +59,7 @@ The `pinned`, `tags`, and `category` columns were added via automatic migration 
 - `tags`: Added for user-defined categorization and filtering
 - `category`: Added for semantic classification (text/code/link/image/file), derived from content analysis
 
-These columns are **safely backward-compatible**: the `_migrate_columns()` method in `lumina/db.py` adds any missing columns with default values, so existing databases are automatically updated on first run with the new version.
+These columns are **safely backward-compatible**: the `_migrate_columns()` method in `lumina/storage.py` adds any missing columns with default values, so existing databases are automatically updated on first run with the new version.
 
 ### FTS5 Full-Text Search tables
 
@@ -89,7 +89,7 @@ These are **implementation details** managed by SQLite; users should not interac
 - 仅有 **`clipboard`** 一张表是应用程序直接读写的业务表，包含所有剪贴历史、分类、标签、Pin 状态等信息。
 - `sqlite_sequence` 是 SQLite 自动创建的系统表，用于支持 `AUTOINCREMENT`，通常不需要手动查询。
 - `clipboard_fts` 及其内部表是全文搜索功能的组件。如果搜索可用（取决于 FTS5 编译情况），它们会在 `init_schema()` 中自动创建；否则应用会退回到 LIKE 方式模糊查询。
-- 所有表的创建和迁移均由 `lumina/db.py` 的 `init_schema()` 和 `_migrate_columns()` 方法统一管理，确保向后兼容。
+- 所有表的创建和迁移均由 `lumina/storage.py` 的 `init_schema()` 和 `_migrate_columns()` 方法统一管理，确保向后兼容。
 
 ## Data Operations
 
@@ -125,7 +125,7 @@ This ensures databases created with earlier versions of Lumina continue to work 
 
 ## Path Configuration
 
-Database path is configured in `lumina/config.py`:
+Database path is configured in `lumina/settings.py`:
 
 ```python
 DEFAULTS = {

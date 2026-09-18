@@ -2,9 +2,9 @@ import argparse
 import os
 import sys
 
-from lumina.app import LuminaApp
-from lumina.config import load_config
-from lumina.db import Database
+from lumina.application import LuminaApp
+from lumina.settings import load_config
+from lumina.storage import Database
 
 
 def cmd_run(cfg, config_path=None):

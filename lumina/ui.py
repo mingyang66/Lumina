@@ -16,7 +16,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 
-from . import win32clip
+from . import clipboard_api
 
 
 class UiServer:
@@ -186,7 +186,7 @@ class UiServer:
                         self._toggle_panel()
                     elif kind == "show_panel":
                         if self._panel and not self._panel.is_visible():
-                            self._prev_hwnd = win32clip.get_foreground_hwnd()
+                            self._prev_hwnd = clipboard_api.get_foreground_hwnd()
                             self._panel.show(self._prev_hwnd)
                     elif kind == "hide_panel":
                         if self._panel and self._panel.is_visible():
@@ -303,7 +303,7 @@ class UiServer:
         if self._panel.is_visible():
             self._panel.hide()
         else:
-            self._prev_hwnd = win32clip.get_foreground_hwnd()
+            self._prev_hwnd = clipboard_api.get_foreground_hwnd()
             self._panel.show(self._prev_hwnd)
 
     # ---------- 区域截图 ----------
@@ -2635,7 +2635,7 @@ class HistoryPanel:
 
     def _open_settings_dialog(self):
         """Open the editable config.json settings dialog."""
-        from .config import DEFAULTS
+        from .settings import DEFAULTS
         tk = self.tk
         T, _dark = self._theme()
         dialog = tk.Toplevel(self.win)
@@ -3361,9 +3361,9 @@ class HistoryPanel:
             if not self.ui.actions.copy_to_clipboard(full):
                 return
             if prev_hwnd:
-                win32clip.set_foreground_hwnd(prev_hwnd)
+                clipboard_api.set_foreground_hwnd(prev_hwnd)
                 time.sleep(0.12)
-            win32clip.send_ctrl_v()
+                clipboard_api.send_ctrl_v()
         except Exception:
             traceback.print_exc()
 
@@ -4178,7 +4178,7 @@ class FlatMenu:
         if self._closed:
             return
         try:
-            if win32clip.mouse_button_down():
+            if clipboard_api.mouse_button_down():
                 px, py = self.win.winfo_pointerxy()
                 if not self.contains_point(px, py):
                     self.close()
