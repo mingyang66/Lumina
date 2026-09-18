@@ -2449,7 +2449,7 @@ class HistoryPanel:
     def show(self, prev_hwnd=None):
         self._sync_theme()
         self._prev_hwnd = prev_hwnd
-        self.apply_mode()  # 重设边框/尺寸/位置（光标附近或全屏态）并刷新
+        self.apply_mode()  # 重设边框/尺寸/位置并刷新
         self.win.deiconify()
         self.win.lift()
         self.win.focus_force()
@@ -4351,9 +4351,13 @@ class HistoryPanel:
         sh = self.win.winfo_screenheight()
         w = min(self._cw, sw)
         h = min(self._ch, sh)
-        px, py = self.win.winfo_pointerxy()
-        x = min(max(px - 60, 0), max(0, sw - w))
-        y = min(max(py - 24, 0), max(0, sh - h))
+        work_area = self._work_area()
+        if work_area:
+            area_x, area_y, area_w, area_h = work_area
+        else:
+            area_x, area_y, area_w, area_h = 0, 0, sw, sh
+        x = area_x + max(0, (area_w - w) // 2)
+        y = area_y + max(0, (area_h - h) // 2)
         self.win.geometry(f"{w}x{h}+{x}+{y}")
         self.refresh()
 
