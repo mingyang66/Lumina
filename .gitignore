@@ -28,8 +28,7 @@ Thumbs.db
 *.log
 err.log
 
-account_book.db
-
-# SQLite sidecar files
+# SQLite databases and sidecar files
+*.db
 *.db-shm
 *.db-wal
