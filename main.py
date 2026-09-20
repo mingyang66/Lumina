@@ -123,6 +123,12 @@ def cmd_stats(cfg):
 
 
 def main():
+    # pythonw.exe has no standard streams; keep background startup from failing
+    # when the application logs status messages.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
     parser = argparse.ArgumentParser(prog="lumina",
                                      description="clipboard & screenshot archiver (SQLite)")
     default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")

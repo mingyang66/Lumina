@@ -27,7 +27,10 @@ def set_autostart(enabled, config_path):
             command = [sys.executable, "-c", config_path, "run"]
         else:
             script = os.path.abspath(sys.argv[0])
-            command = [sys.executable, script, "-c", config_path, "run"]
+            executable = sys.executable
+            if os.path.basename(executable).lower() == "python.exe":
+                executable = os.path.join(os.path.dirname(executable), "pythonw.exe")
+            command = [executable, script, "-c", config_path, "run"]
         winreg.SetValueEx(key, AUTOSTART_VALUE, 0, winreg.REG_SZ,
                           subprocess.list2cmdline(command))
 
