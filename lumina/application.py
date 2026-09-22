@@ -153,7 +153,6 @@ class LuminaApp:
         except Exception:
             traceback.print_exc()
         finally:
-            self.db.close()
             self._capture_lock.release()
 
     # ---------- 区域截图 ----------
@@ -190,7 +189,6 @@ class LuminaApp:
                            clip_id, png=png, source=source)
             self.ui.refresh_panel()
         finally:
-            self.db.close()
             if self._capture_lock.locked():
                 self._capture_lock.release()
 

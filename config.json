@@ -8,7 +8,7 @@
   "max_file_mb": 100,
   "hotkey_capture": "ctrl+alt+v",
   "hotkey_region": "ctrl+alt+s",
-  "hotkey_panel": "ctrl+alt+h",
+  "hotkey_panel": "alt+v",
   "capture_monitor": 1,
   "copy_screenshot_to_clipboard": true,
   "cleanup_interval_minutes": 60,
