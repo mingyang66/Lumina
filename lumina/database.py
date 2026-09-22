@@ -3,12 +3,16 @@ import os
 import sqlite3
 import threading
 
+FILE_STORE_DIR = "file_store"
+FILE_STORE_THRESHOLD = 1 * 1024 * 1024  # 1MB
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clipboard (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL CHECK(kind IN ('text','image')),
     content TEXT,
     data BLOB,
+    file_path TEXT DEFAULT '',
     file_status TEXT NOT NULL DEFAULT 'none',
     hash TEXT NOT NULL,
     source TEXT DEFAULT '',
@@ -57,7 +61,32 @@ class Database:
     def __init__(self, path):
         self.path = path
         self._local = threading.local()
-        self._fts = None  # None=uninitialized, False=unavailable, True=available
+        self._fts = None
+        db_dir = os.path.dirname(os.path.abspath(path))
+        self._file_store_dir = os.path.join(db_dir, FILE_STORE_DIR)
+        os.makedirs(self._file_store_dir, exist_ok=True)
+
+    def _store_file_on_disk(self, clip_id, data):
+        """Write file data to disk, return relative path string."""
+        ext = ".bin"
+        store_path = os.path.join(self._file_store_dir, f"{clip_id}{ext}")
+        with open(store_path, "wb") as f:
+            f.write(data)
+        return os.path.relpath(store_path, os.path.dirname(os.path.abspath(self.path)))
+
+    def _get_file_data(self, row):
+        """Get file bytes from either BLOB or file_path. Returns (bytes_or_none, is_stored_on_disk)."""
+        data = row["data"]
+        file_path = row["file_path"] if "file_path" in row.keys() else ""
+        if file_path:
+            abs_path = os.path.abspath(os.path.join(
+                os.path.dirname(os.path.abspath(self.path)), file_path))
+            if os.path.isfile(abs_path):
+                with open(abs_path, "rb") as stream:
+                    return stream.read(), True
+        if data:
+            return data, False
+        return None, False
 
     @property
     def conn(self):
@@ -129,13 +158,9 @@ class Database:
                 self.conn.execute("ALTER TABLE clipboard DROP COLUMN file_size")
             except sqlite3.OperationalError:
                 pass
-        if "file_path" in cols:
-            # 文件路径与 content 重复，统一从 content 读取后删除旧列。
-            try:
-                self.conn.execute("ALTER TABLE clipboard DROP COLUMN file_path")
-            except sqlite3.OperationalError:
-                # 旧版 SQLite 不支持 DROP COLUMN；新记录已经不再使用该列。
-                pass
+        if "file_path" not in cols:
+            self.conn.execute(
+                "ALTER TABLE clipboard ADD COLUMN file_path TEXT DEFAULT ''")
         self.conn.commit()
 
     def _migrate_unique_constraint(self):
@@ -162,6 +187,7 @@ class Database:
                 kind TEXT NOT NULL CHECK(kind IN ('text','image')),
                 content TEXT,
                 data BLOB,
+                file_path TEXT DEFAULT '',
                 file_status TEXT NOT NULL DEFAULT 'none',
                 hash TEXT NOT NULL,
                 source TEXT DEFAULT '',
@@ -171,10 +197,10 @@ class Database:
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 UNIQUE(category, hash)
             );
-            INSERT INTO clipboard_new (id, kind, content, data, file_status,
-                hash, source, category, pinned, tags, created_at)
-            SELECT id, kind, content, data, file_status,
-                hash, source, category, pinned, tags, created_at
+            INSERT INTO clipboard_new (id, kind, content, data, file_path,
+                file_status, hash, source, category, pinned, tags, created_at)
+            SELECT id, kind, content, data, file_path,
+                file_status, hash, source, category, pinned, tags, created_at
             FROM clipboard;
             DROP TABLE clipboard;
             ALTER TABLE clipboard_new RENAME TO clipboard;
@@ -292,11 +318,21 @@ class Database:
 
     def complete_file(self, clip_id, data):
         digest = hashlib.sha256(data).hexdigest()
-        with self.conn:
-            self.conn.execute(
-                "UPDATE clipboard SET data=?, file_status='ready', hash=? "
-                "WHERE id=?",
-                (data, digest, clip_id))
+        if len(data) > FILE_STORE_THRESHOLD:
+            rel_path = self._store_file_on_disk(clip_id, data)
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE clipboard SET data=?, file_path=?, "
+                    "file_status='ready', hash=? "
+                    "WHERE id=?",
+                    (None, rel_path, digest, clip_id))
+        else:
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE clipboard SET data=?, file_path='', "
+                    "file_status='ready', hash=? "
+                    "WHERE id=?",
+                    (data, digest, clip_id))
 
     def fail_file(self, clip_id, error):
         with self.conn:
@@ -306,7 +342,16 @@ class Database:
     def cleanup(self, retention_days, max_rows):
         deleted = 0
         try:
+            old_files = []
             if retention_days and retention_days > 0:
+                rows = self.conn.execute(
+                    "SELECT id, file_path FROM clipboard WHERE pinned=0 "
+                    "AND julianday(created_at) < julianday('now','localtime',?)",
+                    (f"-{int(retention_days)} days",),
+                ).fetchall()
+                for r in rows:
+                    if r["file_path"]:
+                        old_files.append(r["file_path"])
                 cur = self.conn.execute(
                     "DELETE FROM clipboard WHERE pinned=0 "
                     "AND julianday(created_at) < julianday('now','localtime',?)",
@@ -314,6 +359,15 @@ class Database:
                 )
                 deleted += cur.rowcount
             if max_rows and max_rows > 0:
+                rows = self.conn.execute(
+                    "SELECT id, file_path FROM clipboard WHERE pinned=0 AND id NOT IN "
+                    "(SELECT id FROM clipboard WHERE pinned=0 "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?)",
+                    (int(max_rows),),
+                ).fetchall()
+                for r in rows:
+                    if r["file_path"]:
+                        old_files.append(r["file_path"])
                 cur = self.conn.execute(
                     "DELETE FROM clipboard WHERE pinned=0 AND id NOT IN "
                     "(SELECT id FROM clipboard WHERE pinned=0 "
@@ -321,6 +375,14 @@ class Database:
                     (int(max_rows),),
                 )
                 deleted += cur.rowcount
+            for fp in old_files:
+                try:
+                    abs_path = os.path.join(
+                        os.path.dirname(os.path.abspath(self.path)), fp)
+                    if os.path.exists(abs_path):
+                        os.remove(abs_path)
+                except OSError:
+                    pass
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -413,15 +475,31 @@ class Database:
         """文本和文件记录的轻量读取，不加载图片或文件 BLOB。"""
         return self.conn.execute(
             "SELECT id, kind, category, source, pinned, tags, created_at, content, "
-            "file_status, length(data) AS data_size "
+            "file_path, file_status, length(data) AS data_size "
             "FROM clipboard WHERE id=?", (clip_id,)
         ).fetchone()
 
     def get_file_data(self, clip_id):
-        return self.conn.execute(
-            "SELECT content AS file_path, data, file_status "
+        row = self.conn.execute(
+            "SELECT content AS source_path, file_path, data, file_status "
             "FROM clipboard WHERE id=? AND category='file'", (clip_id,)
         ).fetchone()
+        if not row:
+            return None
+
+        result = dict(row)
+        stored_path = result.get("file_path") or ""
+        if stored_path:
+            abs_path = os.path.abspath(os.path.join(
+                os.path.dirname(os.path.abspath(self.path)), stored_path))
+            result["file_path"] = abs_path
+            if not result.get("data") and os.path.isfile(abs_path):
+                try:
+                    with open(abs_path, "rb") as stream:
+                        result["data"] = stream.read()
+                except OSError:
+                    pass
+        return result
 
     def stats(self):
         rows = self.conn.execute(

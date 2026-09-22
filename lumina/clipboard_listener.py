@@ -121,7 +121,7 @@ class ClipboardListener(threading.Thread):
         self._ignored_until = 0.0
         self._ignore_lock = threading.Lock()
         self._hwnd = None
-        self._work_queue = queue.Queue(maxsize=3)
+        self._work_queue = queue.Queue(maxsize=50)
         self._worker = None
         self._ready = threading.Event()
         self._startup_error = None

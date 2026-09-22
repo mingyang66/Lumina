@@ -102,10 +102,22 @@ def cmd_export(cfg, clip_id, out):
             out = out or f"clip_{clip_id}.png"
             with open(out, "wb") as f:
                 f.write(row["data"])
-        elif row["category"] == "file" and row["data"]:
+        elif row["category"] == "file":
             out = out or os.path.basename(row["content"] or "") or f"file_{clip_id}"
-            with open(out, "wb") as f:
-                f.write(row["data"])
+            data = row["data"]
+            if data is None and ("file_path" in row.keys()) and row["file_path"]:
+                abs_path = os.path.join(
+                    os.path.dirname(os.path.abspath(db.path)),
+                    row["file_path"])
+                if os.path.exists(abs_path):
+                    with open(abs_path, "rb") as f:
+                        data = f.read()
+            if data:
+                with open(out, "wb") as f:
+                    f.write(data)
+            else:
+                print(f"exported -> {out} (no data)")
+                return
         else:
             out = out or f"clip_{clip_id}.txt"
             with open(out, "w", encoding="utf-8") as f:

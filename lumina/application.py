@@ -210,19 +210,27 @@ class LuminaApp:
             save_config(self.config, self.config_path)
 
     def copy_to_clipboard(self, row):
-        """面板回贴/复制：写入剪贴板并抑制自身监听（内容已在库中）。
+        """面板回贴/复制：写入剪贴板并抑制自身监听（内容已在库）。
 
         图片记录写回为图片；归档文件如果实际是图片，也写回为图片，
         否则按文本写回文件路径。
         """
         try:
-            # 历史列表使用轻量字段查询，复制时需要补充图片/文件数据。
             data = row["data"] if "data" in row.keys() else None
+            file_path = row["file_path"] if "file_path" in row.keys() else ""
             if data is None and row["id"]:
                 full_row = self.db.get(row["id"])
                 if full_row is not None:
                     row = full_row
                     data = row["data"]
+                    file_path = row["file_path"] if "file_path" in row.keys() else ""
+
+            if file_path and data is None:
+                abs_path = os.path.join(
+                    os.path.dirname(os.path.abspath(self.db.path)),
+                    file_path)
+                if os.path.exists(abs_path):
+                    data = open(abs_path, "rb").read()
 
             if row["kind"] == "image":
                 img = Image.open(io.BytesIO(data))
