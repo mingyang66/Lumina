@@ -12,9 +12,11 @@ CREATE TABLE IF NOT EXISTS clipboard (
     file_status TEXT NOT NULL DEFAULT 'none',
     hash TEXT NOT NULL,
     source TEXT DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
     pinned INTEGER NOT NULL DEFAULT 0,
     tags TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    UNIQUE(category, hash)
 );
 CREATE INDEX IF NOT EXISTS idx_clipboard_created ON clipboard(created_at);
 CREATE INDEX IF NOT EXISTS idx_clipboard_hash ON clipboard(hash);
@@ -64,8 +66,8 @@ class Database:
             os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
             conn = sqlite3.connect(self.path, timeout=30)
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=DELETE")
-            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA temp_store=MEMORY")
             conn.execute("PRAGMA busy_timeout=30000")
             self._local.conn = conn
@@ -74,6 +76,7 @@ class Database:
     def init_schema(self):
         self.conn.executescript(SCHEMA)
         self._migrate_columns()
+        self._migrate_unique_constraint()
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_clipboard_pinned ON clipboard(pinned)")
         self.conn.execute(
@@ -135,6 +138,54 @@ class Database:
                 pass
         self.conn.commit()
 
+    def _migrate_unique_constraint(self):
+        """Add UNIQUE(category, hash) constraint by recreating the table."""
+        schema_row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='clipboard'").fetchone()
+        if schema_row and "UNIQUE(category, hash)" in schema_row[0]:
+            return
+
+        self._backfill_category()
+
+        self.conn.execute("""
+            DELETE FROM clipboard
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM clipboard GROUP BY category, hash
+            )
+        """)
+        self.conn.commit()
+
+        self.conn.execute("PRAGMA legacy_alter_table=ON")
+        self.conn.executescript("""
+            CREATE TABLE clipboard_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK(kind IN ('text','image')),
+                content TEXT,
+                data BLOB,
+                file_status TEXT NOT NULL DEFAULT 'none',
+                hash TEXT NOT NULL,
+                source TEXT DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                pinned INTEGER NOT NULL DEFAULT 0,
+                tags TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                UNIQUE(category, hash)
+            );
+            INSERT INTO clipboard_new (id, kind, content, data, file_status,
+                hash, source, category, pinned, tags, created_at)
+            SELECT id, kind, content, data, file_status,
+                hash, source, category, pinned, tags, created_at
+            FROM clipboard;
+            DROP TABLE clipboard;
+            ALTER TABLE clipboard_new RENAME TO clipboard;
+        """)
+        self.conn.execute("PRAGMA legacy_alter_table=OFF")
+
+        self.conn.execute(
+            "DROP TABLE IF EXISTS clipboard_fts")
+        self._fts = None
+        self.conn.commit()
+
     def _backfill_category(self):
         """给旧记录补分类（category 为空的行），幂等，可反复执行。"""
         from .text_classifier import classify_text
@@ -191,28 +242,21 @@ class Database:
         digest_data = content.encode("utf-8") if content is not None else blob
         h = hashlib.sha256(digest_data).hexdigest()
         try:
-            self.conn.execute("BEGIN IMMEDIATE")
+            cur = self.conn.execute(
+                "INSERT INTO clipboard(kind, category, content, data, hash, "
+                "source, created_at) "
+                "VALUES (?,?,?,?,?,?,strftime('%Y-%m-%d %H:%M:%f','now','localtime')) "
+                "ON CONFLICT(category, hash) DO UPDATE SET "
+                "source=excluded.source, "
+                "created_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime')",
+                (kind, category, content, blob, h, source or ""),
+            )
+            self.conn.commit()
             row = self.conn.execute(
                 "SELECT id FROM clipboard WHERE category=? AND hash=? "
                 "ORDER BY id DESC LIMIT 1", (category, h)
             ).fetchone()
-            if row:
-                self.conn.execute(
-                    "UPDATE clipboard SET source=?, "
-                    "created_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') "
-                    "WHERE id=?",
-                    (source or "", row["id"]),
-                )
-                self.conn.commit()
-                return row["id"]
-            cur = self.conn.execute(
-                "INSERT INTO clipboard(kind, category, content, data, hash, "
-                "source, created_at) "
-                "VALUES (?,?,?,?,?,?,strftime('%Y-%m-%d %H:%M:%f','now','localtime'))",
-                (kind, category, content, blob, h, source or ""),
-            )
-            self.conn.commit()
-            return cur.lastrowid
+            return row["id"]
         except Exception:
             self.conn.rollback()
             raise
