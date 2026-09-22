@@ -695,12 +695,16 @@ class HistoryPanel:
         except Exception:
             return False
 
-    def show(self, prev_hwnd=None):
+    def show(self, prev_hwnd=None, position=None, topmost=None):
         self._sync_theme()
         self._prev_hwnd = prev_hwnd
         self.apply_mode()  # 重设边框/尺寸/位置并刷新
+        if topmost is not None:
+            self.win.attributes("-topmost", bool(topmost))
         self.win.deiconify()
         self.win.lift()
+        if position:
+            self.win.geometry(f"+{position[0]}+{position[1]}")
         self.win.focus_force()
         if self.search_var.get().strip():
             self._activate_search()
@@ -712,6 +716,7 @@ class HistoryPanel:
         if self._detail is not None:
             self._detail._close_menu()
         try:
+            self.win.attributes("-topmost", False)
             self.win.withdraw()
         except Exception:
             pass

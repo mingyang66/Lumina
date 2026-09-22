@@ -15,6 +15,12 @@
   "popup_enabled": true,
   "popup_seconds": 3.0,
   "panel_enabled": true,
+  "floating_enabled": true,
+  "floating_x": 1846,
+  "floating_y": 460,
+  "floating_size": 52,
+  "floating_hover_delay_ms": 200,
+  "floating_hide_delay_ms": 400,
   "hide_panel_on_capture": false,
   "download_dir": "",
   "autostart": false

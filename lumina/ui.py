@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from . import clipboard_api
 from .region_selector import RegionSelector
 from .history_panel import HistoryPanel
+from .settings import save_config
 
 """统一 UI 服务：单线程单 Tk root，同时管理 toast 提示与常驻历史面板。
 
@@ -70,6 +71,10 @@ class UiServer:
         self._pins = []
         self._prev_hwnd = None
         self.panel_visible = False  # 跨线程可见性提示（仅 UI 线程写入）
+        self._floating_ball = None
+        self._panel_locked = False
+        self._floating_hide_job = None
+        self._floating_hover_job = None
         self.started = False
 
     # ---------- 对外线程安全接口 ----------
@@ -174,11 +179,15 @@ class UiServer:
             root.withdraw()
             self._root = root
             self._build_panel()
+            self._build_floating_ball()
             self.started = True
             root.after(80, self._poll)
             root.mainloop()
         finally:
             self.db.close()
+            if self._floating_ball:
+                self._floating_ball.destroy()
+                self._floating_ball = None
             try:
                 root.destroy()
             except Exception:
@@ -314,8 +323,122 @@ class UiServer:
             traceback.print_exc()
             self._panel = None
 
+    def _build_floating_ball(self):
+        if not (self.panel_enabled and self.config.get("floating_enabled", True)):
+            return
+        try:
+            self._floating_ball = FloatingBall(self)
+            self._bind_panel_hover()
+        except Exception:
+            traceback.print_exc()
+            self._floating_ball = None
+
+    def _bind_panel_hover(self):
+        if not self._panel:
+            return
+        self._panel.win.bind("<Enter>", self._panel_enter, add="+")
+        self._panel.win.bind("<Leave>", self._panel_leave, add="+")
+        self._panel.win.bind("<FocusOut>", self._panel_focus_out, add="+")
+
+    def _panel_enter(self, _event=None):
+        self._cancel_floating_hide()
+
+    def _panel_leave(self, _event=None):
+        self._schedule_floating_hide()
+
+    def _panel_focus_out(self, _event=None):
+        """Stop covering other apps as soon as the user activates one."""
+        if not self._panel:
+            return
+        try:
+            self._panel.win.attributes("-topmost", False)
+        except Exception:
+            pass
+        if not self._panel_locked:
+            self._schedule_floating_hide()
+
+    def _cancel_floating_hide(self):
+        if self._floating_hide_job is not None:
+            try:
+                self._root.after_cancel(self._floating_hide_job)
+            except Exception:
+                pass
+            self._floating_hide_job = None
+
+    def _cancel_floating_hover(self):
+        if self._floating_hover_job is not None:
+            try:
+                self._root.after_cancel(self._floating_hover_job)
+            except Exception:
+                pass
+            self._floating_hover_job = None
+
+    def _schedule_floating_hide(self):
+        self._cancel_floating_hide()
+        if self._panel_locked or not self._panel:
+            return
+        delay = max(100, int(self.config.get("floating_hide_delay_ms", 400)))
+        self._floating_hide_job = self._root.after(delay, self._hide_hover_panel)
+
+    def _hide_hover_panel(self):
+        self._floating_hide_job = None
+        if not self._panel_locked and self._panel and self._panel.is_visible():
+            self._panel.hide()
+
+    def _show_panel_from_floating(self, locked=False):
+        if not self._panel:
+            return
+        self._cancel_floating_hide()
+        self._panel_locked = bool(locked)
+        position = self._floating_ball.panel_position() if self._floating_ball else None
+        self._prev_hwnd = clipboard_api.get_foreground_hwnd()
+        self._panel.show(self._prev_hwnd, position=position, topmost=True)
+
+    def _floating_enter(self):
+        if self._panel_locked:
+            return
+        delay = max(0, int(self.config.get("floating_hover_delay_ms", 200)))
+        self._cancel_floating_hide()
+        self._cancel_floating_hover()
+        if delay:
+            self._floating_hover_job = self._root.after(
+                delay, self._show_hover_panel)
+        else:
+            self._show_hover_panel()
+
+    def _show_hover_panel(self):
+        self._floating_hover_job = None
+        self._show_panel_from_floating()
+
+    def _floating_leave(self):
+        self._cancel_floating_hover()
+        self._schedule_floating_hide()
+
+    def _floating_click(self):
+        if self._panel_locked:
+            self._panel_locked = False
+            if self._panel:
+                self._panel.hide()
+        elif self._panel and self._panel.is_visible():
+            self._panel_locked = True
+        else:
+            self._show_panel_from_floating(locked=True)
+
+    def _floating_position_changed(self, x, y):
+        self.config["floating_x"] = int(x)
+        self.config["floating_y"] = int(y)
+        config_path = getattr(self.actions, "config_path", None)
+        if config_path:
+            try:
+                save_config(self.config, config_path)
+            except OSError:
+                traceback.print_exc()
+
     def _toggle_panel(self):
         if not self._panel:
+            return
+        if self._floating_ball:
+            self._floating_click()
             return
         now = time.monotonic()
         if now - self._last_panel_toggle < 0.35:
@@ -356,6 +479,168 @@ class UiServer:
 
     def get_prev_hwnd(self):
         return self._prev_hwnd
+
+
+class FloatingBall:
+    """桌面悬浮球，只控制 UiServer 当前的历史面板。"""
+
+    def __init__(self, ui):
+        self.ui = ui
+        tk = ui._tk
+        self.size = max(36, int(ui.config.get("floating_size", 52)))
+        from PIL import Image, ImageDraw, ImageTk
+        self._ImageTk = ImageTk
+        self.win = tk.Toplevel(ui._root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg="#010203")
+        try:
+            self.win.attributes("-transparentcolor", "#010203")
+        except tk.TclError:
+            pass
+
+        self.canvas = tk.Canvas(
+            self.win, width=self.size, height=self.size,
+            bg="#010203", highlightthickness=0, bd=0, cursor="hand2")
+        self.canvas.pack()
+        self._normal_photo, self._hover_photo = self._make_icons(
+            Image, ImageDraw, ImageTk)
+        self._icon_id = self.canvas.create_image(
+            self.size // 2, self.size // 2, image=self._normal_photo)
+
+        self._drag = None
+        self._dragged = False
+        self._place_initial()
+        self.canvas.bind("<Enter>", self._enter)
+        self.canvas.bind("<Leave>", self._leave)
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag_move)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+
+    def _make_icons(self, Image, ImageDraw, ImageTk):
+        """Create the Aurora Drop capsule in normal and hover states."""
+        scale = 4
+        size = self.size * scale
+        capsule_w = int(size * .78)
+        left = (size - capsule_w) // 2
+        right = left + capsule_w
+
+        def make(top_color, bottom_color, outline, hover):
+            image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            gradient = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            gradient_draw = ImageDraw.Draw(gradient)
+            top = 2 * scale
+            bottom = size - 2 * scale
+            radius = capsule_w // 2
+            top_rgb = top_color[:3]
+            bottom_rgb = bottom_color[:3]
+            for y in range(top, bottom + 1):
+                ratio = (y - top) / max(1, bottom - top)
+                color = tuple(round(top_rgb[i] * (1 - ratio) + bottom_rgb[i] * ratio)
+                              for i in range(3)) + (top_color[3],)
+                gradient_draw.line((left, y, right, y), fill=color, width=1)
+            mask = Image.new("L", (size, size), 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (left, top, right, bottom), radius=radius, fill=255)
+            image.paste(gradient, (0, 0), mask)
+            draw = ImageDraw.Draw(image)
+
+            # Abstract flowing paper mark: lines only, without a second box
+            # inside the capsule.
+            flow = (210, 255, 245, 235) if hover else (246, 249, 255, 235)
+            for offset in (0, 1, 2):
+                y = size * (.45 + offset * .105)
+                start = size * (.41 + offset * .015)
+                end = size * (.61 - offset * .015)
+                draw.line((start, y, end, y), fill=flow,
+                          width=max(scale, size // 30))
+            # Small status bead, kept inside the capsule.
+            bead = max(scale * 2, size // 13)
+            cx, cy = size // 2, size * .82
+            bead_color = (116, 255, 205, 240) if hover else (120, 211, 169, 210)
+            draw.ellipse((cx - bead, cy - bead, cx + bead, cy + bead), fill=bead_color)
+
+            image = image.resize((self.size, self.size), Image.Resampling.LANCZOS)
+            alpha = image.getchannel("A").point(lambda value: 0 if value < 100 else value)
+            image.putalpha(alpha)
+            return ImageTk.PhotoImage(image)
+
+        return (
+            make((25, 29, 54, 238), (46, 53, 92, 238), (123, 145, 218, 215), False),
+            make((31, 46, 82, 248), (43, 125, 151, 248), (150, 237, 255, 245), True),
+        )
+
+    def _enter(self, _event=None):
+        self.canvas.itemconfigure(self._icon_id, image=self._hover_photo)
+        self.ui._floating_enter()
+
+    def _leave(self, _event=None):
+        self.canvas.itemconfigure(self._icon_id, image=self._normal_photo)
+        self.ui._floating_leave()
+
+    def _place_initial(self):
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        x = self.ui.config.get("floating_x")
+        y = self.ui.config.get("floating_y")
+        try:
+            x, y = int(x), int(y)
+        except (TypeError, ValueError):
+            x = sw - self.size - 24
+            y = max(0, (sh - self.size) // 2)
+        x = max(0, min(x, sw - self.size))
+        y = max(0, min(y, sh - self.size))
+        self.win.geometry(f"{self.size}x{self.size}+{x}+{y}")
+
+    def _press(self, event):
+        self._drag = (event.x_root - self.win.winfo_x(),
+                      event.y_root - self.win.winfo_y())
+        self._dragged = False
+
+    def _drag_move(self, event):
+        if not self._drag:
+            return
+        dx, dy = self._drag
+        x = event.x_root - dx
+        y = event.y_root - dy
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        x = max(0, min(x, sw - self.size))
+        y = max(0, min(y, sh - self.size))
+        self.win.geometry(f"+{x}+{y}")
+        self._dragged = True
+
+    def _release(self, _event):
+        if self._dragged:
+            self.ui._floating_position_changed(
+                self.win.winfo_x(), self.win.winfo_y())
+        else:
+            self.ui._floating_click()
+        self._drag = None
+
+    def panel_position(self):
+        if not self.ui._panel:
+            return None
+        self.ui._panel.win.update_idletasks()
+        pw = self.ui._panel.win.winfo_width()
+        ph = self.ui._panel.win.winfo_height()
+        bx = self.win.winfo_x()
+        by = self.win.winfo_y()
+        bw = self.win.winfo_width()
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        if bx - pw - 12 >= 0:
+            x = bx - pw - 12
+        else:
+            x = bx + bw + 12
+        y = by + (self.size - ph) // 2
+        return max(0, min(x, sw - pw)), max(0, min(y, sh - ph))
+
+    def destroy(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
 
 
 
