@@ -878,6 +878,10 @@ class HistoryPanel:
             x = max(0, sw - 8 - pop.winfo_reqwidth())
         pop.geometry(f"+{x}+{y}")
         self._round_popup_background(pop, frame, T)
+        try:
+            pop.attributes("-topmost", bool(self.win.attributes("-topmost")))
+        except Exception:
+            pass
         pop.deiconify()
         pop.lift()
         self._popup_menu = pop
@@ -1665,12 +1669,53 @@ class HistoryPanel:
         if not row:
             self.status_var.set("未选中记录")
             return
+        self._delete_record(row["id"])
+
+    def _delete_record(self, clip_id):
+        """Delete one record while keeping the adjacent selection and scroll."""
+        clip_id = str(clip_id)
+        row = self._rows.get(clip_id) or self.db.get(clip_id)
+        if not row:
+            self.status_var.set("记录不存在")
+            return False
         if row["pinned"]:
             self.status_var.set(f"#{row['id']} 已收藏，不可删除；请先取消收藏")
-            return
-        self.db.delete(row["id"])
+            return False
+
+        ids = [str(item["id"]) for item in self._rows_displayed]
+        try:
+            index = ids.index(clip_id)
+        except ValueError:
+            index = -1
+        next_id = None
+        if index >= 0:
+            next_id = (ids[index + 1] if index + 1 < len(ids)
+                       else ids[index - 1] if index > 0 else None)
+
+        canvas = self._active_canvas()
+        yview = canvas.yview() if canvas is not None else None
+        if not self.db.delete(row["id"]):
+            self.status_var.set(f"#{row['id']} 删除失败")
+            return False
+
+        self._sel_id = next_id
         self.refresh()
+        if yview and canvas is not None and canvas.winfo_exists():
+            self.win.after_idle(lambda view=yview: self._restore_list_view(view))
         self.status_var.set(f"#{row['id']} 已删除")
+        return True
+
+    def _restore_list_view(self, yview):
+        canvas = self._active_canvas()
+        if canvas is None:
+            return
+        try:
+            first, _last = yview
+            current_first, current_last = canvas.yview()
+            if current_last - current_first < 0.999:
+                canvas.yview_moveto(min(max(0.0, first), 1.0))
+        except (TypeError, ValueError, RuntimeError):
+            pass
 
     # ---------- 面板 UI 构建（Ditto 风格卡片拾取器） ----------
     def _build_compact(self):
@@ -3096,13 +3141,8 @@ class DetailPane:
         row = self.row
         if row is None:
             return
-        if row["pinned"]:
-            self.panel.status_var.set(f"#{row['id']} 已收藏，不可删除；请先取消收藏")
-            return
-        self.panel.db.delete(row["id"])
-        self.panel.status_var.set(f"#{row['id']} 已删除")
-        self._cur_key = None
-        self.panel.refresh()
+        if self.panel._delete_record(row["id"]):
+            self._cur_key = None
 
     def _close_menu(self):
         menu, self._flat_menu = self._flat_menu, None

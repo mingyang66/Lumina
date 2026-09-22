@@ -350,6 +350,16 @@ class UiServer:
         """Stop covering other apps as soon as the user activates one."""
         if not self._panel:
             return
+        if getattr(self._panel, "_popup_open", False):
+            return
+        popup = getattr(self._panel, "_popup_menu", None)
+        focus = self._root.focus_get() if self._root else None
+        if popup is not None and focus is not None:
+            try:
+                if focus.winfo_toplevel() is popup:
+                    return
+            except Exception:
+                pass
         try:
             self._panel.win.attributes("-topmost", False)
         except Exception:
