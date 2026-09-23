@@ -1,30 +1,11 @@
 import hashlib
 import os
 import sqlite3
+import sys
 import threading
 
 FILE_STORE_DIR = "file_store"
 FILE_STORE_THRESHOLD = 1 * 1024 * 1024  # 1MB
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS clipboard (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK(kind IN ('text','image')),
-    content TEXT,
-    data BLOB,
-    file_path TEXT DEFAULT '',
-    file_status TEXT NOT NULL DEFAULT 'none',
-    hash TEXT NOT NULL,
-    source TEXT DEFAULT '',
-    category TEXT NOT NULL DEFAULT '',
-    pinned INTEGER NOT NULL DEFAULT 0,
-    tags TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-    UNIQUE(category, hash)
-);
-CREATE INDEX IF NOT EXISTS idx_clipboard_created ON clipboard(created_at);
-CREATE INDEX IF NOT EXISTS idx_clipboard_hash ON clipboard(hash);
-"""
 
 FTS_TRIGGERS = """
 CREATE TRIGGER IF NOT EXISTS clipboard_ai AFTER INSERT ON clipboard BEGIN
@@ -66,6 +47,19 @@ class Database:
         self._file_store_dir = os.path.join(db_dir, FILE_STORE_DIR)
         os.makedirs(self._file_store_dir, exist_ok=True)
 
+    @staticmethod
+    def _schema_path():
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            return os.path.join(base, "data", "schema.sql")
+        return os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "schema.sql")
+
+    def _load_schema(self):
+        with open(self._schema_path(), "r", encoding="utf-8") as stream:
+            return stream.read()
+
     def _store_file_on_disk(self, clip_id, data):
         """Write file data to disk, return relative path string."""
         ext = ".bin"
@@ -89,7 +83,7 @@ class Database:
         return conn
 
     def init_schema(self):
-        self.conn.executescript(SCHEMA)
+        self.conn.executescript(self._load_schema())
         self._migrate_columns()
         self._migrate_unique_constraint()
         self.conn.execute(
@@ -293,32 +287,43 @@ class Database:
         """Insert file metadata quickly; the worker fills file_data later."""
         path = os.path.abspath(path)
         h = hashlib.sha256(path.encode("utf-8")).hexdigest()
-        cur = self.conn.execute(
-            "INSERT INTO clipboard(kind, category, content, "
-            "file_status, hash, source, created_at) "
-            "VALUES ('text', 'file', ?, ?, ?, ?, "
-            "strftime('%Y-%m-%d %H:%M:%f','now','localtime'))",
-            (path, status, h, source or ""))
-        self.conn.commit()
-        return cur.lastrowid
+        try:
+            self.conn.execute(
+                "INSERT INTO clipboard(kind, category, content, "
+                "file_status, hash, source, created_at) "
+                "VALUES ('text', 'file', ?, ?, ?, ?, "
+                "strftime('%Y-%m-%d %H:%M:%f','now','localtime')) "
+                "ON CONFLICT(category, hash) DO UPDATE SET "
+                "source=excluded.source, "
+                "created_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime'), "
+                "file_status=CASE WHEN clipboard.file_status='ready' "
+                "THEN clipboard.file_status ELSE excluded.file_status END",
+                (path, status, h, source or ""))
+            self.conn.commit()
+            row = self.conn.execute(
+                "SELECT id FROM clipboard WHERE category='file' AND hash=?",
+                (h,)).fetchone()
+            return row["id"]
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def complete_file(self, clip_id, data):
-        digest = hashlib.sha256(data).hexdigest()
         if len(data) > FILE_STORE_THRESHOLD:
             rel_path = self._store_file_on_disk(clip_id, data)
             with self.conn:
                 self.conn.execute(
                     "UPDATE clipboard SET data=?, file_path=?, "
-                    "file_status='ready', hash=? "
+                    "file_status='ready' "
                     "WHERE id=?",
-                    (None, rel_path, digest, clip_id))
+                    (None, rel_path, clip_id))
         else:
             with self.conn:
                 self.conn.execute(
                     "UPDATE clipboard SET data=?, file_path='', "
-                    "file_status='ready', hash=? "
+                    "file_status='ready' "
                     "WHERE id=?",
-                    (data, digest, clip_id))
+                    (data, clip_id))
 
     def fail_file(self, clip_id, error):
         with self.conn:

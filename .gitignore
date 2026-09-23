@@ -10,7 +10,8 @@ ENV/
 
 # PyInstaller
 build/
-data/
+data/*
+!data/schema.sql
 *.spec
 !matrix_dash.spec
 
