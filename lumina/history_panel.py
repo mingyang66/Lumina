@@ -3,9 +3,7 @@ import ctypes
 import io
 import json
 import os
-import queue
 import re
-import shutil
 import threading
 import tempfile
 import time

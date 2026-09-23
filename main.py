@@ -1,6 +1,5 @@
 import argparse
 import os
-import shutil
 import sys
 
 from lumina.application import LuminaApp
@@ -8,25 +7,7 @@ from lumina.settings import load_config
 from lumina.database import Database
 
 
-def _migrate_db_path():
-    old_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lumina.db")
-    new_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "lumina.db")
-    if os.path.exists(old_db) and not os.path.exists(new_db):
-        os.makedirs(os.path.dirname(new_db), exist_ok=True)
-        try:
-            shutil.move(old_db, new_db)
-            for suffix in ("-wal", "-shm"):
-                src = old_db + suffix
-                dst = new_db + suffix
-                if os.path.exists(src):
-                    shutil.move(src, dst)
-            print("[lumina] database moved to data/lumina.db")
-        except Exception as e:
-            print(f"[lumina] database migration skipped: {e}")
-
-
 def cmd_run(cfg, config_path=None):
-    _migrate_db_path()
     LuminaApp(cfg, config_path).start()
 
 

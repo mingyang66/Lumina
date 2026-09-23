@@ -5,41 +5,16 @@ Tk 解释器。因此 toast 与面板共用这里的一个 UI 线程，通过队
 """
 import io
 import gc
-import ctypes
-import json
 import os
 import queue
-import re
-import shutil
 import threading
 import time
 import traceback
-from datetime import datetime, timedelta
 
 from . import clipboard_api
 from .region_selector import RegionSelector
 from .history_panel import HistoryPanel
 from .settings import save_config
-
-"""统一 UI 服务：单线程单 Tk root，同时管理 toast 提示与常驻历史面板。
-
-tkinter 要求所有窗口操作在创建它的同一线程内进行，且一个进程最好只有一个
-Tk 解释器。因此 toast 与面板共用这里的一个 UI 线程，通过队列接收外部指令。
-"""
-import io
-import gc
-import ctypes
-import json
-import os
-import queue
-import re
-import shutil
-import threading
-import time
-import traceback
-from datetime import datetime, timedelta
-
-
 
 class UiServer:
     BG = "#1e1e2e"
