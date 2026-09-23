@@ -74,20 +74,6 @@ class Database:
             f.write(data)
         return os.path.relpath(store_path, os.path.dirname(os.path.abspath(self.path)))
 
-    def _get_file_data(self, row):
-        """Get file bytes from either BLOB or file_path. Returns (bytes_or_none, is_stored_on_disk)."""
-        data = row["data"]
-        file_path = row["file_path"] if "file_path" in row.keys() else ""
-        if file_path:
-            abs_path = os.path.abspath(os.path.join(
-                os.path.dirname(os.path.abspath(self.path)), file_path))
-            if os.path.isfile(abs_path):
-                with open(abs_path, "rb") as stream:
-                    return stream.read(), True
-        if data:
-            return data, False
-        return None, False
-
     @property
     def conn(self):
         conn = getattr(self._local, "conn", None)

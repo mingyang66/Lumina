@@ -12,8 +12,6 @@ import time
 import traceback
 from datetime import datetime, timedelta
 
-import winreg
-
 from PIL import Image, ImageDraw, ImageTk
 
 from . import clipboard_api
@@ -2864,7 +2862,6 @@ class DetailPane:
         self._in_menu = False
         self._flat_menu = None
         self._body = None
-        self._image_click_after = None
         tk = self.tk
         self.frame = tk.Frame(parent, bg=self.BG, width=width)
         self.frame.pack(side="left", fill="y")
@@ -2956,7 +2953,6 @@ class DetailPane:
         if key == self._cur_key:
             return
         self._close_menu()
-        self._cur_key = key
         self.row = full
         self._photo = None
         self._urls = []
@@ -2967,17 +2963,28 @@ class DetailPane:
                 "image" if kind == "image" else "text")
         except (IndexError, KeyError):
             self.cat = "image" if kind == "image" else "text"
-        self._update_meta(full, kind)
-        for w in self._host.winfo_children():
-            w.destroy()
-        if kind == "image" and full["data"]:
-            self._build_image_body(self._host, full, self.tk)
-        elif self.cat == "file":
-            self._build_file_body(self._host, full, self.tk)
-        else:
-            self._build_text_body(self._host, full, self.tk)
-        self._body.bind("<Button-3>", self._menu)
-        self._update_actions()
+        try:
+            self._update_meta(full, kind)
+            for w in self._host.winfo_children():
+                w.destroy()
+            if kind == "image" and full["data"]:
+                self._build_image_body(self._host, full, self.tk)
+            elif self.cat == "file":
+                self._build_file_body(self._host, full, self.tk)
+            else:
+                self._build_text_body(self._host, full, self.tk)
+            if self._body is not None:
+                self._body.bind("<Button-3>", self._menu)
+            self._update_actions()
+            # Only suppress future renders after the complete body succeeded.
+            self._cur_key = key
+        except Exception:
+            self._cur_key = None
+            for w in self._host.winfo_children():
+                w.destroy()
+            self._body = None
+            self.panel.status_var.set("内容预览失败，请重新选择")
+            traceback.print_exc()
 
     def show_placeholder(self):
         self._close_menu()
@@ -3200,71 +3207,6 @@ class DetailPane:
             traceback.print_exc()
             self.panel.status_var.set("图片无法打开")
         return "break"
-
-    def _image_click(self, _event=None):
-        """延迟处理单击，给双击回贴保留判定时间。"""
-        if self._image_click_after is not None:
-            try:
-                self.frame.after_cancel(self._image_click_after)
-            except Exception:
-                pass
-        self._image_click_after = self.frame.after(220, self._show_image_zoom)
-
-    def _image_double_click(self, _event=None):
-        """双击不执行动作，仅取消单击放大，避免重复触发。"""
-        if self._image_click_after is not None:
-            try:
-                self.frame.after_cancel(self._image_click_after)
-            except Exception:
-                pass
-            self._image_click_after = None
-
-    def _show_image_zoom(self, data=None, title="图片预览"):
-        self._image_click_after = None
-        if data is None:
-            if self.row is None:
-                return
-            data = self.row["data"]
-        if not data:
-            return
-        from PIL import Image, ImageTk
-        try:
-            image = Image.open(io.BytesIO(data)).convert("RGB")
-        except Exception:
-            self.panel.status_var.set("图片无法预览")
-            return
-
-        win = self.tk.Toplevel(self.panel.win)
-        win.title(title)
-        win.configure(bg="#111111")
-        win.transient(self.panel.win)
-        win.bind("<Escape>", lambda _e: win.destroy())
-        def close_zoom(_event=None):
-            # 等当前鼠标事件处理完再销毁，避免事件落到底层原图再次放大。
-            win.after_idle(win.destroy)
-            return "break"
-
-        win.bind("<ButtonRelease-1>", close_zoom)
-
-        screen_w = win.winfo_screenwidth()
-        screen_h = win.winfo_screenheight()
-        max_w = max(320, int(screen_w * 0.88))
-        max_h = max(240, int(screen_h * 0.82))
-        scale = min(max_w / image.width, max_h / image.height, 1.0)
-        shown = image.resize((max(1, int(image.width * scale)),
-                              max(1, int(image.height * scale))), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(shown)
-        # Windows Tk 不支持 zoom-out 光标，使用通用手形光标。
-        label = self.tk.Label(win, image=photo, bg="#111111", cursor="hand2")
-        label.image = photo
-        label.pack(padx=12, pady=12)
-        label.bind("<ButtonRelease-1>", close_zoom)
-        win.update_idletasks()
-        x = max(0, (screen_w - win.winfo_width()) // 2)
-        y = max(0, (screen_h - win.winfo_height()) // 2)
-        win.geometry(f"+{x}+{y}")
-        win.grab_set()
-        win.focus_force()
 
     def _build_text_body(self, outer, row, tk):
         T = self.T
