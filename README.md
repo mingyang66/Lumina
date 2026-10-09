@@ -5,6 +5,7 @@
 ```powershell
 python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Lumina" `
     --add-data "config.json;." `
+    --add-data "data/schema.sql;data" `
     --hidden-import "tkinter" `
     --hidden-import "_tkinter" `
     --hidden-import "PIL" `
