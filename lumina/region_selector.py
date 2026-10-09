@@ -78,6 +78,8 @@ class RegionSelector:
         self._text_editor = None
         self._text_commit = None
         self._text_live_item = None
+        self._text_box_item = None
+        self._text_caret_item = None
         self._text_caret_job = None
         self._text_input_proxy = None
         self._text_click_binding = None
@@ -320,17 +322,21 @@ class RegionSelector:
         return buf.getvalue()
 
     # ---------- 选区工具栏 ----------
-    def _toolbar_icons(self):
-        if self._tb_icons:
-            return
-        from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageTk
+    def _toolbar_scale(self):
+        """统一紧凑比例，工具栏与属性浮框共同适配 DPI。"""
         try:
             dpi = self.win.winfo_fpixels("1i") / 96.0
         except Exception:
             dpi = 1.0
+        return 0.85 * max(0.8, min(dpi, 3.0))
+
+    def _toolbar_icons(self):
+        if self._tb_icons:
+            return
+        from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageTk
         # Tk9 的 image 按钮会忽略 padx/pady 与 ipadx/ipady，
         # 因此把内边距直接做进图标画布：字形 ~20px，画布 ~34px。
-        size = max(28, int(round(34 * max(0.8, min(dpi, 3.0)))))
+        size = max(20, int(round(34 * self._toolbar_scale())))
         ss = 3  # 超采样，图钉字形边缘更平滑
 
         def finalize(img_big):
@@ -574,7 +580,7 @@ class RegionSelector:
         self._update_tool_button_state()
 
     def _show_mosaic_style_popup(self):
-        """三档方块大小，尖角始终指向马赛克按钮（边缘处自动翻转）。"""
+        """三档圆点选项，尖角位于小/中圆点之间（边缘处自动翻转）。"""
         self._hide_mosaic_style_popup()
         if self._mosaic_tool_anchor is None:
             return
@@ -590,31 +596,36 @@ class RegionSelector:
             popup.attributes("-transparentcolor", transparent)
         except tk.TclError:
             pass
-        width, height, tip = 128, 52, 8
+        ui_scale = self._toolbar_scale()
+        px = lambda value: max(1, int(round(value * ui_scale)))
+        tip = px(8)
+        body_h = self._tb_bg_photo.height() if self._tb_bg_photo is not None else px(44)
+        width, height = px(128), body_h + tip
         ax, top, bottom = self._mosaic_tool_anchor
         ax += self.win.winfo_rootx()
         top += self.win.winfo_rooty()
         bottom += self.win.winfo_rooty()
-        left = max(4, min(int(ax - width // 2), self.sw - width - 4))
+        # 箭头落在最小圆（26）与中等圆（64）之间。
+        tip_x = px(45)
+        left = max(4, min(int(ax - tip_x), self.sw - width - 4))
         below = bottom + 6 + height <= self.sh - 4
         y = bottom + 6 if below else top - height - 6
         y = max(4, min(int(y), self.sh - height - 4))
-        tip_x = max(12, min(int(ax - left), width - 12))
         scale = 3
         bg = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
         dr = ImageDraw.Draw(bg)
         body_top, body_bottom = (tip, height - 1) if below else (0, height - tip - 1)
         dr.rounded_rectangle(
             (scale, body_top * scale, (width - 1) * scale, body_bottom * scale),
-            radius=9 * scale, fill="#ffffff", outline="#d6dce4", width=scale)
+            radius=px(9) * scale, fill="#ffffff", outline="#d6dce4", width=scale)
         base_y = body_top if below else body_bottom
         apex_y = 0 if below else height - 1
         dr.polygon([(tip_x * scale, apex_y * scale),
-                    ((tip_x - 6) * scale, base_y * scale),
-                    ((tip_x + 6) * scale, base_y * scale)], fill="#ffffff")
-        dr.line([((tip_x - 6) * scale, base_y * scale),
+                    ((tip_x - px(6)) * scale, base_y * scale),
+                    ((tip_x + px(6)) * scale, base_y * scale)], fill="#ffffff")
+        dr.line([((tip_x - px(6)) * scale, base_y * scale),
                  (tip_x * scale, apex_y * scale),
-                 ((tip_x + 6) * scale, base_y * scale)], fill="#d6dce4", width=scale)
+                 ((tip_x + px(6)) * scale, base_y * scale)], fill="#d6dce4", width=scale)
         popup._mosaic_bg = self._ImageTk.PhotoImage(
             bg.resize((width, height), Image.Resampling.LANCZOS))
         chrome = tk.Canvas(popup, width=width, height=height, bg=transparent,
@@ -622,17 +633,29 @@ class RegionSelector:
         chrome.pack()
         chrome.create_image(0, 0, image=popup._mosaic_bg, anchor="nw")
         cy = body_top + (body_bottom - body_top) // 2
+        popup._mosaic_dots = []  # 保留抗锯齿圆点图片，避免被回收。
         for index, radius in enumerate((3, 6, 10)):
-            cx = 26 + index * 38
+            cx = px(26) + index * px(38)
             selected = radius == self._mosaic_radius
             tag = f"mosaic-size-{radius}"
-            chrome.create_rectangle(cx - 16, cy - 16, cx + 16, cy + 16,
+            chrome.create_rectangle(cx - px(16), cy - px(16), cx + px(16), cy + px(16),
                                     fill="#e8f1ff" if selected else "#ffffff",
                                     outline="#3478f6" if selected else "#ffffff", tags=tag)
-            half = (3, 5, 8)[index]
-            chrome.create_rectangle(cx - half, cy - half, cx + half, cy + half,
-                                    fill="#3478f6" if selected else "#4d5962",
-                                    outline="", tags=tag)
+            half = (3, 5, 8)[index] * ui_scale
+            # Tk Canvas 圆形不支持抗锯齿：以 4 倍分辨率绘制再平滑缩小。
+            # 使用与选项一致的实色底，避免透明边缘出现黑边。
+            dot_size, supersample = int(round(half * 2)) + px(4), 4
+            dot = Image.new("RGB", (dot_size * supersample, dot_size * supersample),
+                            "#e8f1ff" if selected else "#ffffff")
+            center = dot_size * supersample / 2
+            r = half * supersample
+            ImageDraw.Draw(dot).ellipse(
+                (center - r, center - r, center + r - 1, center + r - 1),
+                fill="#3478f6" if selected else "#4d5962")
+            dot_photo = self._ImageTk.PhotoImage(
+                dot.resize((dot_size, dot_size), Image.Resampling.LANCZOS))
+            popup._mosaic_dots.append(dot_photo)
+            chrome.create_image(cx, cy, image=dot_photo, anchor="center", tags=tag)
             chrome.tag_bind(tag, "<Button-1>",
                             lambda _event, value=radius: self._set_mosaic_size(value))
             chrome.tag_bind(tag, "<Enter>", lambda _event: chrome.configure(cursor="hand2"))
@@ -672,6 +695,7 @@ class RegionSelector:
         tk = self.ui._tk
         from PIL import Image, ImageDraw, ImageTk
         popup = tk.Toplevel(self.win)
+        popup.withdraw()
         popup.overrideredirect(True)
         popup.attributes("-topmost", True)
         transparent = "#010203"
@@ -682,13 +706,15 @@ class RegionSelector:
             pass
         frame = tk.Frame(popup, bg="#ffffff", bd=0,
                          highlightthickness=0)
-        frame.pack(padx=8, pady=(10, 8))
-        block_size = 28
+        ui_scale = self._toolbar_scale()
+        px = lambda value: max(1, int(round(value * ui_scale)))
+        frame.pack(padx=px(8), pady=(px(10), px(8)))
+        block_size = px(28)
         for label, size in (("小", 14), ("中", 18), ("大", 26)):
             selected = size == self._text_font_size
             holder = tk.Frame(frame, bg="#3478f6" if selected else "#ffffff",
                               width=block_size, height=block_size)
-            holder.pack(side="left", padx=2)
+            holder.pack(side="left", padx=px(2))
             holder.pack_propagate(False)
             button = tk.Button(
                 holder, text=label,
@@ -697,16 +723,16 @@ class RegionSelector:
                 activebackground="#dbeaff", fg="#263238",
                 bd=0, relief="flat",
                 highlightthickness=0, width=1, height=1,
-                padx=0, pady=0, font=("Microsoft YaHei UI", 9, "bold"),
+                padx=0, pady=0, font=("Microsoft YaHei UI", max(7, px(9)), "bold"),
                 cursor="hand2")
-            button.pack(fill="both", expand=True, padx=2 if selected else 0,
-                        pady=2 if selected else 0)
-        tk.Frame(frame, bg="#e1e5ea", width=1, height=block_size).pack(side="left", padx=6)
+            button.pack(fill="both", expand=True, padx=px(2) if selected else 0,
+                        pady=px(2) if selected else 0)
+        tk.Frame(frame, bg="#e1e5ea", width=1, height=block_size).pack(side="left", padx=px(6))
         for color in ("#ff3b30", "#111111", "#1677ff", "#07c160", "#ff9500"):
             selected = color.lower() == self._text_color.lower()
             holder = tk.Frame(frame, bg="#3478f6" if selected else "#ffffff",
                               width=block_size, height=block_size)
-            holder.pack(side="left", padx=2)
+            holder.pack(side="left", padx=px(2))
             holder.pack_propagate(False)
             color_button = tk.Button(holder, bg=color, activebackground=color,
                       bd=0, relief="flat",
@@ -714,46 +740,58 @@ class RegionSelector:
                       padx=0, pady=0, cursor="hand2",
                       text="✓" if selected else "",
                       fg="#ffffff" if selected else color,
-                      font=("Microsoft YaHei UI", 10, "bold"),
+                      font=("Microsoft YaHei UI", px(10), "bold"),
                       command=lambda value=color: self._set_text_color(value))
-            color_button.pack(fill="both", expand=True, padx=3 if selected else 1,
-                              pady=3 if selected else 1)
+            color_button.pack(fill="both", expand=True, padx=px(3) if selected else px(1),
+                              pady=px(3) if selected else px(1))
         self._text_style_popup = popup
         popup.update_idletasks()
+        tip = px(8)
         popup_w = max(1, popup.winfo_reqwidth())
-        popup_h = max(1, popup.winfo_reqheight())
+        body_h = self._tb_bg_photo.height() if self._tb_bg_photo is not None else px(44)
+        popup_h = body_h + tip
+        ax = self.win.winfo_rootx() + (int(x) if x is not None else 12)
+        bottom = self.win.winfo_rooty() + (int(y) if y is not None else 12)
+        button = self._tb_button_map.get("text")
+        button_h = button.winfo_height() if button is not None else 28
+        top = bottom - button_h
+        sw, sh = popup.winfo_screenwidth(), popup.winfo_screenheight()
+        # 左内边距 + 第一档宽度及外边距 + 第二档左边距及半宽。
+        # 窗口尚未显示时控件尺寸可能为 1，使用固定布局尺寸对齐“中”字。
+        tip_x = px(8) + block_size + 3 * px(2) + block_size // 2
+        left = max(4, min(int(ax - tip_x), sw - popup_w - 4))
+        below = bottom + offset + popup_h <= sh - 4
+        py = bottom + offset if below else top - offset - popup_h
+        py = max(4, min(py, sh - popup_h - 4))
+        body_top, body_bottom = (tip, popup_h - 1) if below else (0, body_h - 1)
+        frame.pack_forget()
+        frame.place(x=px(8), y=body_top + (body_h - block_size) // 2,
+                    width=popup_w - 2 * px(8), height=block_size)
         chrome = tk.Canvas(popup, width=popup_w, height=popup_h,
                            bg=transparent, bd=0, highlightthickness=0)
         chrome.place(x=0, y=0, width=popup_w, height=popup_h)
-        bg = Image.new("RGBA", (popup_w * 2, popup_h * 2), (0, 0, 0, 0))
-        ImageDraw.Draw(bg).rounded_rectangle(
-            (1, 1, popup_w * 2 - 2, popup_h * 2 - 2), radius=10 * 2,
-            fill="#ffffff", outline="#d6dce4", width=2)
+        scale = 3
+        bg = Image.new("RGBA", (popup_w * scale, popup_h * scale), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(bg)
+        dr.rounded_rectangle(
+            (scale, body_top * scale, (popup_w - 1) * scale, body_bottom * scale),
+            radius=px(9) * scale, fill="#ffffff", outline="#d6dce4", width=scale)
+        base_y = body_top if below else body_bottom
+        apex_y = 0 if below else popup_h - 1
+        dr.polygon([(tip_x * scale, apex_y * scale),
+                    ((tip_x - px(6)) * scale, base_y * scale),
+                    ((tip_x + px(6)) * scale, base_y * scale)], fill="#ffffff")
+        dr.line([((tip_x - px(6)) * scale, base_y * scale),
+                 (tip_x * scale, apex_y * scale),
+                 ((tip_x + px(6)) * scale, base_y * scale)], fill="#d6dce4", width=scale)
         popup._text_style_bg = ImageTk.PhotoImage(
             bg.resize((popup_w, popup_h), Image.Resampling.LANCZOS))
-        bg_item = chrome.create_image(0, 0, image=popup._text_style_bg, anchor="nw")
-        chrome.create_polygon(popup_w // 2, 0, popup_w // 2 - 6, 9,
-                              popup_w // 2 + 6, 9, fill="#ffffff", outline="")
-        # lower() 是窗口控件方法；这里需要降低 Canvas 内部图元，不能降低 Canvas 控件本身。
-        chrome.tag_lower(bg_item)
+        chrome.create_image(0, 0, image=popup._text_style_bg, anchor="nw")
         frame.lift()
-        if x is None or y is None:
-            x = self.win.winfo_rootx() + 12
-            y = self.win.winfo_rooty() + 12
-        else:
-            x = self.win.winfo_rootx() + int(x)
-            y = self.win.winfo_rooty() + int(y) + offset
-        sw = popup.winfo_screenwidth()
-        sh = popup.winfo_screenheight()
-        x -= popup.winfo_width() // 2
-        x = max(4, min(x, sw - popup.winfo_width() - 4))
-        y = max(4, min(y, sh - popup.winfo_height() - 4))
-        popup.geometry(f"+{x}+{y}")
-        # 箭头固定在属性栏顶部中央，位置只由文字工具按钮决定，不随鼠标移动。
+        popup.geometry(f"{popup_w}x{popup_h}+{left}+{py}")
         popup.deiconify()
         popup.update_idletasks()
         popup.lift()
-        popup.after(30, popup.lift)
 
     def _hide_text_style_popup(self):
         if self._text_style_popup is not None:
@@ -775,6 +813,10 @@ class RegionSelector:
         self._text_color = color
         if self._text_live_item is not None:
             self.canvas.itemconfigure(self._text_live_item, fill=color)
+        if self._text_box_item is not None:
+            self.canvas.itemconfigure(self._text_box_item, outline=color)
+        if self._text_caret_item is not None:
+            self.canvas.itemconfigure(self._text_caret_item, fill=color)
         if self._tool == "text" and self._text_tool_anchor is not None:
             self._show_text_style_popup(*self._text_tool_anchor, offset=8)
 
@@ -931,17 +973,19 @@ class RegionSelector:
         # 直接让 Canvas 接收键盘，避免任何 Entry 背景遮挡截图内容。
         input_box = self.canvas.create_rectangle(
             x, y, x + 132, y + 40,
-            outline="#ff3b30", width=2, fill="")
+            outline=self._text_color, width=2, fill="")
         live_item = self.canvas.create_text(
             text_x, text_y, text=initial_text, anchor="nw", fill=self._text_color,
             font=("Microsoft YaHei UI", self._text_font_size, "bold"))
         self._text_editor = live_item
         self._text_live_item = live_item
+        self._text_box_item = input_box
         # 属性栏固定在工具栏的“文字”按钮下方，不跟随截图中的编辑光标移动。
         if self._text_tool_anchor is not None:
             self._show_text_style_popup(*self._text_tool_anchor, offset=8)
         caret = self.canvas.create_line(text_x, text_y + 1, text_x, text_y + self._text_font_size + 9,
                                         fill=self._text_color, width=2)
+        self._text_caret_item = caret
         tk = self.ui._tk
         input_var = tk.StringVar(self.canvas, value=initial_text)
         input_proxy = tk.Entry(self.canvas, textvariable=input_var, width=1,
@@ -1004,6 +1048,8 @@ class RegionSelector:
             self._text_editor = None
             self._text_commit = None
             self._text_live_item = None
+            self._text_box_item = None
+            self._text_caret_item = None
             if commit and text:
                 self._record_annotation(("text", (x, y), text,
                                           self._text_font_size, self._text_color))
@@ -1388,10 +1434,7 @@ class RegionSelector:
             return
         from PIL import Image, ImageDraw, ImageTk
         tk = self.ui._tk
-        try:
-            dpi = max(0.8, min(self.win.winfo_fpixels("1i") / 96.0, 3.0))
-        except Exception:
-            dpi = 1.0
+        dpi = self._toolbar_scale()
         size = self._tb_icons["pin"][1]
         pad = max(3, int(round(4 * dpi)))
         gap = max(2, int(round(2 * dpi)))
