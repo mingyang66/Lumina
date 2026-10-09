@@ -83,6 +83,10 @@ class RegionSelector:
         self._text_click_binding = None
         self._text_style_popup = None
         self._text_tool_anchor = None
+        self._mosaic_style_popup = None
+        self._mosaic_tool_anchor = None
+        self._mosaic_radius = 6
+        self._draw_mosaic_radius = 6
         self._text_font_size = 18
         self._text_color = "#ff3b30"
         self._ocr_panel = None
@@ -258,6 +262,7 @@ class RegionSelector:
             return buf.getvalue()
         scale_x = result.width / max(1, x1 - x0)
         scale_y = result.height / max(1, y1 - y0)
+        mosaic_source = result.convert("RGB")
         draw = ImageDraw.Draw(result)
         for item in self._annotations:
             kind = item[0]
@@ -281,23 +286,25 @@ class RegionSelector:
                               (bx - length * math.cos(angle + .5), by - length * math.sin(angle + .5))]
                     draw.polygon(points, fill="#ff3b30")
             elif kind in ("brush", "mosaic"):
-                _, points = item
+                points = item[1]
                 pts = [(int((px - x0) * scale_x), int((py - y0) * scale_y)) for px, py in points]
                 if len(pts) > 1 and kind == "brush":
                     draw.line(pts, fill="#ff3b30", width=max(3, int(5 * min(scale_x, scale_y))), joint="curve")
                 elif kind == "mosaic":
-                    radius = max(4, int(7 * min(scale_x, scale_y)))
+                    logical_radius = item[2] if len(item) > 2 else 6
+                    radius_x = max(1, int(round(logical_radius * scale_x)))
+                    radius_y = max(1, int(round(logical_radius * scale_y)))
                     for (px, py), (src_x, src_y) in zip(pts, points):
                         sample_x = int((src_x - x0) * scale_x)
                         sample_y = int((src_y - y0) * scale_y)
                         sample_box = (
-                            max(0, sample_x - radius), max(0, sample_y - radius),
-                            min(result.width, sample_x + radius + 1),
-                            min(result.height, sample_y + radius + 1))
+                            max(0, sample_x - radius_x), max(0, sample_y - radius_y),
+                            min(result.width, sample_x + radius_x + 1),
+                            min(result.height, sample_y + radius_y + 1))
                         color = tuple(int(v) for v in ImageStat.Stat(
-                            result.convert("RGB").crop(sample_box)).mean)
-                        draw.rectangle((px - radius, py - radius, px + radius, py + radius),
-                                       fill=color)
+                            mosaic_source.crop(sample_box)).mean)
+                        draw.rectangle((px - radius_x, py - radius_y,
+                                        px + radius_x, py + radius_y), fill=color)
             elif kind == "text":
                 pos, text = item[1], item[2]
                 try:
@@ -559,8 +566,94 @@ class RegionSelector:
                 self._hide_text_style_popup()
         else:
             self._hide_text_style_popup()
+        if tool == "mosaic" and self._mosaic_tool_anchor is not None:
+            self._show_mosaic_style_popup()
+        else:
+            self._hide_mosaic_style_popup()
         self.canvas.configure(cursor="crosshair" if tool else "arrow")
         self._update_tool_button_state()
+
+    def _show_mosaic_style_popup(self):
+        """三档方块大小，尖角始终指向马赛克按钮（边缘处自动翻转）。"""
+        self._hide_mosaic_style_popup()
+        if self._mosaic_tool_anchor is None:
+            return
+        tk = self.ui._tk
+        from PIL import ImageDraw
+        popup = tk.Toplevel(self.win)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        transparent = "#010203"
+        popup.configure(bg=transparent)
+        try:
+            popup.attributes("-transparentcolor", transparent)
+        except tk.TclError:
+            pass
+        width, height, tip = 128, 52, 8
+        ax, top, bottom = self._mosaic_tool_anchor
+        ax += self.win.winfo_rootx()
+        top += self.win.winfo_rooty()
+        bottom += self.win.winfo_rooty()
+        left = max(4, min(int(ax - width // 2), self.sw - width - 4))
+        below = bottom + 6 + height <= self.sh - 4
+        y = bottom + 6 if below else top - height - 6
+        y = max(4, min(int(y), self.sh - height - 4))
+        tip_x = max(12, min(int(ax - left), width - 12))
+        scale = 3
+        bg = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(bg)
+        body_top, body_bottom = (tip, height - 1) if below else (0, height - tip - 1)
+        dr.rounded_rectangle(
+            (scale, body_top * scale, (width - 1) * scale, body_bottom * scale),
+            radius=9 * scale, fill="#ffffff", outline="#d6dce4", width=scale)
+        base_y = body_top if below else body_bottom
+        apex_y = 0 if below else height - 1
+        dr.polygon([(tip_x * scale, apex_y * scale),
+                    ((tip_x - 6) * scale, base_y * scale),
+                    ((tip_x + 6) * scale, base_y * scale)], fill="#ffffff")
+        dr.line([((tip_x - 6) * scale, base_y * scale),
+                 (tip_x * scale, apex_y * scale),
+                 ((tip_x + 6) * scale, base_y * scale)], fill="#d6dce4", width=scale)
+        popup._mosaic_bg = self._ImageTk.PhotoImage(
+            bg.resize((width, height), Image.Resampling.LANCZOS))
+        chrome = tk.Canvas(popup, width=width, height=height, bg=transparent,
+                           bd=0, highlightthickness=0)
+        chrome.pack()
+        chrome.create_image(0, 0, image=popup._mosaic_bg, anchor="nw")
+        cy = body_top + (body_bottom - body_top) // 2
+        for index, radius in enumerate((3, 6, 10)):
+            cx = 26 + index * 38
+            selected = radius == self._mosaic_radius
+            tag = f"mosaic-size-{radius}"
+            chrome.create_rectangle(cx - 16, cy - 16, cx + 16, cy + 16,
+                                    fill="#e8f1ff" if selected else "#ffffff",
+                                    outline="#3478f6" if selected else "#ffffff", tags=tag)
+            half = (3, 5, 8)[index]
+            chrome.create_rectangle(cx - half, cy - half, cx + half, cy + half,
+                                    fill="#3478f6" if selected else "#4d5962",
+                                    outline="", tags=tag)
+            chrome.tag_bind(tag, "<Button-1>",
+                            lambda _event, value=radius: self._set_mosaic_size(value))
+            chrome.tag_bind(tag, "<Enter>", lambda _event: chrome.configure(cursor="hand2"))
+            chrome.tag_bind(tag, "<Leave>", lambda _event: chrome.configure(cursor="arrow"))
+        self._mosaic_style_popup = popup
+        popup.geometry(f"{width}x{height}+{left}+{y}")
+        popup.deiconify()
+        popup.lift()
+
+    def _hide_mosaic_style_popup(self):
+        if self._mosaic_style_popup is not None:
+            try:
+                self._mosaic_style_popup.destroy()
+            except Exception:
+                pass
+            self._mosaic_style_popup = None
+
+    def _set_mosaic_size(self, radius):
+        self._mosaic_radius = radius
+        if self._tool == "mosaic":
+            self._show_mosaic_style_popup()
 
     def _update_tool_button_state(self):
         """用浅蓝选中态区分当前编辑工具，避免工具栏看起来像一排相同按钮。"""
@@ -717,6 +810,7 @@ class RegionSelector:
             else:
                 self._open_text_editor(e.x, e.y)
             return
+        self._draw_mosaic_radius = self._mosaic_radius
         self._draw_start = (e.x, e.y)
         self._draw_points = [(e.x, e.y)]
         self._draw_preview = None
@@ -727,7 +821,7 @@ class RegionSelector:
             self._draw_points.append((x, y))
             if len(self._draw_points) > 1:
                 if self._tool == "mosaic":
-                    radius = 6
+                    radius = self._draw_mosaic_radius
                     item_id = self.canvas.create_rectangle(
                         x - radius, y - radius, x + radius, y + radius,
                         fill=self._mosaic_color(x, y, radius),
@@ -755,6 +849,8 @@ class RegionSelector:
         self._clear_draw_preview()
         if self._tool in ("brush", "mosaic"):
             item = (self._tool, list(self._draw_points))
+            if self._tool == "mosaic":
+                item += (self._draw_mosaic_radius,)
             self._draw_points = []
         else:
             item = (self._tool, start, (e.x, e.y))
@@ -795,9 +891,9 @@ class RegionSelector:
                     continue
                 self._edit_items.append(fn(*a, *b, outline="#ff3b30", width=3))
             elif kind in ("brush", "mosaic"):
-                _, points = item
+                points = item[1]
                 if kind == "mosaic":
-                    radius = 6
+                    radius = item[2] if len(item) > 2 else 6
                     for px, py in points:
                         self._edit_items.append(self.canvas.create_rectangle(
                             px - radius, py - radius, px + radius, py + radius,
@@ -1003,6 +1099,7 @@ class RegionSelector:
         return "break"
 
     def _extract_text(self):
+        self._hide_mosaic_style_popup()
         from tkinter import messagebox
         try:
             import pytesseract
@@ -1338,6 +1435,10 @@ class RegionSelector:
             self._text_tool_anchor = (
                 inner_x + text_index * (size + gap) + size // 2,
                 inner_y + size)
+        mosaic_index = next(i for i, item in enumerate(buttons) if item[0] == "mosaic")
+        self._mosaic_tool_anchor = (
+            inner_x + mosaic_index * (size + gap) + size // 2,
+            inner_y, inner_y + size)
         # 以细分隔线划分编辑、识别、撤销和输出四组操作。
         for boundary in (6, 7, 9):
             sep_x = inner_x + boundary * (size + gap) - gap // 2
@@ -1388,6 +1489,8 @@ class RegionSelector:
             self._tooltip = None
 
     def _clear_toolbar(self):
+        self._hide_mosaic_style_popup()
+        self._mosaic_tool_anchor = None
         for item_id in self._tb_item_ids:
             try:
                 self.canvas.delete(item_id)
@@ -1469,6 +1572,7 @@ class RegionSelector:
     def _finish(self, png, pin=False, pos=None, source="region"):
         if self.done:
             return
+        self._hide_mosaic_style_popup()
         self.done = True
         self._clear_ocr_panel()
         try:

@@ -32,3 +32,5 @@ err.log
 *.db
 *.db-shm
 *.db-wal
+.workbuddy
+outputs/*
