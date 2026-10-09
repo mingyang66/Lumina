@@ -68,6 +68,11 @@ class RegionSelector:
         self._tb_bg_photo = None  # 圆角背景 PhotoImage（防 GC）
         self._tb_icons = {}       # 图标 PhotoImage 引用（防 GC）
         self._tool = None
+        self._drawing_styles = {tool: [3, "#ff3b30"]
+                                for tool in ("rect", "oval", "arrow", "brush")}
+        self._drawing_style_popup = None
+        self._drawing_tool_anchors = {}
+        self._draw_style = (3, "#ff3b30")
         self._draw_start = None
         self._draw_preview = None
         self._draw_preview_items = []
@@ -75,6 +80,7 @@ class RegionSelector:
         self._annotations = []
         self._redo = []
         self._edit_items = []
+        self._oval_photos = {}
         self._text_editor = None
         self._text_commit = None
         self._text_live_item = None
@@ -269,29 +275,29 @@ class RegionSelector:
         for item in self._annotations:
             kind = item[0]
             if kind in ("rect", "oval", "arrow"):
-                _, a, b = item
+                _, a, b = item[:3]
+                line_width = item[3] if len(item) > 3 else 3
+                color = item[4] if len(item) > 4 else "#ff3b30"
                 coords = tuple(int(v) for p in (a, b)
                                for v in ((p[0] - x0) * scale_x, (p[1] - y0) * scale_y))
-                width = max(2, int(3 * min(scale_x, scale_y)))
+                width = max(1, int(round(line_width * min(scale_x, scale_y))))
                 if kind == "rect":
-                    draw.rectangle(coords, outline="#ff3b30", width=width)
+                    draw.rectangle(coords, outline=color, width=width)
                 elif kind == "oval":
-                    draw.ellipse(coords, outline="#ff3b30", width=width)
+                    oval, pos = self._smooth_oval_image(coords[:2], coords[2:], width, color)
+                    result.alpha_composite(oval, dest=pos)
                 else:
-                    draw.line(coords, fill="#ff3b30", width=width)
-                    import math
-                    ax, ay, bx, by = coords
-                    angle = math.atan2(by - ay, bx - ax)
-                    length = max(12, int(16 * min(scale_x, scale_y)))
-                    points = [(bx, by),
-                              (bx - length * math.cos(angle - .5), by - length * math.sin(angle - .5)),
-                              (bx - length * math.cos(angle + .5), by - length * math.sin(angle + .5))]
-                    draw.polygon(points, fill="#ff3b30")
+                    stroke, pos = self._smooth_stroke_image([coords[:2], coords[2:]], width, color, arrow=True)
+                    result.alpha_composite(stroke, dest=pos)
             elif kind in ("brush", "mosaic"):
                 points = item[1]
                 pts = [(int((px - x0) * scale_x), int((py - y0) * scale_y)) for px, py in points]
-                if len(pts) > 1 and kind == "brush":
-                    draw.line(pts, fill="#ff3b30", width=max(3, int(5 * min(scale_x, scale_y))), joint="curve")
+                if pts and kind == "brush":
+                    brush_width = item[2] if len(item) > 2 else 5
+                    brush_color = item[3] if len(item) > 3 else "#ff3b30"
+                    stroke, pos = self._smooth_stroke_image(
+                        pts, max(1, int(round(brush_width * min(scale_x, scale_y)))), brush_color)
+                    result.alpha_composite(stroke, dest=pos)
                 elif kind == "mosaic":
                     logical_radius = item[2] if len(item) > 2 else 6
                     radius_x = max(1, int(round(logical_radius * scale_x)))
@@ -576,6 +582,10 @@ class RegionSelector:
             self._show_mosaic_style_popup()
         else:
             self._hide_mosaic_style_popup()
+        if tool in self._drawing_styles:
+            self._show_drawing_style_popup()
+        else:
+            self._hide_drawing_style_popup()
         self.canvas.configure(cursor="crosshair" if tool else "arrow")
         self._update_tool_button_state()
 
@@ -639,14 +649,13 @@ class RegionSelector:
             selected = radius == self._mosaic_radius
             tag = f"mosaic-size-{radius}"
             chrome.create_rectangle(cx - px(16), cy - px(16), cx + px(16), cy + px(16),
-                                    fill="#e8f1ff" if selected else "#ffffff",
-                                    outline="#3478f6" if selected else "#ffffff", tags=tag)
+                                    fill="#ffffff", outline="", tags=tag)
             half = (3, 5, 8)[index] * ui_scale
             # Tk Canvas 圆形不支持抗锯齿：以 4 倍分辨率绘制再平滑缩小。
             # 使用与选项一致的实色底，避免透明边缘出现黑边。
             dot_size, supersample = int(round(half * 2)) + px(4), 4
             dot = Image.new("RGB", (dot_size * supersample, dot_size * supersample),
-                            "#e8f1ff" if selected else "#ffffff")
+                            "#ffffff")
             center = dot_size * supersample / 2
             r = half * supersample
             ImageDraw.Draw(dot).ellipse(
@@ -690,8 +699,35 @@ class RegionSelector:
             except Exception:
                 pass
 
-    def _show_text_style_popup(self, x=None, y=None, offset=42):
-        self._hide_text_style_popup()
+    def _hide_drawing_style_popup(self):
+        if self._drawing_style_popup is not None:
+            try:
+                self._drawing_style_popup.destroy()
+            except Exception:
+                pass
+            self._drawing_style_popup = None
+
+    def _set_drawing_style(self, tool, width=None, color=None):
+        style = self._drawing_styles[tool]
+        if width is not None:
+            style[0] = width
+        if color is not None:
+            style[1] = color
+        if self._tool == tool:
+            self._show_drawing_style_popup()
+
+    def _show_drawing_style_popup(self):
+        anchor = self._drawing_tool_anchors.get(self._tool)
+        if anchor is None:
+            self._hide_drawing_style_popup()
+            return
+        self._show_text_style_popup(anchor[0], anchor[2], offset=8, drawing_tool=self._tool)
+
+    def _show_text_style_popup(self, x=None, y=None, offset=42, drawing_tool=None):
+        if drawing_tool is None:
+            self._hide_text_style_popup()
+        else:
+            self._hide_drawing_style_popup()
         tk = self.ui._tk
         from PIL import Image, ImageDraw, ImageTk
         popup = tk.Toplevel(self.win)
@@ -710,41 +746,79 @@ class RegionSelector:
         px = lambda value: max(1, int(round(value * ui_scale)))
         frame.pack(padx=px(8), pady=(px(10), px(8)))
         block_size = px(28)
-        for label, size in (("小", 14), ("中", 18), ("大", 26)):
-            selected = size == self._text_font_size
-            holder = tk.Frame(frame, bg="#3478f6" if selected else "#ffffff",
+        sizes = (("小", 1), ("中", 3), ("大", 6)) if drawing_tool else (("小", 14), ("中", 18), ("大", 26))
+        popup._style_dots = []
+        for index, (label, size) in enumerate(sizes):
+            selected = size == (self._drawing_styles[drawing_tool][0] if drawing_tool else self._text_font_size)
+            text_selected = selected and not drawing_tool
+            holder = tk.Frame(frame, bg="#3478f6" if text_selected else "#ffffff",
                               width=block_size, height=block_size)
             holder.pack(side="left", padx=px(2))
             holder.pack_propagate(False)
+            dot_photo = None
+            if drawing_tool:
+                half = (3, 5, 8)[index] * ui_scale
+                dot_size, ss = int(round(half * 2)) + px(4), 4
+                dot = Image.new("RGB", (dot_size * ss, dot_size * ss),
+                                "#ffffff")
+                center, r = dot_size * ss / 2, half * ss
+                ImageDraw.Draw(dot).ellipse(
+                    (center - r, center - r, center + r - 1, center + r - 1),
+                    fill="#3478f6" if selected else "#4d5962")
+                dot_photo = ImageTk.PhotoImage(dot.resize((dot_size, dot_size), Image.Resampling.LANCZOS))
+                popup._style_dots.append(dot_photo)
             button = tk.Button(
-                holder, text=label,
-                command=lambda value=size: self._set_text_size(value),
-                bg="#e8f1ff" if selected else "#ffffff",
-                activebackground="#dbeaff", fg="#263238",
+                holder, text="" if drawing_tool else label, image=dot_photo if drawing_tool else "",
+                command=(lambda value=size: self._set_drawing_style(drawing_tool, width=value))
+                        if drawing_tool else (lambda value=size: self._set_text_size(value)),
+                bg="#e8f1ff" if text_selected else "#ffffff",
+                activebackground="#dbeaff" if not drawing_tool else "#ffffff", fg="#263238",
                 bd=0, relief="flat",
                 highlightthickness=0, width=1, height=1,
                 padx=0, pady=0, font=("Microsoft YaHei UI", max(7, px(9)), "bold"),
                 cursor="hand2")
-            button.pack(fill="both", expand=True, padx=px(2) if selected else 0,
-                        pady=px(2) if selected else 0)
+            button.pack(fill="both", expand=True, padx=px(2) if text_selected else 0,
+                        pady=px(2) if text_selected else 0)
         tk.Frame(frame, bg="#e1e5ea", width=1, height=block_size).pack(side="left", padx=px(6))
-        for color in ("#ff3b30", "#111111", "#1677ff", "#07c160", "#ff9500"):
-            selected = color.lower() == self._text_color.lower()
-            holder = tk.Frame(frame, bg="#3478f6" if selected else "#ffffff",
+        popup._color_marks = []
+        for color in ("#ff3b30", "#111111", "#1677ff", "#07c160", "#ff9500", "#808080", "#ffffff"):
+            selected = color.lower() == (self._drawing_styles[drawing_tool][1] if drawing_tool else self._text_color).lower()
+            # 白色色块使用独立灰色底框，避免无边框按钮的高亮边缘被图片遮盖。
+            holder = tk.Frame(frame, bg="#808080" if color == "#ffffff" else "#ffffff",
                               width=block_size, height=block_size)
             holder.pack(side="left", padx=px(2))
             holder.pack_propagate(False)
+            mark_photo = None
+            if selected:
+                # 细勾号保留抗锯齿；白色色块用灰勾，其他色块用白勾配细描边。
+                mark_size, ss = block_size - 2 * px(1), 4
+                mark = Image.new("RGB", (mark_size * ss, mark_size * ss), color)
+                points = [(int(mark_size * x * ss), int(mark_size * y * ss))
+                          for x, y in ((.20, .50), (.42, .72), (.80, .28))]
+                dr = ImageDraw.Draw(mark)
+                dr.line(points, fill="#808080" if color == "#ffffff" else "#263238",
+                        width=max(1, int(round(2.5 * ui_scale * ss))), joint="curve")
+                dr.line(points, fill="#808080" if color == "#ffffff" else "#ffffff",
+                        width=max(1, int(round(1.5 * ui_scale * ss))), joint="curve")
+                mark_photo = ImageTk.PhotoImage(mark.resize((mark_size, mark_size), Image.Resampling.LANCZOS))
+                popup._color_marks.append(mark_photo)
             color_button = tk.Button(holder, bg=color, activebackground=color,
+                      image=mark_photo if selected else "",
                       bd=0, relief="flat",
+                      highlightthickness=0,
                       width=1, height=1,
                       padx=0, pady=0, cursor="hand2",
-                      text="✓" if selected else "",
+                      text="",
                       fg="#ffffff" if selected else color,
                       font=("Microsoft YaHei UI", px(10), "bold"),
-                      command=lambda value=color: self._set_text_color(value))
-            color_button.pack(fill="both", expand=True, padx=px(3) if selected else px(1),
-                              pady=px(3) if selected else px(1))
-        self._text_style_popup = popup
+                      command=(lambda value=color: self._set_drawing_style(drawing_tool, color=value))
+                              if drawing_tool else (lambda value=color: self._set_text_color(value)))
+            inset = px(2) if color == "#ffffff" else px(1)
+            color_button.pack(fill="both", expand=True, padx=inset, pady=inset)
+        if drawing_tool:
+            self._drawing_style_popup = popup
+        else:
+            self._text_style_popup = popup
         popup.update_idletasks()
         tip = px(8)
         popup_w = max(1, popup.winfo_reqwidth())
@@ -752,7 +826,7 @@ class RegionSelector:
         popup_h = body_h + tip
         ax = self.win.winfo_rootx() + (int(x) if x is not None else 12)
         bottom = self.win.winfo_rooty() + (int(y) if y is not None else 12)
-        button = self._tb_button_map.get("text")
+        button = self._tb_button_map.get(drawing_tool or "text")
         button_h = button.winfo_height() if button is not None else 28
         top = bottom - button_h
         sw, sh = popup.winfo_screenwidth(), popup.winfo_screenheight()
@@ -853,12 +927,88 @@ class RegionSelector:
                 self._open_text_editor(e.x, e.y)
             return
         self._draw_mosaic_radius = self._mosaic_radius
+        if self._tool in self._drawing_styles:
+            self._draw_style = tuple(self._drawing_styles[self._tool])
         self._draw_start = (e.x, e.y)
         self._draw_points = [(e.x, e.y)]
         self._draw_preview = None
 
+    @staticmethod
+    def _smooth_oval_image(a, b, width=3, color="#ff3b30"):
+        """超采样椭圆描边，透明图片覆盖截图，避免原生椭圆锯齿。"""
+        from PIL import ImageDraw
+        pad, ss = int(math.ceil(width)) + 2, 4
+        x0, x1 = sorted((int(a[0]), int(b[0])))
+        y0, y1 = sorted((int(a[1]), int(b[1])))
+        w, h = max(1, x1 - x0) + pad * 2 + 1, max(1, y1 - y0) + pad * 2 + 1
+        image = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
+        ImageDraw.Draw(image).ellipse(
+            (pad * ss, pad * ss, (pad + x1 - x0) * ss, (pad + y1 - y0) * ss),
+            outline=color, width=max(1, int(round(width * ss))))
+        return image.resize((w, h), Image.Resampling.LANCZOS), (x0 - pad, y0 - pad)
+
+    def _create_smooth_oval(self, a, b, width=3, color="#ff3b30"):
+        image, pos = self._smooth_oval_image(a, b, width, color)
+        photo = self._ImageTk.PhotoImage(image)
+        item = self.canvas.create_image(*pos, image=photo, anchor="nw")
+        self._oval_photos[item] = photo
+        return item
+
+    @staticmethod
+    def _smooth_stroke_image(points, width=3, color="#ff3b30", arrow=False):
+        """箭头/画笔统一超采样，圆端点与圆连接消除斜线、拐点毛边。"""
+        from PIL import ImageDraw
+        points = [(float(x), float(y)) for x, y in points]
+        if not points:
+            return Image.new("RGBA", (1, 1)), (0, 0)
+        head = []
+        line_points = list(points)
+        if arrow and len(points) > 1:
+            ax, ay = points[0]
+            bx, by = points[-1]
+            distance = math.hypot(bx - ax, by - ay)
+            if distance > 0:
+                ux, uy = (bx - ax) / distance, (by - ay) / distance
+                length = min(distance, width * 4 + 6)
+                half = min(length * .5, width + 3)
+                base = (bx - ux * length, by - uy * length)
+                head = [(bx, by), (base[0] - uy * half, base[1] + ux * half),
+                        (base[0] + uy * half, base[1] - ux * half)]
+                line_points = [(ax, ay), base]
+        all_points = points + head
+        pad, ss = int(math.ceil(width / 2)) + 3, 4
+        x0 = math.floor(min(x for x, _ in all_points)) - pad
+        y0 = math.floor(min(y for _, y in all_points)) - pad
+        w = math.ceil(max(x for x, _ in all_points)) - x0 + pad + 1
+        h = math.ceil(max(y for _, y in all_points)) - y0 + pad + 1
+        image = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(image)
+        coords = [((x - x0) * ss, (y - y0) * ss) for x, y in line_points]
+        stroke_width = max(1, int(round(width * ss)))
+        if len(coords) > 1:
+            dr.line(coords, fill=color, width=stroke_width, joint="curve")
+        radius = stroke_width / 2
+        for x, y in coords:
+            dr.ellipse((x - radius, y - radius, x + radius - 1, y + radius - 1), fill=color)
+        if head:
+            dr.polygon([((x - x0) * ss, (y - y0) * ss) for x, y in head], fill=color)
+        return image.resize((w, h), Image.Resampling.LANCZOS), (x0, y0)
+
+    def _create_smooth_stroke(self, points, width, color, arrow=False):
+        image, pos = self._smooth_stroke_image(points, width, color, arrow)
+        photo = self._ImageTk.PhotoImage(image)
+        item = self.canvas.create_image(*pos, image=photo, anchor="nw")
+        self._oval_photos[item] = photo
+        return item
+
     def _update_annotation(self, e):
         x, y = e.x, e.y
+        width, color = self._draw_style
+        if self._tool == "brush":
+            self._draw_points.append((x, y))
+            self._clear_draw_preview()
+            self._draw_preview = self._create_smooth_stroke(self._draw_points, width, color)
+            return
         if self._tool in ("brush", "mosaic"):
             self._draw_points.append((x, y))
             if len(self._draw_points) > 1:
@@ -870,20 +1020,21 @@ class RegionSelector:
                         outline="")
                 else:
                     item_id = self.canvas.create_line(
-                        self._draw_points[-2], self._draw_points[-1], fill="#ff3b30",
-                        width=5, capstyle="round")
+                        self._draw_points[-2], self._draw_points[-1], fill=color,
+                        width=width, capstyle="round")
                 self._draw_preview_items.append(item_id)
                 self._draw_preview = item_id
         else:
             if self._draw_preview is not None:
                 self.canvas.delete(self._draw_preview)
+                self._oval_photos.pop(self._draw_preview, None)
             x0, y0 = self._draw_start
             if self._tool == "rect":
-                self._draw_preview = self.canvas.create_rectangle(x0, y0, x, y, outline="#ff3b30", width=3)
+                self._draw_preview = self.canvas.create_rectangle(x0, y0, x, y, outline=color, width=width)
             elif self._tool == "oval":
-                self._draw_preview = self.canvas.create_oval(x0, y0, x, y, outline="#ff3b30", width=3)
+                self._draw_preview = self._create_smooth_oval((x0, y0), (x, y), width, color)
             else:
-                self._draw_preview = self.canvas.create_line(x0, y0, x, y, fill="#ff3b30", width=3, arrow="last")
+                self._draw_preview = self._create_smooth_stroke([(x0, y0), (x, y)], width, color, arrow=True)
 
     def _finish_annotation(self, e):
         start = self._draw_start
@@ -896,6 +1047,8 @@ class RegionSelector:
             self._draw_points = []
         else:
             item = (self._tool, start, (e.x, e.y))
+        if self._tool in self._drawing_styles:
+            item += self._draw_style
         if self._tool in ("rect", "oval", "arrow", "brush", "mosaic"):
             self._record_annotation(item)
 
@@ -913,6 +1066,7 @@ class RegionSelector:
         for item_id in item_ids:
             try:
                 self.canvas.delete(item_id)
+                self._oval_photos.pop(item_id, None)
             except Exception:
                 pass
         self._draw_preview_items = []
@@ -921,17 +1075,23 @@ class RegionSelector:
     def _redraw_annotations(self):
         for item_id in self._edit_items:
             self.canvas.delete(item_id)
+            self._oval_photos.pop(item_id, None)
         self._edit_items = []
         for annotation_index, item in enumerate(self._annotations):
             kind = item[0]
             if kind in ("rect", "oval", "arrow"):
-                _, a, b = item
-                fn = self.canvas.create_rectangle if kind == "rect" else self.canvas.create_oval
+                _, a, b = item[:3]
+                line_width = item[3] if len(item) > 3 else 3
+                color = item[4] if len(item) > 4 else "#ff3b30"
+                if kind == "oval":
+                    self._edit_items.append(self._create_smooth_oval(a, b, line_width, color))
+                    continue
+                fn = self.canvas.create_rectangle
                 if kind == "arrow":
-                    item_id = self.canvas.create_line(*a, *b, fill="#ff3b30", width=3, arrow="last")
+                    item_id = self._create_smooth_stroke([a, b], line_width, color, arrow=True)
                     self._edit_items.append(item_id)
                     continue
-                self._edit_items.append(fn(*a, *b, outline="#ff3b30", width=3))
+                self._edit_items.append(fn(*a, *b, outline=color, width=line_width))
             elif kind in ("brush", "mosaic"):
                 points = item[1]
                 if kind == "mosaic":
@@ -941,10 +1101,10 @@ class RegionSelector:
                             px - radius, py - radius, px + radius, py + radius,
                             fill=self._mosaic_color(px, py, radius),
                             outline=""))
-                elif len(points) > 1:
-                    self._edit_items.append(self.canvas.create_line(
-                        *[p for point in points for p in point], fill="#ff3b30",
-                        width=5, capstyle="round", smooth=True))
+                elif points:
+                    self._edit_items.append(self._create_smooth_stroke(
+                        points, item[2] if len(item) > 2 else 5,
+                        item[3] if len(item) > 3 else "#ff3b30"))
             elif kind == "text":
                 pos, text = item[1], item[2]
                 self._edit_items.append(self.canvas.create_text(*pos, text=text, anchor="nw",
@@ -1145,6 +1305,8 @@ class RegionSelector:
         return "break"
 
     def _extract_text(self):
+        self._hide_drawing_style_popup()
+        self._hide_text_style_popup()
         self._hide_mosaic_style_popup()
         from tkinter import messagebox
         try:
@@ -1251,6 +1413,7 @@ class RegionSelector:
         self._shot_photo = None
         for item_id in self._edit_items:
             self.canvas.delete(item_id)
+            self._oval_photos.pop(item_id, None)
         self._edit_items = []
         self._sel_box = None
 
@@ -1482,6 +1645,9 @@ class RegionSelector:
         self._mosaic_tool_anchor = (
             inner_x + mosaic_index * (size + gap) + size // 2,
             inner_y, inner_y + size)
+        self._drawing_tool_anchors = {
+            key: (inner_x + i * (size + gap) + size // 2, inner_y, inner_y + size)
+            for i, (key, _, _) in enumerate(buttons) if key in self._drawing_styles}
         # 以细分隔线划分编辑、识别、撤销和输出四组操作。
         for boundary in (6, 7, 9):
             sep_x = inner_x + boundary * (size + gap) - gap // 2
@@ -1532,6 +1698,10 @@ class RegionSelector:
             self._tooltip = None
 
     def _clear_toolbar(self):
+        self._hide_drawing_style_popup()
+        self._hide_text_style_popup()
+        self._drawing_tool_anchors = {}
+        self._text_tool_anchor = None
         self._hide_mosaic_style_popup()
         self._mosaic_tool_anchor = None
         for item_id in self._tb_item_ids:
@@ -1615,6 +1785,8 @@ class RegionSelector:
     def _finish(self, png, pin=False, pos=None, source="region"):
         if self.done:
             return
+        self._hide_drawing_style_popup()
+        self._hide_text_style_popup()
         self._hide_mosaic_style_popup()
         self.done = True
         self._clear_ocr_panel()
