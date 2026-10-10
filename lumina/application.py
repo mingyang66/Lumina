@@ -10,7 +10,7 @@ from PIL import Image
 from . import clipboard_api
 from .clipboard_listener import ClipboardListener
 from .media import grab_screen, image_to_dib, to_png
-from .settings import save_config, set_autostart
+from .settings import default_config_path, _resolve_db_path, save_config, set_autostart
 from .database import Database
 from .system_tray import TrayIcon
 from .text_classifier import classify_text
@@ -19,8 +19,9 @@ from .ui import UiServer
 
 class LuminaApp:
     def __init__(self, config, config_path=None):
+        self.config_path = os.path.abspath(config_path or default_config_path())
+        config = _resolve_db_path(config, self.config_path)
         self.config = config
-        self.config_path = config_path
         self.db = Database(config["db_path"])
         self.db.init_schema()
         self.ui = UiServer(self.db, config, actions=self)
@@ -98,8 +99,8 @@ class LuminaApp:
                     raise ValueError(f"file exceeds {max_bytes // 1024 // 1024} MB limit")
                 with open(path, "rb") as stream:
                     data = stream.read()
-                self.db.complete_file(clip_id, data)
-                self._log(f"file #{clip_id} archived ({size // 1024} KB)")
+                if self.db.complete_file(clip_id, data):
+                    self._log(f"file #{clip_id} archived ({size // 1024} KB)")
             except Exception as exc:
                 self.db.fail_file(clip_id, exc)
                 self._log(f"file #{clip_id} archive failed: {exc}")
@@ -203,11 +204,12 @@ class LuminaApp:
 
     def save_settings(self, values):
         """Persist settings edited by the UI settings dialog."""
+        updated = _resolve_db_path({**self.config, **values}, self.config_path)
+        # 先确保自启动指向的配置已持久化，保存失败时不改注册表。
+        save_config(updated, self.config_path)
         if "autostart" in values:
             set_autostart(values["autostart"], self.config_path)
-        self.config.update(values)
-        if self.config_path:
-            save_config(self.config, self.config_path)
+        self.config.update(updated)
 
     def copy_to_clipboard(self, row):
         """面板回贴/复制：写入剪贴板并抑制自身监听（内容已在库）。
@@ -226,11 +228,8 @@ class LuminaApp:
                     file_path = row["file_path"] if "file_path" in row.keys() else ""
 
             if file_path and data is None:
-                abs_path = os.path.join(
-                    os.path.dirname(os.path.abspath(self.db.path)),
-                    file_path)
-                if os.path.exists(abs_path):
-                    data = open(abs_path, "rb").read()
+                archived = self.db.get_file_data(row['id'])
+                data = archived['data'] if archived else None
 
             if row["kind"] == "image":
                 img = Image.open(io.BytesIO(data))

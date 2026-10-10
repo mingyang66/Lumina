@@ -711,6 +711,8 @@ class PinWindow:
         if new_scale != self._scale:
             self._scale = new_scale
             self._apply_scale()
+        # Label 的 bindtags 还包含 Toplevel，阻止同一滚轮事件再次缩放。
+        return "break"
 
     def close(self):
         try:

@@ -2,12 +2,12 @@ import argparse
 import os
 import sys
 
-from lumina.application import LuminaApp
-from lumina.settings import load_config
+from lumina.settings import default_config_path, load_config
 from lumina.database import Database
 
 
 def cmd_run(cfg, config_path=None):
+    from lumina.application import LuminaApp
     LuminaApp(cfg, config_path).start()
 
 
@@ -81,24 +81,23 @@ def cmd_export(cfg, clip_id, out):
             sys.exit(1)
         if row["kind"] == "image":
             out = out or f"clip_{clip_id}.png"
+            if row['data'] is None:
+                print(f'export failed: record {clip_id} has no image data', file=sys.stderr)
+                raise SystemExit(1)
             with open(out, "wb") as f:
                 f.write(row["data"])
         elif row["category"] == "file":
             out = out or os.path.basename(row["content"] or "") or f"file_{clip_id}"
-            data = row["data"]
-            if data is None and ("file_path" in row.keys()) and row["file_path"]:
-                abs_path = os.path.join(
-                    os.path.dirname(os.path.abspath(db.path)),
-                    row["file_path"])
-                if os.path.exists(abs_path):
-                    with open(abs_path, "rb") as f:
-                        data = f.read()
-            if data:
-                with open(out, "wb") as f:
-                    f.write(data)
-            else:
-                print(f"exported -> {out} (no data)")
-                return
+            try:
+                archived = db.get_file_data(clip_id)
+                data = archived['data'] if archived else None
+                if data is None:
+                    raise ValueError('record has no archived file data')
+            except (OSError, ValueError) as exc:
+                print(f'export failed: record {clip_id}: {exc}', file=sys.stderr)
+                raise SystemExit(1)
+            with open(out, 'wb') as stream:
+                stream.write(data)
         else:
             out = out or f"clip_{clip_id}.txt"
             with open(out, "w", encoding="utf-8") as f:
@@ -143,7 +142,7 @@ def main():
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
     parser = argparse.ArgumentParser(prog="lumina",
                                      description="clipboard & screenshot archiver (SQLite)")
-    default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    default_config = default_config_path()
     parser.add_argument("-c", "--config", default=default_config, help="config file path")
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("run", help="start monitoring (default)")
@@ -166,7 +165,11 @@ def main():
     sub.add_parser("stats", help="show database statistics")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    args.config = os.path.abspath(args.config)
+    try:
+        cfg = load_config(args.config)
+    except (OSError, ValueError, KeyError) as exc:
+        parser.exit(1, f'configuration error: {exc}\n')
     cmd = args.cmd or "run"
     if cmd == "run":
         cmd_run(cfg, args.config)

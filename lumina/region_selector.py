@@ -2,6 +2,7 @@
 import io
 import math
 import os
+import shutil
 import time
 import traceback
 import ctypes
@@ -78,11 +79,18 @@ class RegionSelector:
         self._draw_preview_items = []
         self._draw_points = []
         self._annotations = []
+        self._undo_stack = []
         self._redo = []
+        self._annotation_draw_time = 0.0
+        self._preview_point_index = 0
         self._edit_items = []
         self._oval_photos = {}
         self._text_editor = None
         self._text_commit = None
+        self._text_cancel = None
+        self._text_refresh = None
+        self._text_edit_index = None
+        self._text_click_bindings = []
         self._text_live_item = None
         self._text_box_item = None
         self._text_caret_item = None
@@ -108,10 +116,13 @@ class RegionSelector:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-3>", lambda e: self.cancel())
-        self.win.bind("<Escape>", lambda e: self.cancel())
+        self.win.bind("<Escape>", self._escape)
         self.win.bind("<Return>", lambda e: self._confirm())
-        self.win.bind_all("<Control-z>", lambda e: (self._undo(), "break")[1])
-        self.win.bind_all("<Control-y>", lambda e: (self._redo_action(), "break")[1])
+        self._keyboard_bindings = [
+            (sequence, self.win.bind(sequence, callback, add="+"))
+            for sequence, callback in (
+                ("<Control-z>", lambda e: self._undo()),
+                ("<Control-y>", lambda e: self._redo_action()))]
         self.win.focus_force()
         self.win.after_idle(self._show_initial_coordinates)
 
@@ -177,7 +188,7 @@ class RegionSelector:
         self._tool = None
         self._start = (max(0, min(e.x, self.sw)), max(0, min(e.y, self.sh)))
         self._sel_box = None
-        self._clear_draw_preview()
+        self._reset_annotations()
         self._clear_ocr_panel()
         if self._coord_id is not None:
             self.canvas.itemconfigure(self._coord_id, state="hidden")
@@ -282,7 +293,9 @@ class RegionSelector:
                                for v in ((p[0] - x0) * scale_x, (p[1] - y0) * scale_y))
                 width = max(1, int(round(line_width * min(scale_x, scale_y))))
                 if kind == "rect":
-                    draw.rectangle(coords, outline=color, width=width)
+                    left, right = sorted((coords[0], coords[2]))
+                    top, bottom = sorted((coords[1], coords[3]))
+                    draw.rectangle((left, top, right, bottom), outline=color, width=width)
                 elif kind == "oval":
                     oval, pos = self._smooth_oval_image(coords[:2], coords[2:], width, color)
                     result.alpha_composite(oval, dest=pos)
@@ -315,14 +328,11 @@ class RegionSelector:
                                         px + radius_x, py + radius_y), fill=color)
             elif kind == "text":
                 pos, text = item[1], item[2]
-                try:
-                    font_size = item[3] if len(item) > 3 else 20
-                    font = ImageFont.truetype("msyh.ttc", max(14, int(font_size * min(scale_x, scale_y))))
-                except Exception:
-                    font = ImageFont.load_default()
+                font_size = item[3] if len(item) > 3 else 18
                 color = item[4] if len(item) > 4 else "#ff3b30"
-                draw.text((int((pos[0] - x0) * scale_x), int((pos[1] - y0) * scale_y)), text,
-                          fill=color, font=font)
+                text_image = self._text_image(text, font_size, color, scale_x, scale_y)
+                result.alpha_composite(text_image, dest=(
+                    int((pos[0] - x0) * scale_x), int((pos[1] - y0) * scale_y)))
         buf = io.BytesIO()
         result.convert("RGB").save(buf, "PNG")
         return buf.getvalue()
@@ -570,6 +580,8 @@ class RegionSelector:
         }
 
     def _select_tool(self, tool):
+        if tool != "text" and self._text_commit is not None:
+            self._text_commit()
         self._tool = tool
         if tool == "text":
             if self._text_tool_anchor is not None:
@@ -878,15 +890,14 @@ class RegionSelector:
     def _set_text_size(self, size):
         self._text_font_size = size
         if self._text_live_item is not None:
-            self.canvas.itemconfigure(self._text_live_item,
-                                      font=("Microsoft YaHei UI", size, "bold"))
+            self._text_refresh()
         if self._tool == "text" and self._text_tool_anchor is not None:
             self._show_text_style_popup(*self._text_tool_anchor, offset=8)
 
     def _set_text_color(self, color):
         self._text_color = color
         if self._text_live_item is not None:
-            self.canvas.itemconfigure(self._text_live_item, fill=color)
+            self._text_refresh()
         if self._text_box_item is not None:
             self.canvas.itemconfigure(self._text_box_item, outline=color)
         if self._text_caret_item is not None:
@@ -901,7 +912,7 @@ class RegionSelector:
             existing = None
             for item_id in reversed(self.canvas.find_overlapping(e.x, e.y, e.x, e.y)):
                 try:
-                    if self.canvas.type(item_id) != "text":
+                    if self.canvas.type(item_id) not in ("text", "image"):
                         continue
                     tags = self.canvas.gettags(item_id)
                     index_tag = next((tag for tag in tags
@@ -918,7 +929,7 @@ class RegionSelector:
                     break
             if existing:
                 index, item = existing
-                self._annotations.pop(index)
+                self._text_edit_index = index
                 self._redraw_annotations()
                 self._text_font_size = item[3] if len(item) > 3 else 18
                 self._text_color = item[4] if len(item) > 4 else "#ff3b30"
@@ -929,23 +940,67 @@ class RegionSelector:
         self._draw_mosaic_radius = self._mosaic_radius
         if self._tool in self._drawing_styles:
             self._draw_style = tuple(self._drawing_styles[self._tool])
+        self._clear_draw_preview()
         self._draw_start = (e.x, e.y)
         self._draw_points = [(e.x, e.y)]
-        self._draw_preview = None
+        self._preview_point_index = 0
+        self._annotation_draw_time = 0.0
+
+    @staticmethod
+    def _text_image(text, size, color, scale_x=1.0, scale_y=1.0):
+        """文字用逻辑像素布局；预览与导出共用粗体字形和左上角。"""
+        from PIL import ImageDraw
+        size = max(1, int(round(size * scale_y)))
+        fonts = os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts")
+        for name in (os.path.join(fonts, "msyhbd.ttc"), "msyhbd.ttc",
+                     os.path.join(fonts, "seguisb.ttf"), "DejaVuSans-Bold.ttf"):
+            try:
+                font = ImageFont.truetype(name, size)
+                break
+            except OSError:
+                continue
+        else:
+            font = ImageFont.load_default(size=size)
+        bbox = font.getbbox(text or " ")
+        image = Image.new("RGBA", (max(1, bbox[2] - bbox[0]),
+                                  max(1, bbox[3] - bbox[1])), (0, 0, 0, 0))
+        ImageDraw.Draw(image).text((-bbox[0], -bbox[1]), text, font=font, fill=color)
+        if scale_x != scale_y:
+            image = image.resize((max(1, int(round(image.width * scale_x / scale_y))),
+                                  image.height), Image.Resampling.LANCZOS)
+        return image
+
+    @staticmethod
+    def _antialiased_image(w, h, paint):
+        """分块四倍超采样：单块超采样像素小于 17 MiB，保留最终品质。"""
+        from PIL import ImageDraw
+        ss, tile, halo = 4, 512, 4
+        result = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        for top in range(0, h, tile):
+            for left in range(0, w, tile):
+                tw, th = min(tile, w - left), min(tile, h - top)
+                image = Image.new("RGBA", ((tw + halo * 2) * ss,
+                                           (th + halo * 2) * ss), (0, 0, 0, 0))
+                paint(ImageDraw.Draw(image), left - halo, top - halo, ss)
+                small = image.resize((tw + halo * 2, th + halo * 2),
+                                     Image.Resampling.LANCZOS)
+                result.paste(small.crop((halo, halo, halo + tw, halo + th)), (left, top))
+                del image, small
+        return result
 
     @staticmethod
     def _smooth_oval_image(a, b, width=3, color="#ff3b30"):
         """超采样椭圆描边，透明图片覆盖截图，避免原生椭圆锯齿。"""
         from PIL import ImageDraw
-        pad, ss = int(math.ceil(width)) + 2, 4
+        pad = int(math.ceil(width)) + 2
         x0, x1 = sorted((int(a[0]), int(b[0])))
         y0, y1 = sorted((int(a[1]), int(b[1])))
         w, h = max(1, x1 - x0) + pad * 2 + 1, max(1, y1 - y0) + pad * 2 + 1
-        image = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
-        ImageDraw.Draw(image).ellipse(
-            (pad * ss, pad * ss, (pad + x1 - x0) * ss, (pad + y1 - y0) * ss),
-            outline=color, width=max(1, int(round(width * ss))))
-        return image.resize((w, h), Image.Resampling.LANCZOS), (x0 - pad, y0 - pad)
+        def paint(dr, tx, ty, scale):
+            dr.ellipse(((pad - tx) * scale, (pad - ty) * scale,
+                        (pad + x1 - x0 - tx) * scale, (pad + y1 - y0 - ty) * scale),
+                       outline=color, width=max(1, int(round(width * scale))))
+        return RegionSelector._antialiased_image(w, h, paint), (x0 - pad, y0 - pad)
 
     def _create_smooth_oval(self, a, b, width=3, color="#ff3b30"):
         image, pos = self._smooth_oval_image(a, b, width, color)
@@ -976,23 +1031,36 @@ class RegionSelector:
                         (base[0] + uy * half, base[1] - ux * half)]
                 line_points = [(ax, ay), base]
         all_points = points + head
-        pad, ss = int(math.ceil(width / 2)) + 3, 4
+        pad = int(math.ceil(width / 2)) + 3
         x0 = math.floor(min(x for x, _ in all_points)) - pad
         y0 = math.floor(min(y for _, y in all_points)) - pad
         w = math.ceil(max(x for x, _ in all_points)) - x0 + pad + 1
         h = math.ceil(max(y for _, y in all_points)) - y0 + pad + 1
-        image = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
-        dr = ImageDraw.Draw(image)
-        coords = [((x - x0) * ss, (y - y0) * ss) for x, y in line_points]
-        stroke_width = max(1, int(round(width * ss)))
-        if len(coords) > 1:
-            dr.line(coords, fill=color, width=stroke_width, joint="curve")
-        radius = stroke_width / 2
-        for x, y in coords:
-            dr.ellipse((x - radius, y - radius, x + radius - 1, y + radius - 1), fill=color)
-        if head:
-            dr.polygon([((x - x0) * ss, (y - y0) * ss) for x, y in head], fill=color)
-        return image.resize((w, h), Image.Resampling.LANCZOS), (x0, y0)
+        # 每段仅进入相交瓦片；长画笔不会在每块重扫全部历史点。
+        segments = list(zip(line_points, line_points[1:])) or [(points[0], points[0])]
+        bins = {}
+        margin = width / 2 + 4
+        for a, b in segments:
+            left = max(0, int((min(a[0], b[0]) - x0 - margin) // 512))
+            right = min((w - 1) // 512, int((max(a[0], b[0]) - x0 + margin) // 512))
+            top = max(0, int((min(a[1], b[1]) - y0 - margin) // 512))
+            bottom = min((h - 1) // 512, int((max(a[1], b[1]) - y0 + margin) // 512))
+            for row in range(top, bottom + 1):
+                for col in range(left, right + 1):
+                    bins.setdefault((col, row), []).append((a, b))
+
+        def paint(dr, tx, ty, scale):
+            stroke_width = max(1, int(round(width * scale)))
+            radius = stroke_width / 2
+            for a, b in bins.get(((tx + 4) // 512, (ty + 4) // 512), ()):
+                coords = [((x - x0 - tx) * scale, (y - y0 - ty) * scale) for x, y in (a, b)]
+                dr.line(coords, fill=color, width=stroke_width)
+                for x, y in coords:
+                    dr.ellipse((x - radius, y - radius, x + radius - 1, y + radius - 1), fill=color)
+            if head:
+                dr.polygon([((x - x0 - tx) * scale, (y - y0 - ty) * scale)
+                            for x, y in head], fill=color)
+        return RegionSelector._antialiased_image(w, h, paint), (x0, y0)
 
     def _create_smooth_stroke(self, points, width, color, arrow=False):
         image, pos = self._smooth_stroke_image(points, width, color, arrow)
@@ -1001,29 +1069,34 @@ class RegionSelector:
         self._oval_photos[item] = photo
         return item
 
-    def _update_annotation(self, e):
+    def _update_annotation(self, e, force=False):
         x, y = e.x, e.y
         width, color = self._draw_style
-        if self._tool == "brush":
-            self._draw_points.append((x, y))
-            self._clear_draw_preview()
-            self._draw_preview = self._create_smooth_stroke(self._draw_points, width, color)
-            return
         if self._tool in ("brush", "mosaic"):
-            self._draw_points.append((x, y))
-            if len(self._draw_points) > 1:
-                if self._tool == "mosaic":
-                    radius = self._draw_mosaic_radius
+            last = self._draw_points[-1]
+            if (x, y) != last and (force or math.hypot(x - last[0], y - last[1]) >= 1.0):
+                self._draw_points.append((x, y))
+        now = time.perf_counter()
+        if not force and now - self._annotation_draw_time < 0.033:
+            return
+        self._annotation_draw_time = now
+        if self._tool in ("brush", "mosaic"):
+            # 增量消费新采样，绝不逐次重绘整条历史笔划。
+            if self._tool == "brush":
+                points = self._draw_points[self._preview_point_index:]
+                for a, b in zip(points, points[1:]):
+                    item_id = self.canvas.create_line(*a, *b, fill=color,
+                        width=width, capstyle="round", joinstyle="round")
+                    self._draw_preview_items.append(item_id)
+                self._preview_point_index = len(self._draw_points) - 1
+            else:
+                radius = self._draw_mosaic_radius
+                for px, py in self._draw_points[self._preview_point_index:]:
                     item_id = self.canvas.create_rectangle(
-                        x - radius, y - radius, x + radius, y + radius,
-                        fill=self._mosaic_color(x, y, radius),
-                        outline="")
-                else:
-                    item_id = self.canvas.create_line(
-                        self._draw_points[-2], self._draw_points[-1], fill=color,
-                        width=width, capstyle="round")
-                self._draw_preview_items.append(item_id)
-                self._draw_preview = item_id
+                        px - radius, py - radius, px + radius, py + radius,
+                        fill=self._mosaic_color(px, py, radius), outline="")
+                    self._draw_preview_items.append(item_id)
+                self._preview_point_index = len(self._draw_points)
         else:
             if self._draw_preview is not None:
                 self.canvas.delete(self._draw_preview)
@@ -1032,11 +1105,13 @@ class RegionSelector:
             if self._tool == "rect":
                 self._draw_preview = self.canvas.create_rectangle(x0, y0, x, y, outline=color, width=width)
             elif self._tool == "oval":
-                self._draw_preview = self._create_smooth_oval((x0, y0), (x, y), width, color)
+                self._draw_preview = self.canvas.create_oval(x0, y0, x, y, outline=color, width=width)
             else:
-                self._draw_preview = self._create_smooth_stroke([(x0, y0), (x, y)], width, color, arrow=True)
+                self._draw_preview = self.canvas.create_line(x0, y0, x, y, fill=color,
+                    width=width, arrow="last", arrowshape=(width * 4 + 6, width * 4 + 6, width + 3))
 
     def _finish_annotation(self, e):
+        self._update_annotation(e, force=True)
         start = self._draw_start
         self._draw_start = None
         self._clear_draw_preview()
@@ -1054,9 +1129,30 @@ class RegionSelector:
 
     def _record_annotation(self, item):
         """提交一笔完整标注，所有工具共用同一撤销/恢复栈。"""
+        self._undo_stack.append(list(self._annotations))
         self._annotations.append(item)
         self._redo.clear()
         self._redraw_annotations()
+
+    def _escape(self, _event=None):
+        if self._text_cancel is not None:
+            return self._text_cancel()
+        self.cancel()
+        return "break"
+
+    def _reset_annotations(self):
+        if self._text_cancel is not None:
+            self._text_cancel()
+        self._draw_start = None
+        self._draw_points = []
+        self._preview_point_index = 0
+        self._clear_draw_preview()
+        self._annotations.clear()
+        self._undo_stack.clear()
+        self._redo.clear()
+        self._text_edit_index = None
+        self._redraw_annotations()
+        self._oval_photos.clear()
 
     def _clear_draw_preview(self):
         """删除当前笔划生成的全部临时线段，避免残留在正式标注层。"""
@@ -1078,6 +1174,8 @@ class RegionSelector:
             self._oval_photos.pop(item_id, None)
         self._edit_items = []
         for annotation_index, item in enumerate(self._annotations):
+            if annotation_index == self._text_edit_index:
+                continue
             kind = item[0]
             if kind in ("rect", "oval", "arrow"):
                 _, a, b = item[:3]
@@ -1107,10 +1205,13 @@ class RegionSelector:
                         item[3] if len(item) > 3 else "#ff3b30"))
             elif kind == "text":
                 pos, text = item[1], item[2]
-                self._edit_items.append(self.canvas.create_text(*pos, text=text, anchor="nw",
-                                                               fill=item[4] if len(item) > 4 else "#ff3b30",
-                                                               font=("Microsoft YaHei UI", item[3] if len(item) > 3 else 18, "bold"),
-                                                               tags=("annotation-text", f"annotation-text:{annotation_index}")))
+                photo = self._ImageTk.PhotoImage(self._text_image(
+                    text, item[3] if len(item) > 3 else 18,
+                    item[4] if len(item) > 4 else "#ff3b30"))
+                item_id = self.canvas.create_image(*pos, image=photo, anchor="nw",
+                    tags=("annotation-text", f"annotation-text:{annotation_index}"))
+                self._oval_photos[item_id] = photo
+                self._edit_items.append(item_id)
         for item_id in self._edit_items:
             self.canvas.tag_raise(item_id)
 
@@ -1129,14 +1230,18 @@ class RegionSelector:
     def _open_text_editor(self, x, y, initial_text=""):
         if self._text_editor is not None:
             return
-        text_x, text_y = x + 6, y + 5
+        # 标注位置始终是文字布局左上角，输入框内边距不写入坐标。
+        text_x, text_y = x, y
+        x, y = text_x - 6, text_y - 5
+        edit_index = self._text_edit_index
         # 直接让 Canvas 接收键盘，避免任何 Entry 背景遮挡截图内容。
         input_box = self.canvas.create_rectangle(
             x, y, x + 132, y + 40,
             outline=self._text_color, width=2, fill="")
-        live_item = self.canvas.create_text(
-            text_x, text_y, text=initial_text, anchor="nw", fill=self._text_color,
-            font=("Microsoft YaHei UI", self._text_font_size, "bold"))
+        live_photo = self._ImageTk.PhotoImage(self._text_image(
+            initial_text, self._text_font_size, self._text_color))
+        live_item = self.canvas.create_image(text_x, text_y, image=live_photo, anchor="nw")
+        self._oval_photos[live_item] = live_photo
         self._text_editor = live_item
         self._text_live_item = live_item
         self._text_box_item = input_box
@@ -1179,14 +1284,14 @@ class RegionSelector:
         def finish(commit):
             if self._text_editor != live_item:
                 return "break"
-            text = state["text"].strip()
-            self.win.unbind_all("<KeyPress>")
-            if self._text_click_binding is not None:
+            text = input_var.get()
+            for widget, binding_id in self._text_click_bindings:
                 try:
-                    self.win.unbind_all("<ButtonPress-1>")
-                except Exception:
+                    widget.unbind("<ButtonPress-1>", binding_id)
+                except tk.TclError:
                     pass
-                self._text_click_binding = None
+            self._text_click_bindings = []
+            self._text_click_binding = None
             if self._text_caret_job is not None:
                 try:
                     self.win.after_cancel(self._text_caret_job)
@@ -1200,19 +1305,36 @@ class RegionSelector:
                     self.canvas.delete(caret)
             except Exception:
                 pass
+            input_var.trace_remove("write", trace_id)
             try:
                 input_proxy.destroy()
             except Exception:
                 pass
+            self._oval_photos.pop(live_item, None)
+            self._text_refresh = None
             self._text_input_proxy = None
             self._text_editor = None
             self._text_commit = None
+            self._text_cancel = None
+            self._text_edit_index = None
             self._text_live_item = None
             self._text_box_item = None
             self._text_caret_item = None
-            if commit and text:
-                self._record_annotation(("text", (x, y), text,
-                                          self._text_font_size, self._text_color))
+            before = list(self._annotations)
+            if commit:
+                replacement = ("text", (text_x, text_y), text,
+                               self._text_font_size, self._text_color)
+                if edit_index is not None:
+                    if text.strip():
+                        self._annotations[edit_index] = replacement
+                    else:
+                        self._annotations.pop(edit_index)
+                elif text.strip():
+                    self._annotations.append(replacement)
+                if self._annotations != before:
+                    self._undo_stack.append(before)
+                    self._redo.clear()
+            self._redraw_annotations()
             return "break"
 
         def commit(_event=None):
@@ -1225,7 +1347,10 @@ class RegionSelector:
             if self._text_editor != live_item:
                 return
             state["text"] = input_var.get()
-            self.canvas.itemconfigure(live_item, text=state["text"])
+            photo = self._ImageTk.PhotoImage(self._text_image(
+                state["text"], self._text_font_size, self._text_color))
+            self._oval_photos[live_item] = photo
+            self.canvas.itemconfigure(live_item, image=photo)
             bbox = self.canvas.bbox(live_item)
             if bbox:
                 left, top, right, bottom = bbox
@@ -1243,33 +1368,21 @@ class RegionSelector:
             self.canvas.itemconfigure(caret, state="normal")
             input_proxy.place(x=caret_x, y=text_y + 8, width=2, height=2)
 
-        def edit_key(event):
-            if event.keysym == "Return":
-                return commit(event)
-            if event.keysym == "Escape":
-                return cancel_edit(event)
-            if event.keysym == "BackSpace":
-                state["text"] = state["text"][:-1]
-            elif event.keysym == "Delete":
-                state["text"] = ""
-            elif event.state & 0x0004 and event.keysym.lower() == "a":
-                state["text"] = state["text"]
-            elif event.char and event.char.isprintable():
-                state["text"] += event.char
-            else:
-                return "break"
-            update_from_input()
-            return "break"
-
+        self._text_refresh = update_from_input
         self._text_commit = commit
-        # 文字编辑期间从整个截图窗口接收按键，避免工具栏控件抢走 Canvas 焦点。
-        input_var.trace_add("write", update_from_input)
+        self._text_cancel = cancel_edit
+        trace_id = input_var.trace_add("write", update_from_input)
         input_proxy.bind("<Return>", commit)
         input_proxy.bind("<Escape>", cancel_edit)
         input_proxy.focus_force()
-        # 监听截图窗口内所有点击，包括选区外和工具栏控件的点击。
-        self._text_click_binding = self.win.bind_all(
-            "<ButtonPress-1>", lambda _event: finish(bool(state["text"].strip())), add="+")
+
+        def outside_click(event):
+            # Canvas 自己先处理提交/打开；不能在同一次冒泡中提交新编辑器。
+            if event.widget not in (self.canvas, input_proxy):
+                finish(True)
+
+        binding_id = self.win.bind("<ButtonPress-1>", outside_click, add="+")
+        self._text_click_bindings = [(self.win, binding_id)]
 
     def _undo(self):
         if self._text_commit is not None:
@@ -1277,11 +1390,11 @@ class RegionSelector:
         if self._draw_start is not None:
             self._clear_draw_preview()
             self._draw_start = None
-        if self._annotations:
-            self._redo.append(self._annotations.pop())
-            self._redraw_annotations()
-        else:
-            self._redraw_annotations()
+        self._draw_points = []
+        if self._undo_stack:
+            self._redo.append(list(self._annotations))
+            self._annotations = self._undo_stack.pop()
+        self._redraw_annotations()
         try:
             if self.canvas.winfo_exists() and not self.done:
                 self.canvas.focus_set()
@@ -1291,11 +1404,15 @@ class RegionSelector:
         return "break"
 
     def _redo_action(self):
+        if self._text_commit is not None:
+            self._text_commit()
+        self._clear_draw_preview()
+        self._draw_start = None
+        self._draw_points = []
         if self._redo:
-            self._annotations.append(self._redo.pop())
-            self._redraw_annotations()
-        else:
-            self._redraw_annotations()
+            self._undo_stack.append(list(self._annotations))
+            self._annotations = self._redo.pop()
+        self._redraw_annotations()
         try:
             if self.canvas.winfo_exists() and not self.done:
                 self.canvas.focus_set()
@@ -1305,6 +1422,8 @@ class RegionSelector:
         return "break"
 
     def _extract_text(self):
+        if self._text_commit is not None:
+            self._text_commit()
         self._hide_drawing_style_popup()
         self._hide_text_style_popup()
         self._hide_mosaic_style_popup()
@@ -1411,10 +1530,8 @@ class RegionSelector:
                 self.canvas.delete(item_id)
         self._rect_id = self._shot_id = self._size_id = None
         self._shot_photo = None
-        for item_id in self._edit_items:
-            self.canvas.delete(item_id)
-            self._oval_photos.pop(item_id, None)
-        self._edit_items = []
+        self._reset_annotations()
+        self._tool = None
         self._sel_box = None
 
         # 使用独立透明窗口，避免全屏遮罩 Canvas 的矩形背景露在圆角卡片外。
@@ -1788,6 +1905,13 @@ class RegionSelector:
         self._hide_drawing_style_popup()
         self._hide_text_style_popup()
         self._hide_mosaic_style_popup()
+        self._reset_annotations()
+        for sequence, binding_id in self._keyboard_bindings:
+            self.win.unbind(sequence, binding_id)
+        self._keyboard_bindings = []
+        self._hide_tooltip()
+        self._clear_toolbar()
+        self._tb_icons.clear()
         self.done = True
         self._clear_ocr_panel()
         try:
