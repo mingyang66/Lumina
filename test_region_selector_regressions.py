@@ -160,9 +160,10 @@ def make_selector():
         _text_caret_job=None, _text_tool_anchor=None, _text_font_size=18,
         _text_color="#ff3b30", _draw_start=None, _draw_points=[],
         _draw_preview=None, _draw_preview_items=[], _preview_point_index=0,
-        _annotation_draw_time=0.0, _tool="text", _mosaic_radius=6,
-        _draw_mosaic_radius=6, _draw_style=(3, "#ff3b30"),
-        _drawing_styles={"brush": [3, "#ff3b30"]},
+        _annotation_draw_time=0.0, _tool="text", _mosaic_radius=12,
+        _draw_mosaic_radius=12, _draw_style=(6, "#ff3b30"),
+        _drawing_styles={tool: [6, "#ff3b30"]
+                         for tool in ("rect", "oval", "arrow", "brush")},
         _sel_box=(0, 0, 100, 100), sx=1, sy=1, sw=100, sh=100,
     )
     for name, value in state.items():
@@ -231,7 +232,7 @@ class RegionSelectorRegressionTests(unittest.TestCase):
         selector = make_selector()
         original = ("text", (10, 10), " padded ", 18, "#ff3b30")
         selector._record_annotation(original)
-        selector._record_annotation(("rect", (0, 0), (5, 5)))
+        selector._record_annotation(("rect", (0, 0), (5, 5), 6, "#ff3b30"))
         selector._undo()
         redo = list(selector._redo)
         depth = len(selector._undo_stack)
@@ -303,6 +304,41 @@ class RegionSelectorRegressionTests(unittest.TestCase):
         self.assertEqual(actual.tobytes(), expected.convert("RGB").tobytes())
         stretched = RegionSelector._text_image("Bold", 18, "#ff3b30", 2, 1)
         self.assertEqual(stretched.width, preview.width * 2)
+
+    def test_current_annotation_styles_preview_and_export(self):
+        selector = make_selector()
+        selector._annotations = [
+            ("rect", (2, 2), (25, 25), 2, "#808080"),
+            ("oval", (30, 2), (55, 25), 6, "#1677ff"),
+            ("arrow", (2, 35), (45, 50), 12, "#07c160"),
+            ("brush", [(5, 65), (45, 70)], 6, "#ff9500"),
+            ("mosaic", [(80, 80)], 12),
+            ("text", (60, 30), "A", 18, "#111111"),
+        ]
+        selector._redraw_annotations()
+        self.assertEqual(len(selector._edit_items), 6)
+        image = Image.open(io.BytesIO(selector._crop_box()))
+        self.assertEqual(image.size, (100, 100))
+        self.assertEqual(image.getpixel((2, 2)), (128, 128, 128))
+        self.assertNotEqual(image.tobytes(), selector.src.tobytes())
+
+    def test_incomplete_and_extra_annotation_fields_are_rejected(self):
+        for item in (
+            ("rect", (0, 0), (5, 5)),
+            ("oval", (0, 0), (5, 5), 6),
+            ("arrow", (0, 0), (5, 5)),
+            ("brush", [(0, 0), (5, 5)]),
+            ("mosaic", [(0, 0)]),
+            ("text", (0, 0), "old"),
+            ("rect", (0, 0), (5, 5), 6, "#ff3b30", "extra"),
+        ):
+            for method in ("_crop_box", "_redraw_annotations"):
+                with self.subTest(item=item, method=method):
+                    selector = make_selector()
+                    selector._annotations = [item]
+                    with self.assertRaises(ValueError):
+                        getattr(selector, method)()
+        self.assertNotIn("len(item)", SOURCE)
 
     def test_no_global_bindings_shutil_and_palette(self):
         self.assertNotIn("bind_all(", SOURCE)

@@ -3,7 +3,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import warnings
 
 
 def default_config_path():
@@ -15,25 +14,11 @@ def default_config_path():
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.json')
 
 
-def _resolve_db_path(cfg, config_path, legacy_dirs=()):
+def _resolve_db_path(cfg, config_path):
     raw = os.fspath(cfg['db_path'])
-    if raw == ':memory:' or os.path.isabs(raw):
-        return dict(cfg)
-    target = os.path.abspath(os.path.join(os.path.dirname(config_path), raw))
-    candidates = [target] + [os.path.abspath(os.path.join(base, raw))
-                             for base in (*legacy_dirs, os.getcwd())]
-    existing = []
-    for candidate in candidates:
-        if os.path.isfile(candidate) and not any(os.path.samefile(candidate, other)
-                                                for other in existing):
-            existing.append(candidate)
-    if len(existing) > 1:
-        raise ValueError('发现多个历史数据库，请在配置中显式指定绝对 db_path: ' + ', '.join(existing))
-    resolved = existing[0] if existing else target
-    if os.path.normcase(resolved) != os.path.normcase(target):
-        warnings.warn('继续使用旧历史数据库（未移动）: ' + resolved, RuntimeWarning)
     result = dict(cfg)
-    result['db_path'] = resolved
+    if raw != ':memory:' and not os.path.isabs(raw):
+        result['db_path'] = os.path.abspath(os.path.join(os.path.dirname(config_path), raw))
     return result
 
 AUTOSTART_VALUE = "Lumina"
@@ -70,31 +55,20 @@ def set_autostart(enabled, config_path):
 
 def load_config(path=None):
     path = os.path.abspath(path or default_config_path())
-    legacy_dirs = ((os.path.dirname(os.path.abspath(sys.executable)),)
-                   if getattr(sys, 'frozen', False) else ())
     bootstrap = (getattr(sys, 'frozen', False)
                  and os.path.normcase(path) == os.path.normcase(default_config_path())
                  and not os.path.exists(path))
     source = path
     if bootstrap:
-        executable_dir = os.path.dirname(os.path.abspath(sys.executable))
-        bundle_dir = getattr(sys, '_MEIPASS', executable_dir)
-        legacy_dirs = (executable_dir,)
-        # 优先使用可执行文件旁用户旧配置，解压目录仅作为默认模板。
-        source = os.path.join(executable_dir, 'config.json')
-        if not os.path.isfile(source):
-            source = os.path.join(bundle_dir, 'config.json')
+        bundle_dir = sys._MEIPASS
+        # 首次启动仅使用 bundle 默认模板，后续读取稳定配置。
+        source = os.path.join(bundle_dir, 'config.json')
     with open(source, 'r', encoding='utf-8') as stream:
         cfg = json.load(stream)
     if not isinstance(cfg, dict):
         raise ValueError(f'配置文件必须是 JSON 对象: {source}')
-    raw_db_path = cfg['db_path']
-    cfg = _resolve_db_path(cfg, path, legacy_dirs)
-    target = os.path.abspath(os.path.join(os.path.dirname(path), raw_db_path))
-    legacy_selected = (raw_db_path != ':memory:' and not os.path.isabs(raw_db_path)
-                       and os.path.normcase(cfg['db_path']) != os.path.normcase(target))
-    if bootstrap or legacy_selected:
-        # 固定兼容选择，后续自启动的工作目录变化不能重新丢失历史。
+    cfg = _resolve_db_path(cfg, path)
+    if bootstrap:
         save_config(cfg, path)
     return cfg
 

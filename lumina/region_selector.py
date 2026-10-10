@@ -286,9 +286,7 @@ class RegionSelector:
         for item in self._annotations:
             kind = item[0]
             if kind in ("rect", "oval", "arrow"):
-                _, a, b = item[:3]
-                line_width = item[3] if len(item) > 3 else 3
-                color = item[4] if len(item) > 4 else "#ff3b30"
+                _, a, b, line_width, color = item
                 coords = tuple(int(v) for p in (a, b)
                                for v in ((p[0] - x0) * scale_x, (p[1] - y0) * scale_y))
                 width = max(1, int(round(line_width * min(scale_x, scale_y))))
@@ -303,16 +301,16 @@ class RegionSelector:
                     stroke, pos = self._smooth_stroke_image([coords[:2], coords[2:]], width, color, arrow=True)
                     result.alpha_composite(stroke, dest=pos)
             elif kind in ("brush", "mosaic"):
-                points = item[1]
+                if kind == "brush":
+                    _, points, brush_width, brush_color = item
+                else:
+                    _, points, logical_radius = item
                 pts = [(int((px - x0) * scale_x), int((py - y0) * scale_y)) for px, py in points]
                 if pts and kind == "brush":
-                    brush_width = item[2] if len(item) > 2 else 5
-                    brush_color = item[3] if len(item) > 3 else "#ff3b30"
                     stroke, pos = self._smooth_stroke_image(
                         pts, max(1, int(round(brush_width * min(scale_x, scale_y)))), brush_color)
                     result.alpha_composite(stroke, dest=pos)
                 elif kind == "mosaic":
-                    logical_radius = item[2] if len(item) > 2 else 6
                     radius_x = max(1, int(round(logical_radius * scale_x)))
                     radius_y = max(1, int(round(logical_radius * scale_y)))
                     for (px, py), (src_x, src_y) in zip(pts, points):
@@ -327,9 +325,7 @@ class RegionSelector:
                         draw.rectangle((px - radius_x, py - radius_y,
                                         px + radius_x, py + radius_y), fill=color)
             elif kind == "text":
-                pos, text = item[1], item[2]
-                font_size = item[3] if len(item) > 3 else 18
-                color = item[4] if len(item) > 4 else "#ff3b30"
+                _, pos, text, font_size, color = item
                 text_image = self._text_image(text, font_size, color, scale_x, scale_y)
                 result.alpha_composite(text_image, dest=(
                     int((pos[0] - x0) * scale_x), int((pos[1] - y0) * scale_y)))
@@ -924,9 +920,8 @@ class RegionSelector:
                 index, item = existing
                 self._text_edit_index = index
                 self._redraw_annotations()
-                self._text_font_size = item[3] if len(item) > 3 else 18
-                self._text_color = item[4] if len(item) > 4 else "#ff3b30"
-                self._open_text_editor(item[1][0], item[1][1], item[2])
+                _, pos, text, self._text_font_size, self._text_color = item
+                self._open_text_editor(pos[0], pos[1], text)
             else:
                 self._open_text_editor(e.x, e.y)
             return
@@ -1171,9 +1166,7 @@ class RegionSelector:
                 continue
             kind = item[0]
             if kind in ("rect", "oval", "arrow"):
-                _, a, b = item[:3]
-                line_width = item[3] if len(item) > 3 else 3
-                color = item[4] if len(item) > 4 else "#ff3b30"
+                _, a, b, line_width, color = item
                 if kind == "oval":
                     self._edit_items.append(self._create_smooth_oval(a, b, line_width, color))
                     continue
@@ -1184,9 +1177,11 @@ class RegionSelector:
                     continue
                 self._edit_items.append(fn(*a, *b, outline=color, width=line_width))
             elif kind in ("brush", "mosaic"):
-                points = item[1]
+                if kind == "brush":
+                    _, points, line_width, color = item
+                else:
+                    _, points, radius = item
                 if kind == "mosaic":
-                    radius = item[2] if len(item) > 2 else 6
                     for px, py in points:
                         self._edit_items.append(self.canvas.create_rectangle(
                             px - radius, py - radius, px + radius, py + radius,
@@ -1194,13 +1189,11 @@ class RegionSelector:
                             outline=""))
                 elif points:
                     self._edit_items.append(self._create_smooth_stroke(
-                        points, item[2] if len(item) > 2 else 5,
-                        item[3] if len(item) > 3 else "#ff3b30"))
+                        points, line_width, color))
             elif kind == "text":
-                pos, text = item[1], item[2]
+                _, pos, text, font_size, color = item
                 photo = self._ImageTk.PhotoImage(self._text_image(
-                    text, item[3] if len(item) > 3 else 18,
-                    item[4] if len(item) > 4 else "#ff3b30"))
+                    text, font_size, color))
                 item_id = self.canvas.create_image(*pos, image=photo, anchor="nw",
                     tags=("annotation-text", f"annotation-text:{annotation_index}"))
                 self._oval_photos[item_id] = photo

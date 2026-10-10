@@ -43,43 +43,72 @@ class StorageTests(unittest.TestCase):
             finally:
                 db.close()
 
-    def test_single_legacy_blob_columns(self):
-        for columns, values, expected in (
-                ('image BLOB', (b'image',), b'image'),
-                ('file_data BLOB', (b'',), b''),
-                ('image BLOB, file_data BLOB', (None, b'file'), b'file'),
-                ('data BLOB, image BLOB', (b'existing', b'old'), b'existing')):
-            with self.subTest(columns=columns):
-                db = Database(':memory:')
-                try:
-                    db.conn.execute(
-                        'CREATE TABLE clipboard (id INTEGER PRIMARY KEY AUTOINCREMENT, '
-                        'kind TEXT, content TEXT, hash TEXT, source TEXT, created_at TEXT, '
-                        + columns + ')')
-                    placeholders = ','.join('?' for _ in values)
-                    db.conn.execute("INSERT INTO clipboard VALUES (1,'image',NULL,'h','','2020-01-01',"
-                                    + placeholders + ')', values)
-                    db.conn.commit()
-                    db.init_schema()
-                    self.assertEqual(db.get(1)['data'], expected)
-                    db.init_schema()
-                    self.assertEqual(db.get(1)['data'], expected)
-                finally:
-                    db.close()
+    def test_current_schema_data_and_reinitialization(self):
+        text = self.db.add_text('plain text', source='first')
+        image = self.db.add_image(b'image')
+        file = self.pending()
+        self.assertEqual(self.db.get(file)['file_status'], 'pending')
+        self.assertTrue(self.db.complete_file(file, b''))
+        self.assertEqual(self.db.add_text('plain text', source='second'), text)
+        code = self.db.add_text('plain text', category='code')
+        self.assertNotEqual(code, text)
+        self.db.set_tags(text, 'one,two')
+        self.db.set_pinned(text)
+        self.db.init_schema()
+        self.db.close()
+        self.db.init_schema()
+        columns = {row['name'] for row in self.db.conn.execute('PRAGMA table_info(clipboard)')}
+        self.assertIn('data', columns)
+        self.assertTrue(columns.isdisjoint({'image', 'file_data', 'file_name', 'file_error', 'file_size'}))
+        self.assertEqual(self.db.get(text)['category'], 'text')
+        self.assertEqual(self.db.get(text)['source'], 'second')
+        self.assertEqual(self.db.get(text)['tags'], 'one,two')
+        self.assertEqual(self.db.get(text)['pinned'], 1)
+        self.assertEqual(self.db.get(image)['data'], b'image')
+        self.assertEqual(self.db.get(image)['category'], 'image')
+        self.assertEqual(self.db.get_file_data(file)['data'], b'')
+        self.assertEqual(self.db.get(file)['file_status'], 'ready')
+        self.assertEqual(self.db.count(), 4)
+        self.assertEqual({row['id'] for row in self.db.search('plain')}, {text, code})
+        self.assertEqual({row['cat'] for row in self.db.stats()[0]}, {'text', 'code', 'image', 'file'})
 
-    def test_duplicate_migration_preserves_history(self):
+    def test_checkpoint_uses_current_wal_mode(self):
+        self.db.add_text('checkpoint')
+        self.assertEqual(self.db.conn.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
+        statements = []
+        self.db.conn.set_trace_callback(statements.append)
+        try:
+            self.db.checkpoint()
+        finally:
+            self.db.conn.set_trace_callback(None)
+        self.assertIn('PRAGMA wal_checkpoint(PASSIVE)', statements)
+        self.assertFalse(self.db.conn.in_transaction)
+
+    def test_legacy_schema_is_not_migrated(self):
         db = Database(':memory:')
         try:
             db.conn.execute('CREATE TABLE clipboard (id INTEGER PRIMARY KEY, kind TEXT, '
-                            'content TEXT, data BLOB, hash TEXT, source TEXT, created_at TEXT)')
-            db.conn.executemany("INSERT INTO clipboard VALUES (?,'text','same',NULL,'h','','2020-01-01')",
-                                [(1,), (2,)])
+                            'content TEXT, image BLOB, hash TEXT, source TEXT, created_at TEXT)')
+            db.conn.executemany("INSERT INTO clipboard VALUES (?,'image',NULL,?,'h','','2020-01-01')",
+                                [(1, b'one'), (2, b'two')])
             db.conn.commit()
-            with self.assertRaisesRegex(ValueError, '重复历史'):
+            schema = db.conn.execute("SELECT sql FROM sqlite_master WHERE name='clipboard'").fetchone()[0]
+            with self.assertRaises(sqlite3.OperationalError):
                 db.init_schema()
-            self.assertEqual(db.conn.execute('SELECT COUNT(*) FROM clipboard').fetchone()[0], 2)
+            self.assertEqual(db.conn.execute("SELECT sql FROM sqlite_master WHERE name='clipboard'").fetchone()[0], schema)
+            self.assertEqual([tuple(row) for row in db.conn.execute('SELECT id, image FROM clipboard')],
+                             [(1, b'one'), (2, b'two')])
         finally:
             db.close()
+
+    def test_initialization_does_not_backfill_records(self):
+        clip = self.pending()
+        with self.db.conn:
+            self.db.conn.execute("UPDATE clipboard SET category='', data=? WHERE id=?", (b'raw', clip))
+        self.db.init_schema()
+        self.assertEqual(self.db.get(clip)['category'], '')
+        self.assertEqual(self.db.get(clip)['file_status'], 'pending')
+        self.assertEqual(self.db.get(clip)['data'], b'raw')
 
     def test_delete_and_replace_archive(self):
         with patch('lumina.database.FILE_STORE_THRESHOLD', 1):
@@ -145,18 +174,25 @@ class StorageTests(unittest.TestCase):
                 self.assertIn(str(archived), captured.records[0].getMessage())
                 self.assertIsInstance(captured.records[0].exc_info[1], PermissionError)
 
-    def test_shared_old_archive_preserved_until_last_delete(self):
+    def test_current_archives_are_independent(self):
         with patch('lumina.database.FILE_STORE_THRESHOLD', 1):
             first, second = self.pending('one'), self.pending('two')
             self.db.complete_file(first, b'large')
-            path = self.db.get(first)['file_path']
-            with self.db.conn:
-                self.db.conn.execute('UPDATE clipboard SET file_path=? WHERE id=?', (path, second))
+            self.db.complete_file(second, b'large')
+            first_path = Path(self.db.get_file_data(first)['file_path'])
+            second_path = Path(self.db.get_file_data(second)['file_path'])
+            self.assertNotEqual(first_path, second_path)
+            self.assertEqual(self.pending('two'), second)
+            self.assertEqual(self.db.get_file_data(second)['file_path'], str(second_path))
+            self.db.complete_file(first, b'replacement')
+            replacement = Path(self.db.get_file_data(first)['file_path'])
+            self.assertNotEqual(replacement, first_path)
+            self.assertFalse(first_path.exists())
             self.db.delete(first)
-            self.assertTrue(self.db.resolve_file_path(path))
-            self.assertTrue(Path(self.db.resolve_file_path(path)).exists())
+            self.assertFalse(replacement.exists())
+            self.assertEqual(second_path.read_bytes(), b'large')
             self.db.delete(second)
-            self.assertFalse(Path(self.db.resolve_file_path(path)).exists())
+            self.assertFalse(second_path.exists())
 
     def test_escape_is_not_read_or_deleted(self):
         outside = self.root / 'outside.bin'
@@ -330,51 +366,81 @@ class ConfigTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({'db_path': db_path, 'autostart': False}), encoding='utf-8')
 
-    def test_relative_and_legacy_selection(self):
+    def test_relative_database_uses_only_config_directory(self):
         config = self.root / 'configdir' / 'config.json'
         self.write_config(config)
+        original = config.read_bytes()
         target = config.parent / 'data' / 'history.db'
-        self.assertEqual(settings.load_config(config)['db_path'], str(target))
         legacy = self.root / 'data' / 'history.db'
         legacy.parent.mkdir()
         legacy.write_bytes(b'legacy')
-        with self.assertWarns(RuntimeWarning):
-            cfg = settings.load_config(config)
-        self.assertEqual(cfg['db_path'], str(legacy))
-        self.assertEqual(json.loads(config.read_text(encoding='utf-8'))['db_path'], str(legacy))
-        settings.save_config(cfg, config)
-        self.assertEqual(settings.load_config(config)['db_path'], str(legacy))
-        self.write_config(config)
+        self.assertEqual(settings.load_config(config)['db_path'], str(target))
+        self.assertFalse(target.exists())
         target.parent.mkdir()
-        target.write_bytes(b'other')
-        with self.assertRaisesRegex(ValueError, '多个历史数据库'):
-            settings.load_config(config)
+        target.write_bytes(b'current')
+        self.assertEqual(settings.load_config(config)['db_path'], str(target))
+        elsewhere = self.root / 'elsewhere'
+        elsewhere.mkdir()
+        os.chdir(elsewhere)
+        self.assertEqual(settings.load_config(config)['db_path'], str(target))
+        self.assertEqual(config.read_bytes(), original)
         self.assertEqual(legacy.read_bytes(), b'legacy')
-        self.assertEqual(target.read_bytes(), b'other')
+        self.assertEqual(target.read_bytes(), b'current')
 
-    def test_frozen_bootstrap_stable_and_legacy_history(self):
+    def test_absolute_and_memory_database_paths_are_preserved(self):
+        config = self.root / 'configdir' / 'config.json'
+        for db_path in (str(self.root / 'absolute.db'), ':memory:'):
+            with self.subTest(db_path=db_path):
+                self.write_config(config, db_path)
+                original = config.read_bytes()
+                self.assertEqual(settings.load_config(config)['db_path'], db_path)
+                self.assertEqual(config.read_bytes(), original)
+
+    def test_frozen_bootstrap_uses_bundle_then_stable_config(self):
         executable = self.root / 'portable' / 'Lumina.exe'
         bundle = self.root / 'unpack'
         self.write_config(bundle / 'config.json')
-        self.write_config(executable.parent / 'config.json')
+        self.write_config(executable.parent / 'config.json', 'old/history.db')
+        legacy_config = (executable.parent / 'config.json').read_bytes()
         legacy = executable.parent / 'data' / 'history.db'
         legacy.parent.mkdir()
         legacy.write_bytes(b'old')
+        cwd_db = self.root / 'data' / 'history.db'
+        cwd_db.parent.mkdir()
+        cwd_db.write_bytes(b'cwd')
         with patch.object(sys, 'frozen', True, create=True), \
                 patch.object(sys, '_MEIPASS', str(bundle), create=True), \
                 patch.object(sys, 'executable', str(executable)), \
                 patch.dict(os.environ, {'LOCALAPPDATA': str(self.root / 'local')}):
             stable = Path(settings.default_config_path())
-            with self.assertWarns(RuntimeWarning):
-                cfg = settings.load_config()
+            cfg = settings.load_config()
+            target = str(stable.parent / 'data' / 'history.db')
             self.assertNotIn(str(bundle), str(stable))
             self.assertTrue(stable.is_file())
-            self.assertEqual(cfg['db_path'], str(legacy))
+            self.assertEqual(cfg['db_path'], target)
+            self.assertFalse(Path(target).exists())
+            self.assertEqual(json.loads(stable.read_text(encoding='utf-8')), cfg)
             cfg['autostart'] = True
             settings.save_config(cfg)
-            self.assertEqual(settings.load_config()['autostart'], True)
-            self.assertEqual(settings.load_config()['db_path'], str(legacy))
+            (bundle / 'config.json').unlink()
+            os.chdir(executable.parent)
+            self.assertEqual(settings.load_config(), cfg)
+        self.assertEqual((executable.parent / 'config.json').read_bytes(), legacy_config)
         self.assertEqual(legacy.read_bytes(), b'old')
+        self.assertEqual(cwd_db.read_bytes(), b'cwd')
+
+    def test_frozen_bootstrap_does_not_fallback_to_executable_config(self):
+        executable = self.root / 'portable' / 'Lumina.exe'
+        bundle = self.root / 'unpack'
+        bundle.mkdir()
+        self.write_config(executable.parent / 'config.json')
+        with patch.object(sys, 'frozen', True, create=True), \
+                patch.object(sys, '_MEIPASS', str(bundle), create=True), \
+                patch.object(sys, 'executable', str(executable)), \
+                patch.dict(os.environ, {'LOCALAPPDATA': str(self.root / 'local')}):
+            with self.assertRaises(FileNotFoundError):
+                settings.load_config()
+            self.assertFalse(Path(settings.default_config_path()).exists())
 
     def test_frozen_new_database_ignores_template_unpack_dir(self):
         executable = self.root / 'portable' / 'Lumina.exe'

@@ -84,13 +84,6 @@ class Database:
             path = self.resolve_file_path(stored_path)
         except ValueError:
             return
-        # 兼容可能共享同一归档路径的旧记录。
-        for row in self.conn.execute("SELECT file_path FROM clipboard WHERE file_path<>''"):
-            try:
-                if os.path.normcase(self.resolve_file_path(row[0])) == os.path.normcase(path):
-                    return
-            except ValueError:
-                continue
         try:
             os.remove(path)
         except FileNotFoundError:
@@ -130,148 +123,12 @@ class Database:
 
     def init_schema(self):
         self.conn.executescript(self._load_schema())
-        self._migrate_columns()
-        self._migrate_unique_constraint()
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_clipboard_pinned ON clipboard(pinned)")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_clipboard_category ON clipboard(category)")
-        self._backfill_category()
         self._init_fts()
         self.conn.commit()
-
-    def _migrate_columns(self):
-        cols = {r["name"] for r in
-                self.conn.execute("PRAGMA table_info(clipboard)").fetchall()}
-        if "pinned" not in cols:
-            self.conn.execute(
-                "ALTER TABLE clipboard ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
-        if "tags" not in cols:
-            self.conn.execute(
-                "ALTER TABLE clipboard ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
-        if "category" not in cols:
-            # 分类列：text/code/link/image/file。kind 保留存储语义(text/image)
-            # 不动 CHECK 约束，避免整表重建。
-            self.conn.execute(
-                "ALTER TABLE clipboard ADD COLUMN category TEXT NOT NULL DEFAULT ''")
-        for name, definition in (
-                ("file_status", "TEXT NOT NULL DEFAULT 'none'"),
-                ):
-            if name not in cols:
-                self.conn.execute(
-                    f"ALTER TABLE clipboard ADD COLUMN {name} {definition}")
-        if "data" not in cols:
-            self.conn.execute("ALTER TABLE clipboard ADD COLUMN data BLOB")
-        sources = [name for name in ("image", "file_data") if name in cols]
-        if sources:
-            expression = sources[0] if len(sources) == 1 else "COALESCE(" + ",".join(sources) + ")"
-            self.conn.execute(
-                "UPDATE clipboard SET data=" + expression + " WHERE data IS NULL")
-        if 'file_data' in cols:
-            self.conn.execute(
-                "UPDATE clipboard SET category='file' "
-                "WHERE file_data IS NOT NULL AND (category IS NULL OR category='')")
-        self.conn.execute(
-            "UPDATE clipboard SET file_status='ready' "
-            "WHERE category='file' AND data IS NOT NULL AND file_status='none'")
-        for old_name in ("image", "file_data"):
-            if old_name in cols:
-                try:
-                    self.conn.execute(f"ALTER TABLE clipboard DROP COLUMN {old_name}")
-                except sqlite3.OperationalError:
-                    pass
-        for old_name in ("file_name", "file_error"):
-            if old_name in cols:
-                try:
-                    self.conn.execute(f"ALTER TABLE clipboard DROP COLUMN {old_name}")
-                except sqlite3.OperationalError:
-                    pass
-        if "file_size" in cols:
-            try:
-                self.conn.execute("ALTER TABLE clipboard DROP COLUMN file_size")
-            except sqlite3.OperationalError:
-                pass
-        if "file_path" not in cols:
-            self.conn.execute(
-                "ALTER TABLE clipboard ADD COLUMN file_path TEXT DEFAULT ''")
-        self.conn.commit()
-
-    def _migrate_unique_constraint(self):
-        """Add UNIQUE(category, hash) constraint by recreating the table."""
-        schema_row = self.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE name='clipboard'").fetchone()
-        if schema_row and "UNIQUE(category, hash)" in schema_row[0]:
-            return
-
-        self._backfill_category()
-
-        duplicate = self.conn.execute(
-            "SELECT 1 FROM clipboard GROUP BY category, hash HAVING COUNT(*)>1 LIMIT 1"
-        ).fetchone()
-        if duplicate:
-            raise ValueError("旧数据库存在重复历史，已停止唯一约束迁移；请备份后显式处理重复记录")
-        self.conn.commit()
-
-        self.conn.execute("PRAGMA legacy_alter_table=ON")
-        try:
-            self.conn.executescript("""
-            BEGIN IMMEDIATE;
-            CREATE TABLE clipboard_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL CHECK(kind IN ('text','image')),
-                content TEXT,
-                data BLOB,
-                file_path TEXT DEFAULT '',
-                file_status TEXT NOT NULL DEFAULT 'none',
-                hash TEXT NOT NULL,
-                source TEXT DEFAULT '',
-                category TEXT NOT NULL DEFAULT '',
-                pinned INTEGER NOT NULL DEFAULT 0,
-                tags TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-                UNIQUE(category, hash)
-            );
-            INSERT INTO clipboard_new (id, kind, content, data, file_path,
-                file_status, hash, source, category, pinned, tags, created_at)
-            SELECT id, kind, content, data, file_path,
-                file_status, hash, source, category, pinned, tags, created_at
-            FROM clipboard;
-            DROP TABLE clipboard;
-            ALTER TABLE clipboard_new RENAME TO clipboard;
-            CREATE INDEX IF NOT EXISTS idx_clipboard_created ON clipboard(created_at);
-            CREATE INDEX IF NOT EXISTS idx_clipboard_hash ON clipboard(hash);
-            COMMIT;
-            """)
-        except Exception:
-            self.conn.rollback()
-            raise
-        finally:
-            self.conn.execute("PRAGMA legacy_alter_table=OFF")
-
-        self.conn.execute(
-            "DROP TABLE IF EXISTS clipboard_fts")
-        self._fts = None
-        self.conn.commit()
-
-    def _backfill_category(self):
-        """给旧记录补分类（category 为空的行），幂等，可反复执行。"""
-        from .text_classifier import classify_text
-        rows = self.conn.execute(
-            "SELECT id, kind, content FROM clipboard "
-            "WHERE category IS NULL OR category=''").fetchall()
-        if not rows:
-            return 0
-        for r in rows:
-            if r["kind"] == "text" and r["content"] and "\\" in r["content"]:
-                cat = "file"
-            elif r["kind"] == "image":
-                cat = "image"
-            else:
-                cat = classify_text(r["content"] or "")
-            self.conn.execute("UPDATE clipboard SET category=? WHERE id=?",
-                              (cat, r["id"]))
-        self.conn.commit()
-        return len(rows)
 
     def _init_fts(self):
         if self._fts is not None:
@@ -340,12 +197,8 @@ class Database:
     def add_image(self, png, source=""):
         return self._add("image", "image", None, png, source)
 
-    def add_files(self, paths, source="", max_bytes=512 * 1024):
-        """兼容旧接口：记录一批文件路径，不归档文件内容。"""
-        return [self.add_file_pending(path, source) for path in paths]
-
     def add_file_pending(self, path, source="", status="pending"):
-        """Insert file metadata quickly; the worker fills file_data later."""
+        """快速插入文件元数据，工作线程随后填充 data 或独立归档文件。"""
         path = os.path.abspath(path)
         h = hashlib.sha256(path.encode("utf-8")).hexdigest()
         try:
@@ -520,8 +373,7 @@ class Database:
         return cur.rowcount > 0
 
     def checkpoint(self):
-        # Kept as a compatibility no-op; DELETE journal mode has no WAL checkpoint.
-        return None
+        self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
     def close(self):
         conn = getattr(self._local, "conn", None)
@@ -562,8 +414,7 @@ class Database:
 
     def stats(self):
         rows = self.conn.execute(
-            "SELECT CASE WHEN category IS NULL OR category='' THEN kind "
-            "ELSE category END AS cat, "
+            "SELECT category AS cat, "
             "COUNT(*) AS cnt, MIN(created_at) AS oldest, "
             "MAX(created_at) AS newest FROM clipboard GROUP BY cat"
         ).fetchall()

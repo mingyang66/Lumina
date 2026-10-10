@@ -44,7 +44,9 @@ This is the only user-defined table in the database. It stores all clipboard ent
 | `id` | INTEGER | PRIMARY KEY, AUTOINCREMENT | Unique identifier for each entry |
 | `kind` | TEXT | NOT NULL, CHECK(kind IN ('text','image')) | Type of content: 'text' or 'image' |
 | `content` | TEXT | | Text content (for text entries) |
-| `image` | BLOB | | Image data (for image entries) |
+| `data` | BLOB | | Image or file binary data; NULL for disk-archived files |
+| `file_path` | TEXT | DEFAULT '' | Relative path inside the database's `file_store` directory |
+| `file_status` | TEXT | NOT NULL, DEFAULT 'none' | File archive state: `none`, `pending`, `ready`, or `failed` |
 | `hash` | TEXT | NOT NULL | SHA256 hash of content/image, used for deduplication |
 | `source` | TEXT | DEFAULT '' | Source filename or path where the clip was captured |
 | `created_at` | TEXT | NOT NULL, DEFAULT `(datetime('now','localtime'))` | Creation timestamp |
@@ -52,15 +54,9 @@ This is the only user-defined table in the database. It stores all clipboard ent
 | `tags` | TEXT | NOT NULL, DEFAULT '' | Comma-separated user tags for filtering |
 | `category` | TEXT | NOT NULL, DEFAULT '' | Classification: `text`, `code`, `link`, `image`, or `file` |
 
-### Migration history
+### Current-format initialization
 
-The `pinned`, `tags`, and `category` columns were added via automatic migration scripts as the project evolved:
-
-- `pinned`: Added first to support pinning important clips
-- `tags`: Added for user-defined categorization and filtering
-- `category`: Added for semantic classification (text/code/link/image/file), derived from content analysis
-
-These columns are **safely backward-compatible**: the `_migrate_columns()` method in `lumina/database.py` adds any missing columns with default values, so existing databases are automatically updated on first run with the new version.
+`init_schema()` initializes the current schema from `data/schema.sql`. There are no legacy column migrations, constraint migrations, or historical category backfills. Existing databases must already use the current schema; incompatible older databases are not automatically upgraded or cleared.
 
 ### FTS5 Full-Text Search tables
 
@@ -77,7 +73,7 @@ These are **implementation details** managed by SQLite; users should not interac
 
 | 表名 | 类别 | 主要用途 | 关键列 |
 |------|------|----------|--------|
-| `clipboard` | **业务表** | 存储所有剪贴记录（文本/图片），每条记录一行 | `id`, `kind`, `content`, `image`, `hash`, `source`, `created_at`, `pinned`, `tags`, `category` |
+| `clipboard` | **业务表** | 存储所有剪贴记录（文本/图片），每条记录一行 | `id`, `kind`, `content`, `data`, `file_path`, `file_status`, `hash`, `source`, `created_at`, `pinned`, `tags`, `category` |
 | `sqlite_sequence` | **系统表** | `AUTOINCREMENT` 计数器，记录 `clipboard.id` 的序列 | `name`, `seq`（内部使用，用户无需关注） |
 | `clipboard_fts` | **FTS5 虚表** | 全文搜索索引表，全文检索的基础 | `content`, `tags`, `source`, `rowid`（映射到 `clipboard.id`） |
 | `clipboard_fts_data` | **FTS5 内部** | 存储 FTS5 的文档数据、标记及位置信息 | 内部字段，由 SQLite 管理 |
@@ -90,7 +86,7 @@ These are **implementation details** managed by SQLite; users should not interac
 - 仅有 **`clipboard`** 一张表是应用程序直接读写的业务表，包含所有剪贴历史、分类、标签、Pin 状态等信息。
 - `sqlite_sequence` 是 SQLite 自动创建的系统表，用于支持 `AUTOINCREMENT`，通常不需要手动查询。
 - `clipboard_fts` 及其内部表是全文搜索功能的组件。如果搜索可用（取决于 FTS5 编译情况），它们会在 `init_schema()` 中自动创建；否则应用会退回到 LIKE 方式模糊查询。
-- 所有表的创建和迁移均由 `lumina/database.py` 的 `init_schema()` 和 `_migrate_columns()` 方法统一管理，确保向后兼容。
+- 当前表和索引由 `lumina/database.py` 的 `init_schema()` 初始化；不再支持旧表结构自动迁移。
 
 ## Data Operations
 
@@ -98,7 +94,9 @@ These are **implementation details** managed by SQLite; users should not interac
 
 - `add_text(text, source)` — Stores text content with automatic classification
 - `add_image(png, source)` — Stores raw PNG image data
-- `add_files(paths, source)` — Records file paths as a text entry
+- `add_file_pending(path, source)` — Records one file's metadata for asynchronous archiving
+- `complete_file(clip_id, data)` — Stores file data in `data` or an independent disk archive
+- `fail_file(clip_id, error)` — Marks a failed file archive
 
 ### Querying
 
@@ -114,25 +112,33 @@ These are **implementation details** managed by SQLite; users should not interac
 - `set_tags(clip_id, tags)` — Update tags for a clip
 - `delete(clip_id)` — Remove a clip permanently
 
-## Backward Compatibility
+## Current Format Only
 
-The database schema includes a migration step (`_migrate_columns()`) that runs on every `init_schema()` call. If a column is missing from an older database, it is added with a safe default:
+Lumina is maintained as a new project. Legacy database fields (`image`, `file_data`, etc.), old file-list APIs, old annotation tuples missing style fields, and automatic discovery of historical configuration/database locations are not supported.
 
-- `pinned` → DEFAULT 0 (not pinned)
-- `tags` → DEFAULT '' (no tags)
-- `category` → DEFAULT '' (unclassified)
-
-This ensures databases created with earlier versions of Lumina continue to work without data loss.
+Removing compatibility code does not delete existing databases, configurations, or archives. To start fresh, explicitly configure a new database path; do not point the application at an incompatible old database.
 
 ## Path Configuration
 
-Database path is configured in `lumina/settings.py`:
+Database path is configured by `db_path` in `config.json` and resolved by `lumina/settings.py`:
 
-```python
-DEFAULTS = {
-    "db_path": "data/lumina.db",
-    ...
+```json
+{
+    "db_path": "data/lumina.db"
 }
 ```
 
-The directory `data/` is created automatically if it does not exist.
+Relative `db_path` values are resolved only against the configuration file's directory. Lumina does not search the executable directory or current working directory for historical databases.
+
+In source runs, the default configuration is the project's `config.json`. In packaged runs, the default writable configuration is `%LOCALAPPDATA%/Lumina/config.json`; the first run copies defaults from the bundled template, and later runs use this stable file. The database directory is created when needed.
+
+Screenshot annotations use only these complete tuples:
+
+```python
+("rect", start, end, width, color)  # also oval / arrow
+("brush", points, width, color)
+("mosaic", points, radius)
+("text", position, text, font_size, color)
+```
+
+Missing or extra style fields are not interpreted as older formats.
