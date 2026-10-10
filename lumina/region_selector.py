@@ -69,11 +69,11 @@ class RegionSelector:
         self._tb_bg_photo = None  # 圆角背景 PhotoImage（防 GC）
         self._tb_icons = {}       # 图标 PhotoImage 引用（防 GC）
         self._tool = None
-        self._drawing_styles = {tool: [3, "#ff3b30"]
+        self._drawing_styles = {tool: [6, "#ff3b30"]
                                 for tool in ("rect", "oval", "arrow", "brush")}
         self._drawing_style_popup = None
         self._drawing_tool_anchors = {}
-        self._draw_style = (3, "#ff3b30")
+        self._draw_style = (6, "#ff3b30")
         self._draw_start = None
         self._draw_preview = None
         self._draw_preview_items = []
@@ -101,8 +101,8 @@ class RegionSelector:
         self._text_tool_anchor = None
         self._mosaic_style_popup = None
         self._mosaic_tool_anchor = None
-        self._mosaic_radius = 6
-        self._draw_mosaic_radius = 6
+        self._mosaic_radius = 12
+        self._draw_mosaic_radius = 12
         self._text_font_size = 18
         self._text_color = "#ff3b30"
         self._ocr_panel = None
@@ -601,6 +601,19 @@ class RegionSelector:
         self.canvas.configure(cursor="crosshair" if tool else "arrow")
         self._update_tool_button_state()
 
+    def _thickness_dot_image(self, index, selected):
+        """全部粗细选项共用同一尺寸、画布及抗锯齿算法。"""
+        from PIL import ImageDraw
+        ui_scale = self._toolbar_scale()
+        size, ss = max(1, int(round(28 * ui_scale))), 4
+        half = (4, 5.5, 7)[index] * ui_scale
+        image = Image.new("RGB", (size * ss, size * ss), "#ffffff")
+        center, radius = size * ss / 2, half * ss
+        ImageDraw.Draw(image).ellipse(
+            (center - radius, center - radius, center + radius - 1, center + radius - 1),
+            fill="#3478f6" if selected else "#4d5962")
+        return image.resize((size, size), Image.Resampling.LANCZOS)
+
     def _show_mosaic_style_popup(self):
         """三档圆点选项，尖角位于小/中圆点之间（边缘处自动翻转）。"""
         self._hide_mosaic_style_popup()
@@ -656,25 +669,13 @@ class RegionSelector:
         chrome.create_image(0, 0, image=popup._mosaic_bg, anchor="nw")
         cy = body_top + (body_bottom - body_top) // 2
         popup._mosaic_dots = []  # 保留抗锯齿圆点图片，避免被回收。
-        for index, radius in enumerate((3, 6, 10)):
+        for index, radius in enumerate((6, 12, 20)):
             cx = px(26) + index * px(38)
             selected = radius == self._mosaic_radius
             tag = f"mosaic-size-{radius}"
             chrome.create_rectangle(cx - px(16), cy - px(16), cx + px(16), cy + px(16),
                                     fill="#ffffff", outline="", tags=tag)
-            half = (3, 5, 8)[index] * ui_scale
-            # Tk Canvas 圆形不支持抗锯齿：以 4 倍分辨率绘制再平滑缩小。
-            # 使用与选项一致的实色底，避免透明边缘出现黑边。
-            dot_size, supersample = int(round(half * 2)) + px(4), 4
-            dot = Image.new("RGB", (dot_size * supersample, dot_size * supersample),
-                            "#ffffff")
-            center = dot_size * supersample / 2
-            r = half * supersample
-            ImageDraw.Draw(dot).ellipse(
-                (center - r, center - r, center + r - 1, center + r - 1),
-                fill="#3478f6" if selected else "#4d5962")
-            dot_photo = self._ImageTk.PhotoImage(
-                dot.resize((dot_size, dot_size), Image.Resampling.LANCZOS))
+            dot_photo = self._ImageTk.PhotoImage(self._thickness_dot_image(index, selected))
             popup._mosaic_dots.append(dot_photo)
             chrome.create_image(cx, cy, image=dot_photo, anchor="center", tags=tag)
             chrome.tag_bind(tag, "<Button-1>",
@@ -758,7 +759,7 @@ class RegionSelector:
         px = lambda value: max(1, int(round(value * ui_scale)))
         frame.pack(padx=px(8), pady=(px(10), px(8)))
         block_size = px(28)
-        sizes = (("小", 1), ("中", 3), ("大", 6)) if drawing_tool else (("小", 14), ("中", 18), ("大", 26))
+        sizes = (("小", 2), ("中", 6), ("大", 12)) if drawing_tool else (("小", 14), ("中", 18), ("大", 26))
         popup._style_dots = []
         for index, (label, size) in enumerate(sizes):
             selected = size == (self._drawing_styles[drawing_tool][0] if drawing_tool else self._text_font_size)
@@ -769,15 +770,7 @@ class RegionSelector:
             holder.pack_propagate(False)
             dot_photo = None
             if drawing_tool:
-                half = (3, 5, 8)[index] * ui_scale
-                dot_size, ss = int(round(half * 2)) + px(4), 4
-                dot = Image.new("RGB", (dot_size * ss, dot_size * ss),
-                                "#ffffff")
-                center, r = dot_size * ss / 2, half * ss
-                ImageDraw.Draw(dot).ellipse(
-                    (center - r, center - r, center + r - 1, center + r - 1),
-                    fill="#3478f6" if selected else "#4d5962")
-                dot_photo = ImageTk.PhotoImage(dot.resize((dot_size, dot_size), Image.Resampling.LANCZOS))
+                dot_photo = ImageTk.PhotoImage(self._thickness_dot_image(index, selected))
                 popup._style_dots.append(dot_photo)
             button = tk.Button(
                 holder, text="" if drawing_tool else label, image=dot_photo if drawing_tool else "",
