@@ -110,6 +110,23 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.db.get(clip)['file_status'], 'pending')
         self.assertEqual(self.db.get(clip)['data'], b'raw')
 
+    def test_file_archive_threshold_is_ten_mib(self):
+        from lumina.database import FILE_STORE_THRESHOLD
+        self.assertEqual(FILE_STORE_THRESHOLD, 10 * 1024 * 1024)
+        clip = self.pending()
+        data = b'x' * FILE_STORE_THRESHOLD
+        self.db.complete_file(clip, data)
+        row = self.db.get(clip)
+        self.assertEqual(row['data'], data)
+        self.assertEqual(row['file_path'], '')
+        self.assertFalse((self.root / 'file_store').exists())
+        data += b'x'
+        self.db.complete_file(clip, data)
+        row = self.db.get(clip)
+        self.assertIsNone(row['data'])
+        archived = Path(self.db.resolve_file_path(row['file_path']))
+        self.assertEqual(archived.read_bytes(), data)
+
     def test_delete_and_replace_archive(self):
         with patch('lumina.database.FILE_STORE_THRESHOLD', 1):
             clip = self.pending()

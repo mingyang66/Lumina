@@ -7,7 +7,7 @@ import threading
 import uuid
 
 FILE_STORE_DIR = "file_store"
-FILE_STORE_THRESHOLD = 1 * 1024 * 1024  # 1MB
+FILE_STORE_THRESHOLD = 10 * 1024 * 1024  # 10 MiB
 
 FTS_TRIGGERS = """
 CREATE TRIGGER IF NOT EXISTS clipboard_ai AFTER INSERT ON clipboard BEGIN
