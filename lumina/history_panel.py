@@ -3179,29 +3179,24 @@ class DetailPane:
         self._photo = photo
         self._body = tk.Label(outer, image=photo, bg=self.BG, cursor="hand2")
         self._body.pack(expand=True, padx=6, pady=6)
-        self._body.bind("<ButtonRelease-1>", self._open_preview_externally)
+        self._body.bind("<ButtonRelease-1>", self._open_image_preview)
         self._body.bind("<MouseWheel>", self._on_wheel)
 
-    def _open_preview_externally(self, _event=None):
-        """Open the preview with the system viewer, matching the file Open action."""
+    def _open_image_preview(self, _event=None):
+        """历史图片使用单实例预览，普通文件的打开动作仍使用系统关联。"""
         if self.row is None:
             return "break"
-        if self.cat == "file":
-            self._open_file()
-            return "break"
-
-        data = self.row["data"]
-        if not data:
-            self.panel.status_var.set("图片数据不可用")
-            return "break"
-        folder = os.path.join(tempfile.gettempdir(), "Lumina", "images")
         try:
-            os.makedirs(folder, exist_ok=True)
-            path = os.path.join(folder, f"clip_{self.row['id']}.png")
-            with open(path, "wb") as stream:
-                stream.write(data)
-            os.startfile(path)
-        except OSError:
+            if self.cat == "file":
+                archived = self.panel.db.get_file_data(self.row["id"])
+                data = archived["data"] if archived else None
+            else:
+                data = self.row["data"]
+            if not data:
+                self.panel.status_var.set("图片数据不可用")
+                return "break"
+            self.panel.ui.show_image_preview(data, (self.cat, self.row["id"]))
+        except Exception:
             traceback.print_exc()
             self.panel.status_var.set("图片无法打开")
         return "break"
@@ -3425,7 +3420,7 @@ class DetailPane:
                                            cursor="hand2")
                     image_label.image = photo
                     image_label.pack(padx=8, pady=8)
-                    image_label.bind("<ButtonRelease-1>", self._open_preview_externally)
+                    image_label.bind("<ButtonRelease-1>", self._open_image_preview)
                 except Exception:
                     pass
 

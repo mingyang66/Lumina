@@ -44,6 +44,8 @@ class UiServer:
         self._panel = None
         self._region = None
         self._pins = []
+        self._image_preview = None
+        self._image_preview_key = None
         self._prev_hwnd = None
         self.panel_visible = False  # 跨线程可见性提示（仅 UI 线程写入）
         self._floating_ball = None
@@ -171,6 +173,8 @@ class UiServer:
             self._panel = None
             self._region = None
             self._pins.clear()
+            self._image_preview = None
+            self._image_preview_key = None
             self._root = None
             self.started = False
             gc.collect()
@@ -294,6 +298,7 @@ class UiServer:
             return
         try:
             self._panel = HistoryPanel(self._root, self._tk, self)
+            self._bind_panel_hover()
         except Exception:
             traceback.print_exc()
             self._panel = None
@@ -303,7 +308,6 @@ class UiServer:
             return
         try:
             self._floating_ball = FloatingBall(self)
-            self._bind_panel_hover()
         except Exception:
             traceback.print_exc()
             self._floating_ball = None
@@ -360,7 +364,7 @@ class UiServer:
 
     def _schedule_floating_hide(self):
         self._cancel_floating_hide()
-        if self._panel_locked or not self._panel:
+        if self._panel_locked or not self._panel or not self._floating_ball:
             return
         delay = max(100, int(self.config.get("floating_hide_delay_ms", 400)))
         self._floating_hide_job = self._root.after(delay, self._hide_hover_panel)
@@ -377,7 +381,8 @@ class UiServer:
         self._panel_locked = bool(locked)
         position = self._floating_ball.panel_position() if self._floating_ball else None
         self._prev_hwnd = clipboard_api.get_foreground_hwnd()
-        self._panel.show(self._prev_hwnd, position=position, topmost=True)
+        # 锁定仅表示不自动隐藏，不应永久覆盖其他应用。
+        self._panel.show(self._prev_hwnd, position=position, topmost=not locked)
 
     def _floating_enter(self):
         if self._panel_locked:
@@ -405,7 +410,11 @@ class UiServer:
             if self._panel:
                 self._panel.hide()
         elif self._panel and self._panel.is_visible():
+            self._cancel_floating_hide()
             self._panel_locked = True
+            self._panel.win.attributes("-topmost", False)
+            self._panel.win.lift()
+            self._panel.win.focus_force()
         else:
             self._show_panel_from_floating(locked=True)
 
@@ -434,6 +443,22 @@ class UiServer:
         else:
             self._prev_hwnd = clipboard_api.get_foreground_hwnd()
             self._panel.show(self._prev_hwnd)
+
+    def show_image_preview(self, data, key):
+        """UI线程调用：所有历史图片共用一个普通层级预览窗口。"""
+        preview = self._image_preview
+        if preview is not None and not preview.win.winfo_exists():
+            self._image_preview = preview = None
+            self._image_preview_key = None
+        if preview is None:
+            preview = PinWindow(self, data, preview=True)
+            self._image_preview = preview
+        elif key != self._image_preview_key:
+            preview.replace_image(data)
+        self._image_preview_key = key
+        preview.win.deiconify()
+        preview.win.lift()
+        preview.win.focus_force()
 
     # ---------- 区域截图 ----------
     def _open_region(self, png):
@@ -640,7 +665,7 @@ class PinWindow:
     MIN_SCALE = 0.1
     MAX_SCALE = 5.0
 
-    def __init__(self, ui, png, pos=None):
+    def __init__(self, ui, png, pos=None, preview=False):
         from PIL import Image, ImageTk
         self._Image = Image
         self._ImageTk = ImageTk
@@ -651,8 +676,13 @@ class PinWindow:
 
         tk = ui._tk
         self.win = tk.Toplevel(ui._root)
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
+        self._preview = preview
+        self.win.overrideredirect(not preview)
+        self.win.attributes("-topmost", not preview)
+        if preview:
+            self.win.title("Lumina 图片预览 · 滚轮缩放")
+            self.win.protocol("WM_DELETE_WINDOW", self.close)
+            self._fit_preview()
 
         self._label = tk.Label(self.win, bd=1, relief="solid",
                                highlightthickness=0, cursor="fleur",
@@ -663,8 +693,8 @@ class PinWindow:
         if pos:
             x, y = int(pos[0]), int(pos[1])
         else:
-            x = (self.win.winfo_screenwidth() - self._img.width) // 2
-            y = (self.win.winfo_screenheight() - self._img.height) // 2
+            x = max(0, (self.win.winfo_screenwidth() - int(self._img.width * self._scale)) // 2)
+            y = max(0, (self.win.winfo_screenheight() - int(self._img.height * self._scale)) // 2)
         self.win.geometry(f"+{x}+{y}")
 
         self._label.bind("<ButtonPress-1>", self._on_press)
@@ -681,6 +711,20 @@ class PinWindow:
             self.win.focus_force()
         except Exception:
             pass
+
+    def _fit_preview(self):
+        self._scale = min(
+            1.0, self.win.winfo_screenwidth() * 0.8 / self._img.width,
+            self.win.winfo_screenheight() * 0.8 / self._img.height)
+
+    def replace_image(self, png):
+        image = self._Image.open(io.BytesIO(png)).convert("RGB")
+        self._img = image
+        self._drag_offset = None
+        self._scale = 1.0
+        if self._preview:
+            self._fit_preview()
+        self._apply_scale()
 
     def _apply_scale(self):
         w = max(1, int(self._img.width * self._scale))
@@ -715,6 +759,9 @@ class PinWindow:
         return "break"
 
     def close(self):
+        if getattr(self.ui, "_image_preview", None) is self:
+            self.ui._image_preview = None
+            self.ui._image_preview_key = None
         try:
             if self in self.ui._pins:
                 self.ui._pins.remove(self)

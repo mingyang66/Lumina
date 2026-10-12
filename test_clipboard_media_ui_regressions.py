@@ -1,4 +1,6 @@
+import ast
 import ctypes
+import traceback
 import importlib.util
 import io
 from pathlib import Path
@@ -420,6 +422,119 @@ class PinWheelTests(unittest.TestCase):
         self.dispatch(self.pin._label, 120)
         self.assertAlmostEqual(self.pin._scale, 1.21)
         self.assertEqual(self.pin._apply_scale.call_count, 2)
+
+
+class PreviewAndPanelTests(unittest.TestCase):
+    def setUp(self):
+        self.server = ui.UiServer(None, {}, types.SimpleNamespace())
+        self.server._root = MagicMock()
+        self.server._panel = MagicMock()
+
+    def test_repeated_image_click_reuses_window(self):
+        preview = MagicMock()
+        preview.win.winfo_exists.return_value = True
+        with patch.object(ui, 'PinWindow', return_value=preview) as factory:
+            for _ in range(10):
+                self.server.show_image_preview(b'png', ('image', 1))
+            factory.assert_called_once_with(self.server, b'png', preview=True)
+        preview.replace_image.assert_not_called()
+        self.assertEqual(preview.win.lift.call_count, 10)
+        self.assertFalse(self.server._pins)
+
+    def test_switch_image_updates_same_window(self):
+        preview = MagicMock()
+        preview.win.winfo_exists.return_value = True
+        with patch.object(ui, 'PinWindow', return_value=preview) as factory:
+            self.server.show_image_preview(b'a', 1)
+            self.server.show_image_preview(b'b', 2)
+            self.server.show_image_preview(b'a', 1)
+            self.assertEqual(factory.call_count, 1)
+        self.assertEqual(preview.replace_image.call_count, 2)
+
+    def test_destroyed_preview_rebuilds(self):
+        old = MagicMock()
+        old.win.winfo_exists.return_value = False
+        self.server._image_preview = old
+        with patch.object(ui, 'PinWindow') as factory:
+            self.server.show_image_preview(b'png', 1)
+            factory.assert_called_once()
+            self.assertIs(self.server._image_preview, factory.return_value)
+
+    def test_preview_close_clears_reference_not_other_pins(self):
+        preview = ui.PinWindow.__new__(ui.PinWindow)
+        preview.ui = self.server
+        preview.win = MagicMock()
+        other_pin = object()
+        self.server._pins = [other_pin]
+        self.server._image_preview = preview
+        self.server._image_preview_key = 1
+        preview.close()
+        self.assertIsNone(self.server._image_preview)
+        self.assertIsNone(self.server._image_preview_key)
+        self.assertEqual(self.server._pins, [other_pin])
+        preview.win.destroy.assert_called_once()
+
+    def test_locked_panel_is_not_topmost_hover_still_is(self):
+        with patch.object(ui.clipboard_api, 'get_foreground_hwnd', return_value=12):
+            for locked in (True, False):
+                self.server._show_panel_from_floating(locked=locked)
+                self.server._panel.show.assert_called_with(
+                    12, position=None, topmost=not locked)
+
+    def test_hover_to_locked_demotes_and_cancels_hide(self):
+        self.server._panel.is_visible.return_value = True
+        self.server._floating_hide_job = 42
+        self.server._floating_click()
+        self.assertTrue(self.server._panel_locked)
+        self.server._panel.win.attributes.assert_called_with('-topmost', False)
+        self.server._root.after_cancel.assert_called_once_with(42)
+
+    def test_panel_events_bind_without_floating_ball(self):
+        with patch.object(ui, 'HistoryPanel', return_value=self.server._panel):
+            self.server._build_panel()
+        events = [call.args[0] for call in self.server._panel.win.bind.call_args_list]
+        self.assertEqual(events, ['<Enter>', '<Leave>', '<FocusOut>'])
+
+    def test_detail_image_click_routes_to_single_preview(self):
+        source = (ROOT / 'lumina' / 'history_panel.py').read_text(encoding='utf-8')
+        cls = next(node for node in ast.parse(source).body
+                   if isinstance(node, ast.ClassDef) and node.name == 'DetailPane')
+        method = next(node for node in cls.body
+                      if isinstance(node, ast.FunctionDef) and node.name == '_open_image_preview')
+        namespace = {'traceback': traceback}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), '<preview>', 'exec'), namespace)
+        panel = types.SimpleNamespace(ui=self.server, db=MagicMock(), status_var=MagicMock())
+        panel.db.get_file_data.return_value = {'data': b'file-png'}
+        detail = types.SimpleNamespace(row={'id': 3, 'data': b'png'}, cat='image', panel=panel)
+        with patch.object(self.server, 'show_image_preview') as show:
+            self.assertEqual(namespace['_open_image_preview'](detail), 'break')
+            show.assert_called_with(b'png', ('image', 3))
+            detail.cat = 'file'
+            namespace['_open_image_preview'](detail)
+            show.assert_called_with(b'file-png', ('file', 3))
+
+    def test_no_floating_ball_does_not_auto_hide_panel(self):
+        self.server._schedule_floating_hide()
+        self.server._root.after.assert_not_called()
+
+    def test_preview_not_topmost_pin_still_topmost_and_update(self):
+        from PIL import ImageTk
+        stream = io.BytesIO()
+        Image.new('RGB', (2000, 1000)).save(stream, 'PNG')
+        window = MagicMock()
+        window.winfo_screenwidth.return_value = 1000
+        window.winfo_screenheight.return_value = 1000
+        self.server._tk = types.SimpleNamespace(
+            Toplevel=lambda root: window, Label=lambda *args, **kwargs: MagicMock())
+        with patch.object(ImageTk, 'PhotoImage', return_value=object()):
+            preview = ui.PinWindow(self.server, stream.getvalue(), preview=True)
+            preview.win.attributes.assert_called_with('-topmost', False)
+            preview.win.overrideredirect.assert_called_with(False)
+            preview.win.protocol.assert_called_once_with('WM_DELETE_WINDOW', preview.close)
+            preview.replace_image(stream.getvalue())
+            pin = ui.PinWindow(self.server, stream.getvalue())
+            pin.win.attributes.assert_called_with('-topmost', True)
+            pin.win.overrideredirect.assert_called_with(True)
 
 
 if __name__ == '__main__':
