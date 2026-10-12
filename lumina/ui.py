@@ -14,6 +14,7 @@ import traceback
 from . import clipboard_api
 from .region_selector import RegionSelector
 from .history_panel import HistoryPanel
+from .diff_window import DiffWindow
 from .settings import save_config
 
 class UiServer:
@@ -46,6 +47,7 @@ class UiServer:
         self._pins = []
         self._image_preview = None
         self._image_preview_key = None
+        self._diff_window = None
         self._prev_hwnd = None
         self.panel_visible = False  # 跨线程可见性提示（仅 UI 线程写入）
         self._floating_ball = None
@@ -161,6 +163,9 @@ class UiServer:
             root.after(80, self._poll)
             root.mainloop()
         finally:
+            if self._diff_window is not None:
+                self._diff_window.close()
+                self._diff_window = None
             self.db.close()
             if self._floating_ball:
                 self._floating_ball.destroy()
@@ -459,6 +464,20 @@ class UiServer:
         preview.win.deiconify()
         preview.win.lift()
         preview.win.focus_force()
+
+    def show_text_diff(self, left_row, right_row):
+        """UI线程调用：所有文本比较共用一个普通非置顶窗口。"""
+        window = self._diff_window
+        if window is not None and not window.is_alive():
+            self._diff_window = window = None
+        if window is None:
+            window = DiffWindow(self, left_row, right_row)
+            self._diff_window = window
+        else:
+            window.update(left_row, right_row)
+        window.win.deiconify()
+        window.win.lift()
+        window.win.focus_force()
 
     # ---------- 区域截图 ----------
     def _open_region(self, png):

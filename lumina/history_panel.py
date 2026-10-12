@@ -150,6 +150,10 @@ class HistoryPanel:
         self._maxed = False
         self._normal_geom = None
         self._sel_id = None
+        self._diff_base_id = None
+        self._diff_base_summary = ""
+        self._diff_peer_id = None
+        self._diff_peer_summary = ""
         self._hover_id = None
         self._row_rects = []
         self._row_bg_items = {}
@@ -293,6 +297,8 @@ class HistoryPanel:
             return False
         root, tk, ui = self._root, self.tk, self.ui
         sel = self._sel_id
+        diff_base = self._diff_base_id
+        diff_peer = self._diff_peer_id
         maxed = self._maxed
         self._close_popup_menu()
         try:
@@ -305,6 +311,9 @@ class HistoryPanel:
             cache.clear()
         self.__init__(root, tk, ui)
         self._sel_id = sel
+        self._diff_base_id = diff_base
+        self._diff_peer_id = diff_peer
+        self._validate_diff_base()
         self._maxed = maxed
         return True
 
@@ -624,11 +633,188 @@ class HistoryPanel:
                  ("导出…", self._export_selected),
                  None,
                  ("删除  (Del)", self.delete_selected)]
+        base = getattr(self, "_diff_base_id", None)
+        if cat in ("text", "code", "link"):
+            if base is None:
+                items[3:3] = [None, ("选为比对 A", lambda cid=clip_id: self._set_diff_base(cid))]
+            elif str(clip_id) != base:
+                items[3:3] = [None, ("与 A 比对", lambda cid=clip_id: self._compare_with_base(cid))]
         if cat == "file":
             items.insert(0, ("打开", self._open_file_from_row(row)))
             items.insert(1, ("在资源管理器中显示", self._reveal_file_from_row(row)))
         self._flat_menu = FlatMenu(self.tk, self.win, items, theme=self._theme()[0])
         self._flat_menu.popup(x, y)
+
+    def _diff_record(self, clip_id):
+        row = self.db.get_text(clip_id)
+        if row is None:
+            raise ValueError("记录已删除或不存在")
+        row = dict(row)
+        if row["category"] not in ("text", "code", "link") or not isinstance(row["content"], str):
+            raise ValueError("仅支持文本、代码和链接记录比对")
+        return row
+
+    def _set_diff_base(self, clip_id):
+        try:
+            row = self._diff_record(clip_id)
+        except Exception as error:
+            self.status_var.set(f"无法设置基准：{error}")
+            return
+        self._diff_base_id = str(clip_id)
+        self._diff_base_summary = self._diff_summary(row)
+        self._diff_peer_id = None
+        self._diff_peer_summary = ""
+        self._sync_diff_banner()
+        self._refresh_cards(self._rows_displayed)
+        self.status_var.set("已选定 A；右键另一条记录选择“与 A 比对”")
+
+    @staticmethod
+    def _diff_summary(row):
+        category = {"text": "文本", "code": "代码", "link": "链接"}[row["category"]]
+        raw = row["content"]
+        summary = " ".join(raw[:240].split()) or "（空文本）"
+        if len(summary) > 42 or len(raw) > 240:
+            summary = summary[:42] + "…"
+        return f"{category} · {summary}"
+
+    def _diff_role(self, clip_id):
+        cid = str(clip_id)
+        if cid == getattr(self, "_diff_base_id", None):
+            return "A"
+        if cid == getattr(self, "_diff_peer_id", None):
+            return "B"
+        return None
+
+    def _diff_color(self, role):
+        dark = self._theme()[1]
+        return ("#69AAFF" if dark else "#007AFF") if role == "A" else (
+            "#C39AFF" if dark else "#8050CC")
+
+    def _draw_diff_marker(self, canvas, cid, margin, y, row_h, text_x):
+        role = self._diff_role(cid)
+        if role is None:
+            return 0
+        d, color = self._dpi, self._diff_color(role)
+        tags = ("card", str(cid), "diff_marker")
+        canvas.create_rectangle(margin + round(3 * d), y + round(10 * d),
+                                margin + round(6 * d), y + row_h - round(10 * d),
+                                fill=color, outline="", tags=tags)
+        size = max(14, round(18 * d))
+        cy = y + row_h // 2 - round(10 * d)
+        canvas.create_rectangle(text_x, cy - size // 2, text_x + size, cy + size // 2,
+                                fill=color, outline="", tags=tags)
+        canvas.create_text(text_x + size // 2, cy, text=role, fill="#FFFFFF",
+                           font=self._font(9, "bold"), tags=tags)
+        return size + round(6 * d)
+
+    def _build_diff_banner(self, parent, before):
+        tk, t = self.tk, self._theme()[0]
+        self._diff_banner_before = before
+        self._diff_banner = tk.Frame(parent, bg=t["accent_soft"], bd=0)
+        self._diff_banner.grid_columnconfigure(0, weight=1)
+        self._diff_banner_text = tk.Label(
+            self._diff_banner, text="", anchor="w", bg=t["accent_soft"],
+            fg=t["label"], font=self._font(9, "bold"))
+        self._diff_banner_text.grid(row=0, column=0, sticky="ew", padx=(10, 4), pady=(6, 0))
+        self._diff_banner_peer = tk.Label(
+            self._diff_banner, text="右键另一条记录，选择“与 A 比对”", anchor="w",
+            bg=t["accent_soft"], fg=t["label2"], font=self._font(9))
+        self._diff_banner_peer.grid(row=1, column=0, sticky="ew", padx=(10, 4), pady=(0, 6))
+        self._diff_cancel = tk.Button(
+            self._diff_banner, text="取消比对 ×", command=self._clear_diff_base,
+            bg=t["accent_soft"], fg=t["accent"], activebackground=t["fill_hover"],
+            activeforeground=t["accent"], bd=0, highlightthickness=0,
+            relief="flat", cursor="hand2", font=self._font(9), padx=8, pady=4)
+        self._diff_cancel.grid(row=0, column=1, rowspan=2, padx=(0, 5))
+        self._diff_banner.bind("<Configure>", self._layout_diff_banner)
+
+    def _layout_diff_banner(self, event=None):
+        if getattr(self, "_diff_base_id", None) is None:
+            return
+        width = self._diff_banner.winfo_width() - self._diff_cancel.winfo_reqwidth() - 29
+        if width <= 0:
+            return
+        text = "比对 A：" + self._diff_base_summary
+        self._diff_banner_text.configure(text=self._fit_text(text, self._font(9, "bold"), width))
+        peer = getattr(self, "_diff_peer_summary", "")
+        if getattr(self, "_diff_peer_id", None) is not None:
+            self._diff_banner_peer.configure(
+                text=self._fit_text("比对 B：" + peer, self._font(9), width))
+
+    def _sync_diff_banner(self):
+        banner = getattr(self, "_diff_banner", None)
+        if banner is None:
+            return
+        if getattr(self, "_diff_base_id", None) is None:
+            banner.pack_forget()
+            return
+        self._diff_banner_text.configure(text="比对 A：" + self._diff_base_summary,
+                                         fg=self._diff_color("A"))
+        has_peer = getattr(self, "_diff_peer_id", None) is not None
+        self._diff_banner_peer.configure(
+            text="比对 B：" + self._diff_peer_summary if has_peer
+                 else "右键另一条记录，选择“与 A 比对”",
+            fg=self._diff_color("B") if has_peer else self._theme()[0]["label2"])
+        banner.pack(fill="x", pady=(0, 6), before=self._diff_banner_before)
+        self._layout_diff_banner()
+
+    def _clear_diff_base(self):
+        self._diff_base_id = None
+        self._diff_base_summary = ""
+        self._diff_peer_id = None
+        self._diff_peer_summary = ""
+        self._sync_diff_banner()
+        self._refresh_cards(self._rows_displayed)
+        self.status_var.set("已取消比对基准")
+
+    def _validate_diff_base(self):
+        base = getattr(self, "_diff_base_id", None)
+        if base is None:
+            return False
+        row = self.db.get_text(base)
+        if row is None or row["category"] not in ("text", "code", "link"):
+            self._diff_base_id = None
+            self._diff_base_summary = ""
+            self._diff_peer_id = None
+            self._diff_peer_summary = ""
+            self._sync_diff_banner()
+            return True
+        self._diff_base_summary = self._diff_summary(row)
+        peer_id = getattr(self, "_diff_peer_id", None)
+        if peer_id is not None:
+            peer = self.db.get_text(peer_id)
+            if peer is None or peer["category"] not in ("text", "code", "link"):
+                self._diff_peer_id = None
+                self._diff_peer_summary = ""
+            else:
+                self._diff_peer_summary = self._diff_summary(peer)
+        self._sync_diff_banner()
+        return False
+
+    def _compare_with_base(self, clip_id):
+        base = self._diff_base_id
+        if base is None:
+            self.status_var.set("请先右键一条文本记录，选择“选为比对 A”")
+            return
+        if str(clip_id) == base:
+            self.status_var.set("请选择另一条记录，不能与自身比对")
+            return
+        try:
+            if self._validate_diff_base():
+                self._refresh_cards(self._rows_displayed)
+                self.status_var.set("比对基准已删除或不可用，请重新设置")
+                return
+            # 从数据库读取完整原文，不取列表截断内容或 JSON 临时预览。
+            left, right = self._diff_record(base), self._diff_record(clip_id)
+            self.ui.show_text_diff(left, right)
+        except Exception as error:
+            self.status_var.set(f"无法打开比对：{error}")
+            return
+        self._diff_peer_id = str(clip_id)
+        self._diff_peer_summary = self._diff_summary(right)
+        self._sync_diff_banner()
+        self._refresh_cards(self._rows_displayed)
+        self.status_var.set(f"正在比对：基准 {base} ↔ 记录 {clip_id}")
 
     def _open_file_from_row(self, row):
         def _action():
@@ -1142,6 +1328,7 @@ class HistoryPanel:
         self.refresh()
 
     def refresh(self):
+        base_removed = self._validate_diff_base()
         q = self.search_var.get().strip()
         limit = 60
         rows = self.db.search(q, limit) if q else self.db.list_recent(limit)
@@ -1158,6 +1345,10 @@ class HistoryPanel:
         self.status_var.set(
             f"显示 {shown} / 共 {total} 条" if shown != total
             else f"共 {total} 条")
+        if getattr(self, "_diff_base_id", None) is not None:
+            self.status_var.set(self.status_var.get() + f" · 比对基准 ID {self._diff_base_id}")
+        elif base_removed:
+            self.status_var.set(self.status_var.get() + " · 比对基准已删除，已取消")
         if self._detail is not None:
             self._detail_hover_id = None
             self._detail.show(self._sel_id, immediate=True)
@@ -1250,9 +1441,10 @@ class HistoryPanel:
                                     tags=("card", cid))
             text_x = margin + int(round(12 * self._dpi)) + tile_size + int(round(12 * self._dpi))
             avail = card_w - (text_x - margin) - int(round(46 * self._dpi))
-            main = self._fit_text(self._row_main(r, cat), self._font(title_size), avail)
+            marker_width = self._draw_diff_marker(canvas, cid, margin, y, row_h, text_x)
+            main = self._fit_text(self._row_main(r, cat), self._font(title_size), max(0, avail - marker_width))
             meta = self._fit_text(self._row_meta(r, group, now), self._font(meta_size), avail)
-            canvas.create_text(text_x, y + row_h // 2 - int(round(10 * self._dpi)),
+            canvas.create_text(text_x + marker_width, y + row_h // 2 - int(round(10 * self._dpi)),
                                anchor="w", text=main, fill=T["label"],
                                font=self._font(title_size), tags=("card", cid))
             canvas.create_text(text_x, y + row_h // 2 + int(round(9 * self._dpi)),
@@ -1328,6 +1520,8 @@ class HistoryPanel:
         src = self._source_app(r["source"])[0][:18]
         when = self._fmt_row_time(r["created_at"], group, now)
         parts = [when, src[:18]]
+        if str(r["id"]) == getattr(self, "_diff_base_id", None):
+            parts.insert(0, "比对基准")
         if self._cat_of(r) != "image":
             parts.append(self._fmt_size(r))
         if r["tags"]:
@@ -1842,6 +2036,7 @@ class HistoryPanel:
         # ---------- 过滤胶囊 pills（Canvas 自绘，紧凑） ----------
         chip_wrap = tk.Frame(left, bg=win_bg)
         chip_wrap.pack(fill="x", pady=(0, 6))
+        self._build_diff_banner(left, chip_wrap)
         self._chip_h = int(round(28 * dpi))
         self._chip_canvas = tk.Canvas(chip_wrap, height=self._chip_h, bg=win_bg,
                                       highlightthickness=0, bd=0)
