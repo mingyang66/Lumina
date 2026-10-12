@@ -2851,6 +2851,10 @@ class DetailPane:
         self.T = T
         self.BG = T["card_bg"]
         self.row = None
+        self._json_text = None
+        self._json_mode = None
+        self._json_request = 0
+        self._json_busy = False
         self.cat = "text"
         self._cur_key = None
         self._pending = None
@@ -2948,9 +2952,12 @@ class DetailPane:
             self.show_placeholder()
             return
         key = (iid, bool(full["pinned"]))
-        if key == self._cur_key:
+        if (key == self._cur_key and self.row is not None
+                and self.row["content"] == full["content"]):
             return
         self._close_menu()
+        if self.row is None or self.row["id"] != full["id"] or self.row["content"] != full["content"]:
+            self._reset_json_state()
         self.row = full
         self._photo = None
         self._urls = []
@@ -2963,6 +2970,9 @@ class DetailPane:
             self.cat = "image" if kind == "image" else "text"
         try:
             self._update_meta(full, kind)
+            if self._json_text is not None:
+                self._meta_title.configure(text="JSON · " + (
+                    "已格式化" if self._json_mode == "format" else "已压缩"))
             for w in self._host.winfo_children():
                 w.destroy()
             if kind == "image" and full["data"]:
@@ -2970,7 +2980,7 @@ class DetailPane:
             elif self.cat == "file":
                 self._build_file_body(self._host, full, self.tk)
             else:
-                self._build_text_body(self._host, full, self.tk)
+                self._build_text_body(self._host, self._effective_row(), self.tk)
             if self._body is not None:
                 self._body.bind("<Button-3>", self._menu)
             self._update_actions()
@@ -2985,6 +2995,7 @@ class DetailPane:
             traceback.print_exc()
 
     def show_placeholder(self):
+        self._reset_json_state()
         self._close_menu()
         self._cur_key = None
         self.row = None
@@ -3118,29 +3129,118 @@ class DetailPane:
         if self._urls:
             btn("打开链接", lambda: self._open_url(self._urls[0]))
         if self.cat in ("text", "code") and (self.row["content"] or "").strip():
-            btn("JSON", self._format_json)
+            self._json_anchor = btn("JSON ▾", self._json_menu)
         btn("导出", self._save_as)
         btn("删除", self._delete, fg=danger)
 
+    def _reset_json_state(self):
+        self._json_request += 1
+        self._json_text = None
+        self._json_mode = None
+        self._json_busy = False
+
+    def _effective_row(self):
+        """完整输出取临时结果，不从截断后的预览控件取文本。"""
+        if self.row is None or self._json_text is None:
+            return self.row
+        row = dict(self.row)
+        row["content"] = self._json_text
+        return row
+
+    def _json_menu(self):
+        from .json_popup import JsonPopup
+        if isinstance(self._flat_menu, JsonPopup):
+            self._close_menu()
+            return
+        self._close_menu()
+        items = [
+            dict(label="格式化", hint="2 空格", kind="format",
+                 command=lambda: self._transform_json("format"),
+                 enabled=not self._json_busy, selected=self._json_mode == "format"),
+            dict(label="压缩", hint="紧凑输出", kind="compress",
+                 command=lambda: self._transform_json("compress"),
+                 enabled=not self._json_busy, selected=self._json_mode == "compress"),
+            dict(label="恢复原文", hint="", kind="restore", command=self._restore_json,
+                 enabled=self._json_text is not None or self._json_busy, selected=False),
+        ]
+        self._in_menu = True
+        self._flat_menu = JsonPopup(self.tk, self.panel.win, items,
+                                   self.panel._theme()[0], dpi=self.panel._dpi)
+        self._flat_menu.popup(self._json_anchor, on_close=self._menu_closed)
+
     def _format_json(self):
-        """格式化当前文本预览中的 JSON，不改写数据库原始剪贴板内容。"""
-        if self.row is None:
+        self._transform_json("format")
+
+    def _transform_json(self, mode):
+        if self.row is None or self.cat not in ("text", "code"):
             return
+        from .json_tools import transform_json, MAX_INPUT_BYTES
         raw = self.row["content"] or ""
-        try:
-            value = json.loads(raw)
-        except (TypeError, json.JSONDecodeError) as exc:
-            self.panel.status_var.set(f"JSON 格式错误：第 {exc.lineno} 行，第 {exc.colno} 列")
+        # 当前记录仅允许一个任务；忙时不改变有效请求编号。
+        if self._json_busy:
+            self.panel.status_var.set("JSON 正在处理中，请稍候或恢复原文")
             return
-        formatted = json.dumps(value, ensure_ascii=False, indent=2)
-        formatted_row = dict(zip(self.row.keys(), self.row)) \
-            if hasattr(self.row, "keys") else dict(self.row)
-        formatted_row["content"] = formatted
+        if len(raw) > MAX_INPUT_BYTES:
+            self.panel.status_var.set("JSON 输入过大，最多允许 2 MiB")
+            return
+        self._json_request += 1
+        request, row_id = self._json_request, self.row["id"]
+        self._json_busy = True
+        self.panel.status_var.set("正在处理 JSON…")
+        box = []
+
+        def work():
+            try:
+                box.append((transform_json(raw, mode), None))
+            except json.JSONDecodeError as exc:
+                box.append((None, f"JSON 格式错误：第 {exc.lineno} 行，第 {exc.colno} 列：{exc.msg}"))
+            except (ValueError, TypeError, RecursionError) as exc:
+                box.append((None, str(exc)))
+            except Exception:
+                traceback.print_exc()
+                box.append((None, "JSON 转换失败"))
+
+        def collect():
+            if request != self._json_request or self.row is None or self.row["id"] != row_id:
+                return
+            if not self.frame.winfo_exists():
+                return
+            if not box:
+                self.frame.after(40, collect)
+                return
+            self._json_busy = False
+            result, error = box[0]
+            if error:
+                self.panel.status_var.set(error)
+                return
+            self._json_text, self._json_mode = result.text, mode
+            self._refresh_json_preview()
+            label = "格式化" if mode == "format" else "压缩"
+            message = f"已{label} JSON；复制/回贴/导出使用结果，原文未修改"
+            if result.duplicate_keys:
+                message += f"；发现 {len(result.duplicate_keys)} 个重复键，已保留"
+            self.panel.status_var.set(message)
+
+        threading.Thread(target=work, name="lumina-json", daemon=True).start()
+        self.frame.after(40, collect)
+
+    def _refresh_json_preview(self):
+        self._urls = []
+        self._url_down = None
         for widget in self._host.winfo_children():
             widget.destroy()
-        self._build_text_body(self._host, formatted_row, self.tk)
+        self._build_text_body(self._host, self._effective_row(), self.tk)
         self._body.bind("<Button-3>", self._menu)
-        self.panel.status_var.set("已格式化 JSON（仅预览，原始内容未修改）")
+        self._meta_title.configure(text="JSON · " + (
+            "已格式化" if self._json_mode == "format" else "已压缩"))
+
+    def _restore_json(self):
+        if self.row is None:
+            return
+        self._reset_json_state()
+        self._refresh_json_preview()
+        self._update_meta(self.row, self.row["kind"])
+        self.panel.status_var.set("已恢复原文")
 
     def _delete(self):
         row = self.row
@@ -3600,7 +3700,7 @@ class DetailPane:
             return
         try:
             panel = self.panel
-            full = self.row
+            full = self._effective_row()
             prev = panel._prev_hwnd
             threading.Thread(target=panel._do_paste_back, args=(full, prev),
                              daemon=True).start()
@@ -3693,7 +3793,7 @@ class DetailPane:
 
     def _copy(self):
         try:
-            self.ui.actions.copy_to_clipboard(self.row)
+            self.ui.actions.copy_to_clipboard(self._effective_row())
         except Exception:
             traceback.print_exc()
 
@@ -3757,7 +3857,7 @@ class DetailPane:
 
     def _save_as(self):
         from tkinter import filedialog
-        row = self.row
+        row = self._effective_row()
         if row["kind"] == "image":
             path = filedialog.asksaveasfilename(
                 parent=self.panel.win, title="保存图片", defaultextension=".png",
