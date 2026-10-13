@@ -17,8 +17,11 @@ class _ToolbarControl:
         self.owner = owner
         self.parent = parent
         self._command = command
+        self._closed = False
         self._edge = edge
-        self._hover = self._focused = False
+        self._hover = self._focused = self._pressed = False
+        self._mouse_focus = False
+        self._press_after = None
         self._tooltip_after = self._tooltip = None
         self._tooltip_text = ''
         self._photo = None
@@ -30,13 +33,14 @@ class _ToolbarControl:
         self._segment_start = 0
         self.options = dict(text=text, state='normal', bg=owner.theme['toolbar_bg'],
                             fg=owner.theme['label'], command=self.invoke,
-                            font=owner._ui_font, marker=None)
+                            font=owner._ui_font, marker=None, icon=None)
         self.canvas = owner.tk.Canvas(
             parent, width=self._width, height=self._height,
             bg=owner.theme['window_bg'], bd=0, highlightthickness=0,
             takefocus=1 if command else 0)
         self.canvas.bind('<Enter>', self._enter)
         self.canvas.bind('<Leave>', self._leave)
+        self.canvas.bind('<ButtonPress-1>', self._press)
         self.canvas.bind('<ButtonRelease-1>', self._click)
         self.canvas.bind('<FocusIn>', lambda event: self._focus(True))
         self.canvas.bind('<FocusOut>', lambda event: self._focus(False))
@@ -57,15 +61,18 @@ class _ToolbarControl:
         self.canvas.place(**kwargs)
 
     def configure(self, **kwargs):
+        if self._closed or self.owner._closed:
+            return
         self.options.update(kwargs)
         self.canvas.configure(takefocus=1 if self._command and self.options['state'] != 'disabled' else 0)
         if self.options['state'] == 'disabled':
-            self._hover = self._focused = False
+            self._hover = self._focused = self._mouse_focus = False
+            self._clear_press()
             self._hide_tooltip()
         self._draw()
 
     def _draw(self):
-        if self.owner._closed:
+        if self._closed or self.owner._closed:
             return
         if self._group is not None:
             self._group._draw()
@@ -87,29 +94,35 @@ class _ToolbarControl:
             mask_draw = ImageDraw.Draw(mask)
             if x:
                 mask_draw.rectangle((0, 0, x - 1, image.height - 1), fill=0)
-            mask_draw.rectangle((x + segment._width * aa, 0, image.width - 1, image.height - 1), fill=0)
+            end = x + segment._width * aa
+            if end < image.width:
+                mask_draw.rectangle((end, 0, image.width - 1, image.height - 1), fill=0)
             image.paste(rgb(segment_bg), (0, 0, image.width, image.height), mask)
-            if segment._focused and segment.options['state'] != 'disabled':
-                draw.rectangle((x + stroke, 0,
-                                x + segment._width * aa - 1 - stroke,
-                                image.height - 1),
-                               outline=rgb(self.owner.theme['toolbar_focus']), width=stroke)
-        draw.rounded_rectangle(bounds, radius=self._radius * aa, outline=rgb(border), width=stroke)
+        focus_stroke = max(stroke, round(1.75 * s * aa))
+        draw.rounded_rectangle(bounds, radius=self._radius * aa, outline=rgb(border),
+                               width=focus_stroke if self._focused else stroke)
         for segment in self._segments:
             x = segment._segment_start * aa
             _, segment_border, _ = segment._colors()
+            focused = segment._focused and segment.options['state'] != 'disabled'
+            segment_stroke = focus_stroke if focused else stroke
             contour = Image.new('RGBA', image.size)
-            ImageDraw.Draw(contour).rounded_rectangle(
-                bounds, radius=self._radius * aa, outline=rgb(segment_border) + (255,), width=stroke)
-            region = (x, 0, x + segment._width * aa, image.height)
-            image.paste(contour.crop(region), (x, 0), contour.crop(region))
+            contour_draw = ImageDraw.Draw(contour)
+            contour_draw.rounded_rectangle(
+                bounds, radius=self._radius * aa, outline=rgb(segment_border) + (255,),
+                width=segment_stroke)
             if x:
-                draw.rectangle((x, inset + stroke, x + stroke - 1,
-                                image.height - 1 - inset - stroke), fill=rgb(border))
-        if self._focused and self.options['state'] != 'disabled':
-            draw.rounded_rectangle((0, 0, image.width - 1, image.height - 1),
-                                   radius=(self._radius + round(2 * s)) * aa,
-                                   outline=rgb(self.owner.theme['toolbar_focus']), width=stroke)
+                contour_draw.rectangle((x, inset + stroke, x + segment_stroke - 1,
+                                        image.height - 1 - inset - stroke),
+                                       fill=rgb(segment_border if focused else border) + (255,))
+            end = x + segment._width * aa
+            if focused and end < bounds[2]:
+                # 共享分隔线在焦点段内侧加粗，不改变相邻段的像素。
+                contour_draw.rectangle((end - segment_stroke, inset + stroke, end - 1,
+                                        image.height - 1 - inset - stroke),
+                                       fill=rgb(segment_border) + (255,))
+            region = (x, 0, end, image.height)
+            image.paste(contour.crop(region), (x, 0), contour.crop(region))
         surface = image.resize((self._width, self._height), Image.Resampling.LANCZOS)
         # 每段独立降采样，LANCZOS 不把相邻段的 hover/focus 颜色扩散过去。
         for segment in self._segments:
@@ -127,21 +140,52 @@ class _ToolbarControl:
         t = self.owner.theme
         if self.options['state'] == 'disabled':
             return t['toolbar_bg'], t['toolbar_disabled_border'], t['label2']
-        selected = self.options['marker'] in ('check', 'dot')
-        if selected:
-            return self.options['bg'], t['accent'], self.options['fg']
-        if self._hover:
-            return t['toolbar_hover_bg'], t['toolbar_hover_border'], self.options['fg']
-        return self.options['bg'], t['toolbar_border'], self.options['fg']
+        if self._pressed:
+            bg, border, fg = t['toolbar_press_bg'], t['accent'], '#FFFFFF'
+        elif self.options['marker'] in ('check', 'dot'):
+            bg, border, fg = self.options['bg'], t['accent'], self.options['fg']
+        elif self._hover:
+            bg, border, fg = t['toolbar_hover_bg'], t['toolbar_hover_border'], t['accent']
+        else:
+            bg, border, fg = self.options['bg'], t['toolbar_border'], self.options['fg']
+        return bg, t['toolbar_focus'] if self._focused else border, fg
 
     def _set_surface(self, image, bg, border, fg):
+        if self._closed or self.owner._closed:
+            return
         self._paint_bg, self._paint_border, self._paint_fg = bg, border, fg
-        self._photo = ImageTk.PhotoImage(image, master=self.canvas)
         self.canvas.delete('surface')
-        self.canvas.create_image(0, 0, anchor='nw', image=self._photo, tags='surface')
         marker = self.options['marker']
         shift = round(5 * self.owner._scale) if marker else 0
-        self.canvas.create_text(self._width / 2 + shift, self._height / 2,
+        text_x = self._width / 2 + shift
+        if self.options['icon'] == 'swap':
+            s, aa = self.owner._scale, 4
+            # 用实际字体宽度将图标、间距与文字作为整体居中。
+            probe = self.canvas.create_text(0, 0, text=self.options['text'],
+                                            font=self.options['font'], anchor='w')
+            bounds = self.canvas.bbox(probe)
+            self.canvas.delete(probe)
+            text_width = bounds[2] - bounds[0]
+            icon_width, gap = 16 * s, 7 * s
+            left = (self._width - icon_width - gap - text_width) / 2
+            text_x = left + icon_width + gap + text_width / 2
+            icon = Image.new('RGBA', (self._width * aa, self._height * aa))
+            draw = ImageDraw.Draw(icon)
+            color = tuple(value // 257 for value in self.canvas.winfo_rgb(fg)) + (255,)
+            stroke = max(1, round(1.25 * s * aa))
+            x1, x2, y = left * aa, (left + icon_width) * aa, self._height * aa / 2
+            for start, end, row in ((x1, x2, y - 3 * s * aa),
+                                    (x2, x1, y + 3 * s * aa)):
+                back = end - (3 * s * aa if end > start else -3 * s * aa)
+                draw.line(((start, row), (end, row)), fill=color, width=stroke)
+                draw.line(((back, row - 3 * s * aa), (end, row),
+                           (back, row + 3 * s * aa)), fill=color, width=stroke, joint='curve')
+            icon = icon.resize(image.size, Image.Resampling.LANCZOS)
+            image = image.copy()
+            image.paste(icon, (0, 0), icon)
+        self._photo = ImageTk.PhotoImage(image, master=self.canvas)
+        self.canvas.create_image(0, 0, anchor='nw', image=self._photo, tags='surface')
+        self.canvas.create_text(text_x, self._height / 2,
                                 text=self.options['text'], font=self.options['font'],
                                 fill=fg, tags='surface')
         if marker == 'dot':
@@ -156,35 +200,75 @@ class _ToolbarControl:
         self.canvas.tag_lower('surface')
 
     def invoke(self):
-        if self.options['state'] != 'disabled' and not self.owner._closed and self._command:
+        if self.options['state'] != 'disabled' and not self._closed and not self.owner._closed and self._command:
             self._hide_tooltip()
             self._command()
 
+    def _clear_press(self):
+        if self._press_after is not None:
+            with suppress(TclError):
+                self.owner.win.after_cancel(self._press_after)
+            self._press_after = None
+        self._pressed = False
+
+    def _release_feedback(self):
+        self._press_after = None
+        self._pressed = False
+        self._draw()
+
     def _activate(self):
-        self.invoke()
+        if not self._closed and not self.owner._closed and self.options['state'] != 'disabled' and self._command:
+            self._mouse_focus = False
+            self._focused = True
+            self._clear_press()
+            self._pressed = True
+            self._draw()
+            self._press_after = self.owner.win.after(120, self._release_feedback)
+            self.invoke()
+        return 'break'
+
+    def _press(self, event):
+        if (not self._closed and not self.owner._closed and self.options['state'] != 'disabled' and self._command
+                and 0 <= event.x < self._width and 0 <= event.y < self._height):
+            self._clear_press()
+            self._pressed = True
+            # focus_set 的 FocusIn 可能延后到 release，来源标记需保留到 FocusOut。
+            self._mouse_focus = True
+            self._focused = False
+            self.canvas.focus_set()
+            self._hide_tooltip()
+            self._draw()
         return 'break'
 
     def _click(self, event):
-        if (0 <= event.x < self._width and 0 <= event.y < self._height
+        pressed = self._pressed
+        self._clear_press()
+        self._draw()
+        if (pressed and not self._closed and not self.owner._closed
+                and 0 <= event.x < self._width and 0 <= event.y < self._height
                 and self.options['state'] != 'disabled' and self._command):
-            self.canvas.focus_set()
             self.invoke()
         return 'break'
 
     def _focus(self, focused):
-        self._focused = focused and bool(self._command) and self.options['state'] != 'disabled'
+        self._focused = (focused and not self._mouse_focus and not self._closed and not self.owner._closed
+                         and bool(self._command) and self.options['state'] != 'disabled')
         if not focused:
+            self._mouse_focus = False
+            self._clear_press()
             self._hide_tooltip()
         self._draw()
 
     def _enter(self, event):
-        self._hover = bool(self._command) and self.options['state'] != 'disabled'
+        self._hover = (not self._closed and not self.owner._closed
+                       and bool(self._command) and self.options['state'] != 'disabled')
         self._draw()
         self._hide_tooltip()
-        if self._tooltip_text and not self.owner._closed:
+        if self._hover and self._tooltip_text and not self.owner._closed:
             self._tooltip_after = self.owner.win.after(500, self._show_tooltip)
 
     def _leave(self, event):
+        self._clear_press()
         self._hover = False
         self._hide_tooltip()
         self._draw()
@@ -196,7 +280,8 @@ class _ToolbarControl:
 
     def _show_tooltip(self):
         self._tooltip_after = None
-        if self.owner._closed or not self.canvas.winfo_exists():
+        if (self._closed or self.owner._closed or self.options['state'] == 'disabled'
+                or not self._hover or not self.canvas.winfo_exists()):
             return
         owner, t = self.owner, self.owner.theme
         self._tooltip = owner.tk.Label(owner.win, text=self._tooltip_text,
@@ -218,8 +303,40 @@ class _ToolbarControl:
             self._tooltip = None
 
     def close(self):
+        self._closed = True
+        self._hover = self._focused = self._mouse_focus = False
+        self._clear_press()
         self._hide_tooltip()
         self._photo = None
+
+
+class _BlockLabel:
+    """框外纯文本计数，仅当前序号使用强调色。"""
+
+    def __init__(self, owner, parent):
+        self.owner = owner
+        self.frame = owner.tk.Frame(parent, bg=owner.theme['window_bg'],
+                                    bd=0, highlightthickness=0, takefocus=0)
+        self.options = dict(text='', fg=owner.theme['label2'])
+        self.labels = []
+        for _ in range(3):
+            label = owner.tk.Label(self.frame, text='', font=owner._ui_font,
+                                   bg=owner.theme['window_bg'], fg=owner.theme['label2'],
+                                   bd=0, highlightthickness=0, padx=0, pady=0, takefocus=0)
+            label.pack(side='left')
+            self.labels.append(label)
+
+    def __getattr__(self, name):
+        return getattr(self.frame, name)
+
+    def configure(self, *, text, current=''):
+        if self.owner._closed:
+            return
+        before, number, after = text.partition(current) if current else (text, '', '')
+        self.options.update(text=text, fg=self.owner.theme['accent'] if number else self.owner.theme['label2'])
+        for label, part, color in zip(self.labels, (before, number, after),
+                                      ('label2', 'accent', 'label2')):
+            label.configure(text=part, fg=self.owner.theme[color])
 
 
 class DiffWindow:
@@ -243,6 +360,7 @@ class DiffWindow:
         self._popup_after = None
         self._retained = False
         self._block_index = -1
+        self._marker_after = None
         self._syncing = False
         self._wheel_remainder = 0
         self._left_row = dict(left_row)
@@ -287,11 +405,13 @@ class DiffWindow:
             'toolbar_bg': '#2C2C32', 'toolbar_border': '#60606B',
             'toolbar_hover_bg': '#263D59', 'toolbar_hover_border': '#7193BE',
             'toolbar_disabled_border': '#43434C', 'toolbar_focus': '#B9D7FF',
+            'toolbar_press_bg': '#245BA8',
             'accent_soft': '#253C59', 'card_border': '#3D3D42',
         } if self._dark else {
             'toolbar_bg': '#FFFFFF', 'toolbar_border': '#B8BEC8',
             'toolbar_hover_bg': '#EDF5FF', 'toolbar_hover_border': '#799BC7',
             'toolbar_disabled_border': '#D8DCE3', 'toolbar_focus': '#245BA8',
+            'toolbar_press_bg': '#245BA8',
             'accent_soft': '#E5F0FF', 'card_border': '#D8D8DE',
         }).items() if key not in self._theme_overrides})
         try:
@@ -305,8 +425,8 @@ class DiffWindow:
         win.attributes('-topmost', False)
         win.resizable(True, True)
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        width = min(round(1080 * self._scale), max(1, sw - 40))
-        height = min(round(700 * self._scale), max(1, sh - 80))
+        width = min(round(1280 * self._scale), max(1, sw - 40))
+        height = min(round(840 * self._scale), max(1, sh - 80))
         win.geometry(f'{width}x{height}+{max(0, (sw - width) // 2)}+{max(0, (sh - height) // 2)}')
         win.minsize(min(round(760 * self._scale), width), min(round(420 * self._scale), height))
         win.protocol('WM_DELETE_WINDOW', self.close)
@@ -329,38 +449,33 @@ class DiffWindow:
         self._json_toggle = self._toolbar_control(options, '格式化 JSON', self._toggle_json, 126)
         self._json_toggle.pack(side='left', padx=(gap, 0))
         self._json_toggle.set_tooltip('格式化 JSON，原始记录不变')
-        self._navigation = self._toolbar_control(options, width=244)
+        self._block_label = _BlockLabel(self, options)
+        self._block_label.pack(side='right', padx=(pad, 0))
+        self._navigation = self._toolbar_control(options, width=152)
         self._navigation.pack(side='right')
         self._previous = self._toolbar_control(self._navigation.canvas, '↑ 上一个', lambda: self._navigate(-1),
                                                76, edge='left')
         self._previous.place(x=0, y=0)
         self._previous.set_tooltip('上一处')
-        self._block_label = self._toolbar_control(self._navigation.canvas, width=84)
-        self._block_label.configure(fg=t['label2'])
-        self._block_label.place(x=round(152 * self._scale), y=0,
-                                width=round(84 * self._scale), height=round(30 * self._scale))
         self._next = self._toolbar_control(self._navigation.canvas, '下一个 ↓', lambda: self._navigate(1),
                                            76)
         self._next.place(x=round(76 * self._scale), y=0)
         self._next.set_tooltip('下一处')
-        self._navigation._segments = [self._previous, self._next, self._block_label]
-        for control, start in zip(self._navigation._segments, (0, 76, 152)):
+        self._navigation._segments = [self._previous, self._next]
+        for control, start in zip(self._navigation._segments, (0, 76)):
             control._group = self._navigation
             control._segment_start = round(start * self._scale)
         self._navigation._draw()
-        self._separator = tk.Frame(options, bg=t['field'], width=max(1, round(self._scale)),
-                                   height=round(18 * self._scale))
-        self._separator.pack(side='right', padx=gap)
-        self._swap_button = self._toolbar_control(options, '⇄ 交换', self._swap, 76)
-        self._swap_button.configure(bg=t['window_bg'], fg=t['label2'])
-        self._swap_button.pack(side='right')
+        self._swap_button = self._toolbar_control(options, '交换 A/B', self._swap, 108)
+        self._swap_button.configure(bg=t['window_bg'], fg=t['label'], icon='swap')
+        self._swap_button.pack(side='right', padx=(0, round(12 * self._scale)))
         self._swap_button.set_tooltip('交换左右')
         body = tk.Frame(win, bg=t['window_bg'])
         body.grid(row=2, column=0, sticky='nsew', padx=pad, pady=0)
         body.grid_rowconfigure(0, weight=1)
         for col in (0, 1):
             body.grid_columnconfigure(col, weight=1, uniform='side')
-        self._texts, self._gutters = [], []
+        self._texts, self._gutters, self._block_markers = [], [], []
         self._yscroll = tk.Scrollbar(body, orient='vertical', command=self._scroll_y)
         self._yscroll.grid(row=0, column=2, sticky='ns')
         for side in range(2):
@@ -398,14 +513,23 @@ class DiffWindow:
                           highlightthickness=0, padx=4, pady=4, spacing1=0,
                           spacing2=0, spacing3=0, state='disabled', undo=False,
                           exportselection=False)
-            gutter = tk.Text(pane, width=5, takefocus=0, bg=t['field'], fg=t['label2'], **common)
+            gutter_frame = tk.Frame(pane, bg=t['field'], bd=0)
+            gutter_frame.grid(row=1, column=0, sticky='ns')
+            gutter_frame.grid_rowconfigure(0, weight=1)
+            gutter = tk.Text(gutter_frame, width=5, takefocus=0, bg=t['field'], fg=t['label2'], **common)
+            marker = tk.Canvas(gutter_frame, width=2, bg=t['field'], bd=0,
+                               highlightthickness=0, takefocus=0)
+            gutter.grid(row=0, column=0, sticky='ns')
+            marker.grid(row=0, column=1, sticky='ns')
+            self._block_markers.append(marker)
             text = tk.Text(pane, width=1, bg=t['card_bg'], fg=t['label'],
                            selectbackground=t['accent'], selectforeground='#FFFFFF', **common)
-            gutter.grid(row=1, column=0, sticky='ns')
             text.grid(row=1, column=1, sticky='nsew')
+            for widget in (text, gutter, marker):
+                widget.bind('<Configure>', self._queue_marker_redraw, add='+')
             gutter.tag_configure('numbers', justify='right')
-            gutter.tag_configure('block', background='#34496B' if self._dark else '#DBEAFE',
-                                 foreground=t['accent'])
+            gutter.tag_configure('block', background='#253C59' if self._dark else '#E5F0FF',
+                                 foreground=t['accent'], font=('Consolas', 11, 'bold'))
             xscroll = tk.Scrollbar(pane, orient='horizontal', command=text.xview)
             xscroll.grid(row=2, column=1, sticky='ew')
             text.configure(xscrollcommand=xscroll.set)
@@ -422,14 +546,17 @@ class DiffWindow:
                 for event in ('<<Copy>>', '<Control-c>', '<Control-C>', '<Control-Insert>'):
                     widget.bind(event, lambda event, s=side, w=widget, g=gutter:
                                 self._copy_event(s) if w is not g else 'break')
-            text.tag_configure('removed', background='#512F35' if self._dark else '#FFE8E8')
-            text.tag_configure('added', background='#294637' if self._dark else '#E5F5E9')
-            text.tag_configure('emphasis_removed', background='#914653' if self._dark else '#FFB8BE')
-            text.tag_configure('emphasis_added', background='#397956' if self._dark else '#ADE5BC')
-            text.tag_configure('missing', background='#252529' if self._dark else '#F1F2F5')
-            # 行号底色标记整个区段；正文底色低于增删和字符强调，且不改变行高。
-            text.tag_configure('block', background='#34496B' if self._dark else '#EFF6FF')
-            text.tag_lower('block')
+            text.tag_configure('removed', background='#512F3C' if self._dark else '#FBE9EF')
+            text.tag_configure('added', background='#294740' if self._dark else '#E4F4EF')
+            text.tag_configure('emphasis_removed', background='#784052' if self._dark else '#F1B8CA')
+            text.tag_configure('emphasis_added', background='#326558' if self._dark else '#A9DFCF')
+            text.tag_configure('missing', background='#303034' if self._dark else '#F1F2F5')
+            text.tag_configure('current', background='#304F73' if self._dark else '#CFE2FF')
+            # 普通行底 < 当前块 < 字符强调 < 原生选择；只覆盖背景，不改变字色。
+            text.tag_raise('current')
+            text.tag_raise('emphasis_removed', 'current')
+            text.tag_raise('emphasis_added', 'emphasis_removed')
+            text.tag_raise('sel')
         self._footer = footer = tk.Frame(win, bg=t['window_bg'])
         footer.grid(row=3, column=0, sticky='ew', padx=pad,
                     pady=(round(4 * self._scale), round(4 * self._scale)))
@@ -705,10 +832,17 @@ class DiffWindow:
 
     def _render(self, result):
         self._block_index = -1
+        if self._marker_after is not None:
+            with suppress(TclError):
+                self.win.after_cancel(self._marker_after)
+            self._marker_after = None
+        self._redraw_markers()
         eol_names = {'': '∅', '\n': 'LF', '\r': 'CR', '\r\n': 'CRLF'}
         self._syncing = True
         try:
             for side, text, gutter in zip(('left', 'right'), self._texts, self._gutters):
+                text.tag_remove('current', '1.0', 'end')
+                gutter.tag_remove('block', '1.0', 'end')
                 lines, numbers = [], []
                 for row in result.rows:
                     lines.append(getattr(row, side + '_text'))
@@ -765,8 +899,51 @@ class DiffWindow:
         blocks = self._result.blocks if self._result is not None else ()
         for button in (self._previous, self._next):
             button.configure(state='normal' if ready and blocks else 'disabled')
-        self._block_label.configure(text=('比较中' if self._busy else
-                                         (f'{self._block_index + 1}/{len(blocks)}' if blocks else '无差异')))
+        current = ''
+        if self._busy:
+            text = '比较中…'
+        elif not blocks:
+            text = '无差异'
+        elif self._block_index < 0:
+            text = f'待定位 / {len(blocks)} 处'
+        else:
+            current = str(self._block_index + 1)
+            text = f'第 {current} / {len(blocks)} 处'
+        self._block_label.configure(text=text, current=current)
+
+    def _queue_marker_redraw(self, event=None):
+        if not self._closed and self._block_index >= 0 and self._marker_after is None:
+            self._marker_after = self.win.after(0, self._flush_marker_redraw)
+
+    def _flush_marker_redraw(self):
+        self._marker_after = None
+        self._redraw_markers()
+
+    def _redraw_markers(self):
+        for text, marker in zip(self._texts, self._block_markers):
+            with suppress(TclError, AttributeError):
+                marker.delete('block')
+                if self._closed or self._result is None or self._block_index < 0:
+                    continue
+                start = self._result.blocks[self._block_index]
+                stop = start + 1
+                while stop < len(self._result.rows) and self._result.rows[stop].kind != 'equal':
+                    stop += 1
+                # dlineinfo 对不可见行返回 None；只查询视口内的行，避免扫描长区段。
+                first = max(start + 1, int(text.index('@0,0').split('.')[0]))
+                last = min(stop, int(text.index(f'@0,{text.winfo_height()}').split('.')[0]))
+                top = bottom = None
+                for line in range(first, last + 1):
+                    info = text.dlineinfo(f'{line}.0')
+                    if info is not None:
+                        y, height = info[1], info[3]
+                        top = y if top is None else min(top, y)
+                        bottom = y + height if bottom is None else max(bottom, y + height)
+                if top is not None:
+                    top, bottom = max(0, top), min(marker.winfo_height(), bottom)
+                    if bottom > top:
+                        marker.create_rectangle(0, top, 2, bottom, fill=self.theme['accent'],
+                                                outline='', tags='block')
 
     def _scroll_y(self, *args):
         if self._closed:
@@ -778,6 +955,8 @@ class DiffWindow:
         finally:
             self._syncing = False
         self._yscroll.set(*self._texts[0].yview())
+        self._redraw_markers()
+        self._queue_marker_redraw()
 
     def _on_y(self, source, first, last):
         if self._closed or self._syncing:
@@ -790,6 +969,8 @@ class DiffWindow:
             self._yscroll.set(first, last)
         finally:
             self._syncing = False
+        self._redraw_markers()
+        self._queue_marker_redraw()
 
     def _wheel(self, event):
         num = getattr(event, 'num', None)
@@ -815,9 +996,13 @@ class DiffWindow:
         stop = blocks[self._block_index] + 1
         while stop < len(self._result.rows) and self._result.rows[stop].kind != 'equal':
             stop += 1
-        for widget in (*self._texts, *self._gutters):
-            widget.tag_remove('block', '1.0', 'end')
-            widget.tag_add('block', index, f'{stop + 1}.0')
+        for text, gutter in zip(self._texts, self._gutters):
+            text.tag_remove('current', '1.0', 'end')
+            text.tag_add('current', index, f'{stop + 1}.0')
+            gutter.tag_remove('block', '1.0', 'end')
+            gutter.tag_add('block', index, f'{stop + 1}.0')
+        self._redraw_markers()
+        self._queue_marker_redraw()
         self._refresh_actions()
 
     def _copy_event(self, side):
@@ -867,6 +1052,13 @@ class DiffWindow:
         if getattr(self, '_rules_popup', None) is not None or getattr(self, '_popup_after', None) is not None:
             self._close_rules()
         self._closed = True
+        if getattr(self, '_marker_after', None) is not None:
+            with suppress(TclError):
+                self.win.after_cancel(self._marker_after)
+            self._marker_after = None
+        for marker in getattr(self, '_block_markers', ()):
+            with suppress(TclError):
+                marker.delete('block')
         for control in getattr(self, '_toolbar_controls', ()):
             control.close()
         self._generation += 1

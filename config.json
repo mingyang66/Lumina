@@ -1,5 +1,5 @@
 {
-  "db_path": "data/lumina.db",
+  "db_path": "D:\\workplace-python\\Lumina\\data\\lumina.db",
   "retention_days": 30,
   "max_rows": 0,
   "max_text_kb": 512,
@@ -16,8 +16,8 @@
   "popup_seconds": 3.0,
   "panel_enabled": true,
   "floating_enabled": true,
-  "floating_x": 1827,
-  "floating_y": 361,
+  "floating_x": 1826,
+  "floating_y": 721,
   "floating_size": 52,
   "floating_hover_delay_ms": 200,
   "floating_hide_delay_ms": 400,
