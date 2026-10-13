@@ -660,6 +660,7 @@ class HistoryPanel:
         except Exception as error:
             self.status_var.set(f"无法设置基准：{error}")
             return
+        self._close_diff_session()
         self._diff_base_id = str(clip_id)
         self._diff_base_summary = self._diff_summary(row)
         self._diff_peer_id = None
@@ -725,13 +726,21 @@ class HistoryPanel:
             bg=t["accent_soft"], fg=t["accent"], activebackground=t["fill_hover"],
             activeforeground=t["accent"], bd=0, highlightthickness=0,
             relief="flat", cursor="hand2", font=self._font(9), padx=8, pady=4)
-        self._diff_cancel.grid(row=0, column=1, rowspan=2, padx=(0, 5))
+        self._diff_cancel.grid(row=0, column=2, rowspan=2, padx=(0, 5))
+        self._diff_view = tk.Button(
+            self._diff_banner, text="查看比对", command=self._view_diff,
+            bg=t["accent_soft"], fg=t["accent"], activebackground=t["fill_hover"],
+            activeforeground=t["accent"], bd=0, highlightthickness=0,
+            relief="flat", cursor="hand2", font=self._font(9), padx=8, pady=4)
         self._diff_banner.bind("<Configure>", self._layout_diff_banner)
 
     def _layout_diff_banner(self, event=None):
         if getattr(self, "_diff_base_id", None) is None:
             return
         width = self._diff_banner.winfo_width() - self._diff_cancel.winfo_reqwidth() - 29
+        view = getattr(self, "_diff_view", None)
+        if view is not None and getattr(self, "_diff_peer_id", None) is not None:
+            width -= view.winfo_reqwidth() + 5
         if width <= 0:
             return
         text = "比对 A：" + self._diff_base_summary
@@ -745,6 +754,13 @@ class HistoryPanel:
         banner = getattr(self, "_diff_banner", None)
         if banner is None:
             return
+        view = getattr(self, "_diff_view", None)
+        if view is not None:
+            if (getattr(self, "_diff_base_id", None) is not None
+                    and getattr(self, "_diff_peer_id", None) is not None):
+                view.grid(row=0, column=1, rowspan=2, padx=(0, 5))
+            else:
+                view.grid_remove()
         if getattr(self, "_diff_base_id", None) is None:
             banner.pack_forget()
             return
@@ -758,7 +774,22 @@ class HistoryPanel:
         banner.pack(fill="x", pady=(0, 6), before=self._diff_banner_before)
         self._layout_diff_banner()
 
+    def _close_diff_session(self):
+        clear = getattr(self.ui, "clear_text_diff", None)
+        if callable(clear):
+            clear()
+
+    def _view_diff(self):
+        try:
+            self._validate_diff_base()
+            if (getattr(self, "_diff_base_id", None) is not None
+                    and getattr(self, "_diff_peer_id", None) is not None):
+                self.ui.view_text_diff()
+        except Exception as error:
+            self.status_var.set(f"无法打开比对：{error}")
+
     def _clear_diff_base(self):
+        self._close_diff_session()
         self._diff_base_id = None
         self._diff_base_summary = ""
         self._diff_peer_id = None
@@ -772,7 +803,9 @@ class HistoryPanel:
         if base is None:
             return False
         row = self.db.get_text(base)
-        if row is None or row["category"] not in ("text", "code", "link"):
+        if (row is None or row["category"] not in ("text", "code", "link")
+                or not isinstance(row["content"], str)):
+            self._close_diff_session()
             self._diff_base_id = None
             self._diff_base_summary = ""
             self._diff_peer_id = None
@@ -783,7 +816,9 @@ class HistoryPanel:
         peer_id = getattr(self, "_diff_peer_id", None)
         if peer_id is not None:
             peer = self.db.get_text(peer_id)
-            if peer is None or peer["category"] not in ("text", "code", "link"):
+            if (peer is None or peer["category"] not in ("text", "code", "link")
+                    or not isinstance(peer["content"], str)):
+                self._close_diff_session()
                 self._diff_peer_id = None
                 self._diff_peer_summary = ""
             else:

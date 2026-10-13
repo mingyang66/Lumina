@@ -15,6 +15,7 @@ METHOD_NAMES = {
     '_cat_of', '_row_meta', '_diff_summary', '_build_diff_banner',
     '_layout_diff_banner', '_sync_diff_banner', '_fit_text', '_sync_theme',
     '_diff_role', '_diff_color', '_draw_diff_marker', '_render_list',
+    '_close_diff_session', '_view_diff',
 }
 
 
@@ -67,6 +68,10 @@ class FakeWidget:
 
     def grid(self, **options):
         self.grid_options = options
+        self.visible = True
+
+    def grid_remove(self):
+        self.visible = False
 
     def pack(self, **options):
         self.visible = True
@@ -211,7 +216,7 @@ class DiffHistoryRegressionTests(unittest.TestCase):
         self.assertIsNone(banner.pack_options)
         self.assertEqual(self.panel._diff_banner_text.options['text'], '')
         self.assertEqual(banner.column_config, (0, {'weight': 1}))
-        self.assertEqual(self.panel._diff_cancel.grid_options['column'], 1)
+        self.assertEqual(self.panel._diff_cancel.grid_options['column'], 2)
         self.assertEqual(self.panel._diff_cancel.grid_options['rowspan'], 2)
         self.assertEqual(banner.bindings['<Configure>'], self.panel._layout_diff_banner)
         self.panel._sync_diff_banner()
@@ -923,11 +928,11 @@ class DiffHistoryRegressionTests(unittest.TestCase):
         full = ('比对 A：' + summaries[0], '比对 B：' + summaries[1])
         labels = (self.panel._diff_banner_text, self.panel._diff_banner_peer)
         self.assertEqual([label.options['text'] for label in labels], list(full))
-        for width in (189, 99):
+        for width in (254, 164):
             with self.subTest(width=width):
                 self.panel._diff_banner.width = width
                 self.panel._layout_diff_banner(SimpleNamespace(width=9999))
-                available = width - 60 - 29
+                available = width - 60 - 29 - 65
                 for label, text in zip(labels, full):
                     fitted = label.options['text']
                     self.assertEqual(fitted, text[:available // 10 - 1] + '…')
@@ -946,6 +951,95 @@ class DiffHistoryRegressionTests(unittest.TestCase):
         self.assertEqual([label.options['text'] for label in labels], list(full))
         self.assertEqual(self.panel._diff_banner_peer.grid_options,
                          {'row': 1, 'column': 0, 'sticky': 'ew', 'padx': (10, 4), 'pady': (0, 6)})
+
+    def test_view_button_only_with_pair_validates_without_reloading_snapshot(self):
+        self.panel.ui.view_text_diff = Mock()
+        self.assertFalse(self.panel._diff_view.visible)
+        self.panel._set_diff_base(1)
+        self.assertFalse(self.panel._diff_view.visible)
+        self.panel._compare_with_base(2)
+        self.assertTrue(self.panel._diff_view.visible)
+        self.panel.ui.show_text_diff.reset_mock()
+        self.records['1']['content'] = '数据库更新不应替换内存快照'
+        self.panel.db.get_text.reset_mock()
+        self.panel._diff_view.options['command']()
+        self.panel.ui.view_text_diff.assert_called_once_with()
+        self.panel.ui.show_text_diff.assert_not_called()
+        self.assertEqual(self.panel.db.get_text.call_args_list, [call('1'), call('2')])
+        self.panel._clear_diff_base()
+        self.assertFalse(self.panel._diff_view.visible)
+
+    def test_cancel_new_a_and_deleted_records_close_and_clear_session(self):
+        self.panel.ui.clear_text_diff = Mock()
+        for action in ('cancel', 'new_a', 'delete_a', 'delete_b', 'bad_content'):
+            with self.subTest(action=action):
+                self.records['1'] = self.make_row(1, 'text', 'A')
+                self.records['2'] = self.make_row(2, 'code', 'B')
+                self.select_pair()
+                self.panel.ui.clear_text_diff.reset_mock()
+                if action == 'cancel':
+                    self.panel._clear_diff_base()
+                elif action == 'new_a':
+                    self.panel._set_diff_base(3)
+                else:
+                    if action == 'bad_content':
+                        self.records['2']['content'] = None
+                    else:
+                        self.records.pop('1' if action == 'delete_a' else '2')
+                    self.panel._validate_diff_base()
+                self.panel.ui.clear_text_diff.assert_called_once_with()
+                self.assertIsNone(self.panel._diff_peer_id)
+                self.assertFalse(self.panel._diff_view.visible)
+                self.assertEqual(self.panel._diff_base_id,
+                                 None if action in ('cancel', 'delete_a') else
+                                 '3' if action == 'new_a' else '1')
+
+    def test_view_deleted_peer_closes_session_and_does_not_open(self):
+        self.select_pair()
+        self.panel.ui.clear_text_diff = Mock()
+        self.panel.ui.view_text_diff = Mock()
+        del self.records['2']
+        self.panel._view_diff()
+        self.panel.ui.clear_text_diff.assert_called_once_with()
+        self.panel.ui.view_text_diff.assert_not_called()
+        self.assertEqual(self.panel._diff_base_id, '1')
+        self.assertIsNone(self.panel._diff_peer_id)
+        self.assertFalse(self.panel._diff_view.visible)
+
+    def test_initial_validation_without_a_does_not_clear_new_session(self):
+        snapshot = {'rows': ('完整 A', '完整 B')}
+        self.panel.ui._diff_session = snapshot
+        self.panel.ui.clear_text_diff = Mock()
+        self.assertFalse(self.panel._validate_diff_base())
+        self.panel.ui.clear_text_diff.assert_not_called()
+        self.assertIs(self.panel.ui._diff_session, snapshot)
+
+    def test_theme_rebuild_initial_refresh_preserves_session_and_view(self):
+        self.select_pair()
+        snapshot = {'rows': ('完整 A', '完整 B'), 'roles': ('B', 'A'),
+                    'options': {'json_format': True}}
+        self.panel.ui._diff_session = snapshot
+        self.panel.ui.clear_text_diff = Mock()
+        self.panel._root = object()
+        self.panel._dark = False
+        self.panel._is_dark_mode = Mock(return_value=True)
+        self.panel._maxed = False
+        self.panel._close_popup_menu = Mock()
+        for name in ('_thumb_cache', '_tile_cache', '_cardbg_cache',
+                     '_marker_cache', '_preview_cache'):
+            setattr(self.panel, name, {})
+
+        def rebuild(root, tk, ui):
+            self.panel._diff_base_id = self.panel._diff_peer_id = None
+            self.panel._build_diff_banner(self.banner_parent, self.chips)
+            self.panel._validate_diff_base()
+
+        with patch.object(HistoryPanel, '__init__', side_effect=rebuild):
+            self.assertTrue(self.panel._sync_theme())
+        self.panel.ui.clear_text_diff.assert_not_called()
+        self.assertIs(self.panel.ui._diff_session, snapshot)
+        self.assertTrue(self.panel._diff_view.visible)
+        self.assert_pair()
 
     def test_banner_and_marker_share_theme_colors_for_both_roles(self):
         self.select_pair()

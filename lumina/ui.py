@@ -48,6 +48,7 @@ class UiServer:
         self._image_preview = None
         self._image_preview_key = None
         self._diff_window = None
+        self._diff_session = None
         self._prev_hwnd = None
         self.panel_visible = False  # 跨线程可见性提示（仅 UI 线程写入）
         self._floating_ball = None
@@ -163,9 +164,7 @@ class UiServer:
             root.after(80, self._poll)
             root.mainloop()
         finally:
-            if self._diff_window is not None:
-                self._diff_window.close()
-                self._diff_window = None
+            self.clear_text_diff()
             self.db.close()
             if self._floating_ball:
                 self._floating_ball.destroy()
@@ -465,16 +464,43 @@ class UiServer:
         preview.win.lift()
         preview.win.focus_force()
 
+    def _save_diff_session(self, window):
+        """仅接受当前窗口在 UI 线程导出的快照，旧窗口不能回写。"""
+        if getattr(self, '_diff_window', None) is window:
+            self._diff_session = window.export_session()
+
+    def clear_text_diff(self):
+        """取消或退出：先关闭，再清空，避免关闭时回写会话。"""
+        window = getattr(self, '_diff_window', None)
+        if window is not None:
+            window.close()
+        self._diff_window = None
+        self._diff_session = None
+
     def show_text_diff(self, left_row, right_row):
-        """UI线程调用：所有文本比较共用一个普通非置顶窗口。"""
-        window = self._diff_window
+        """UI 线程提交新配对，替换旧会话及其配置。"""
+        window = DiffWindow(self, left_row, right_row)
+        self.clear_text_diff()
+        self._diff_session = {
+            'rows': (dict(left_row), dict(right_row)), 'roles': ('A', 'B'),
+            'options': dict.fromkeys(('ignore_trailing_space', 'ignore_line_endings',
+                                     'json_format'), False)}
+        self._diff_window = window
+        window.win.deiconify()
+        window.win.lift()
+        window.win.focus_force()
+
+    def view_text_diff(self):
+        """查看存活窗口仅激活；关闭后从内存原文快照重新比较。"""
+        session = getattr(self, '_diff_session', None)
+        if session is None:
+            return
+        window = getattr(self, '_diff_window', None)
         if window is not None and not window.is_alive():
             self._diff_window = window = None
         if window is None:
-            window = DiffWindow(self, left_row, right_row)
+            window = DiffWindow(self, *session['rows'], session=session)
             self._diff_window = window
-        else:
-            window.update(left_row, right_row)
         window.win.deiconify()
         window.win.lift()
         window.win.focus_force()

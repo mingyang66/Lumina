@@ -46,11 +46,14 @@ class FakeWindow:
 class FakeDiffWindow:
     instances = []
 
-    def __init__(self, ui, left_row, right_row):
+    def __init__(self, ui, left_row, right_row, session=None):
         self.ui = ui
         self.win = FakeWindow()
         self.alive = True
-        self.rows = (left_row, right_row)
+        self.rows = tuple(map(dict, session['rows'] if session else (left_row, right_row)))
+        self.roles = tuple(session['roles']) if session else ('A', 'B')
+        self.options = dict(session['options']) if session else dict.fromkeys(
+            ('ignore_trailing_space', 'ignore_line_endings', 'json_format'), False)
         self.updates = []
         self.close_count = 0
         self.instances.append(self)
@@ -63,7 +66,13 @@ class FakeDiffWindow:
         self.win.record('update')
         self.updates.append((left_row, right_row))
 
+    def export_session(self):
+        self.win.record('export_session')
+        return {'rows': tuple(map(dict, self.rows)), 'roles': self.roles,
+                'options': dict(self.options)}
+
     def close(self):
+        self.ui._save_diff_session(self)
         self.win.record('close')
         self.close_count += 1
         self.alive = False
@@ -92,23 +101,28 @@ class DiffUiTests(unittest.TestCase):
         window = self.server._diff_window
         self.assertEqual(FakeDiffWindow.instances, [window])
         self.assertIs(window.ui, self.server)
-        self.assertIs(window.rows[0], self.left)
-        self.assertIs(window.rows[1], self.right)
+        self.assertEqual(window.rows, (self.left, self.right))
+        self.assertIsNot(window.rows[0], self.left)
+        self.assertIsNot(window.rows[1], self.right)
         self.assertEqual(window.updates, [])
         self.assertEqual(window.win.calls, ['deiconify', 'lift', 'focus_force'])
         self.assertEqual(self.server._pins, [])
         self.assertIsNone(self.server._image_preview)
 
-    def test_reuse_updates_even_same_rows_and_restores_each_time(self):
+    def test_view_alive_only_activates_without_update_or_resetting_swap(self):
         self.server.show_text_diff(self.left, self.right)
         window = self.server._diff_window
-        for left, right in ((self.left, self.right), (self.right, self.left)):
-            self.server.show_text_diff(left, right)
+        window.rows = window.rows[::-1]
+        window.roles = ('B', 'A')
+        for _ in range(2):
+            self.server.view_text_diff()
             self.assertIs(self.server._diff_window, window)
         self.assertEqual(len(FakeDiffWindow.instances), 1)
-        self.assertEqual(window.updates, [(self.left, self.right), (self.right, self.left)])
+        self.assertEqual(window.updates, [])
+        self.assertEqual(window.roles, ('B', 'A'))
+        self.assertEqual(window.rows, (self.right, self.left))
         self.assertEqual(window.win.calls, ['deiconify', 'lift', 'focus_force'] +
-                         ['is_alive', 'update', 'deiconify', 'lift', 'focus_force'] * 2)
+                         ['is_alive', 'deiconify', 'lift', 'focus_force'] * 2)
 
     def test_dead_window_rebuilt_without_updating_old_instance(self):
         self.server.show_text_diff(self.left, self.right)
@@ -119,7 +133,7 @@ class DiffUiTests(unittest.TestCase):
         self.assertIsNot(new, old)
         self.assertEqual(FakeDiffWindow.instances, [old, new])
         self.assertEqual(old.updates, [])
-        self.assertEqual(old.win.calls[-1], 'is_alive')
+        self.assertEqual(old.close_count, 1)
         self.assertEqual(new.rows, (self.right, self.left))
         self.assertEqual(new.win.calls, ['deiconify', 'lift', 'focus_force'])
 
@@ -128,8 +142,63 @@ class DiffUiTests(unittest.TestCase):
         self.server._diff_window.alive = False
         with patch.dict(NAMESPACE, {'DiffWindow': MagicMock(side_effect=RuntimeError('创建失败'))}):
             with self.assertRaisesRegex(RuntimeError, '创建失败'):
-                self.server.show_text_diff(self.left, self.right)
+                self.server.view_text_diff()
         self.assertIsNone(self.server._diff_window)
+
+    def test_close_reopen_restores_full_snapshots_options_and_swap(self):
+        self.left['content'] = '原文尾部' * 40000
+        self.server.show_text_diff(self.left, self.right)
+        old = self.server._diff_window
+        old.rows = old.rows[::-1]
+        old.roles = ('B', 'A')
+        old.options = dict.fromkeys(old.options, True)
+        old.close()
+        expected = self.server._diff_session
+        self.left['content'] = '数据库或调用方已改变'
+        self.server.view_text_diff()
+        new = self.server._diff_window
+        self.assertIsNot(new, old)
+        self.assertEqual(new.export_session(), expected)
+        self.assertEqual(len(new.rows[1]['content']), 160000)
+        self.assertEqual(new.updates, [])
+
+    def test_new_pair_replaces_settings_and_stale_close_cannot_overwrite(self):
+        self.server.show_text_diff(self.left, self.right)
+        old = self.server._diff_window
+        old.options['json_format'] = True
+        old.rows = old.rows[::-1]
+        old.roles = ('B', 'A')
+        self.server.show_text_diff(self.right, {'id': 3, 'content': '新记录'})
+        new = self.server._diff_window
+        expected = new.export_session()
+        self.assertFalse(any(expected['options'].values()))
+        self.assertEqual(expected['roles'], ('A', 'B'))
+        self.assertEqual(self.server._diff_session, expected)
+        old.close()
+        self.server._save_diff_session(old)
+        self.assertIs(self.server._diff_window, new)
+        self.assertEqual(self.server._diff_session, expected)
+
+    def test_cancel_closes_before_clearing_and_view_no_session_is_noop(self):
+        self.server.show_text_diff(self.left, self.right)
+        old = self.server._diff_window
+        self.server.clear_text_diff()
+        self.assertEqual(old.close_count, 1)
+        self.assertIsNone(self.server._diff_session)
+        self.server.view_text_diff()
+        self.assertIsNone(self.server._diff_window)
+        self.assertEqual(len(FakeDiffWindow.instances), 1)
+
+    def test_new_pair_constructor_failure_keeps_previous_session(self):
+        self.server.show_text_diff(self.left, self.right)
+        old = self.server._diff_window
+        expected = self.server._diff_session
+        with patch.dict(NAMESPACE, {'DiffWindow': MagicMock(side_effect=RuntimeError('失败'))}):
+            with self.assertRaises(RuntimeError):
+                self.server.show_text_diff(self.right, self.left)
+        self.assertIs(self.server._diff_window, old)
+        self.assertIs(self.server._diff_session, expected)
+        self.assertTrue(old.alive)
 
     def test_existing_close_clears_only_matching_identity(self):
         cls = next(node for node in DIFF_TREE.body
@@ -192,6 +261,7 @@ class DiffUiTests(unittest.TestCase):
                 else:
                     server._run()
         self.assertIsNone(server._diff_window)
+        self.assertIsNone(server._diff_session)
         self.assertIsNone(server._root)
         self.assertFalse(server.started)
         server.db.close.assert_called_once()
@@ -221,7 +291,8 @@ class DiffUiTests(unittest.TestCase):
         attributes = {node.attr for node in ast.walk(method) if isinstance(node, ast.Attribute)}
         self.assertFalse({'Thread', 'Tk', 'Toplevel', 'overrideredirect', 'attributes',
                           'grab_set', 'call_ui', 'print_exc'} & attributes)
-        self.assertTrue({'is_alive', 'update', 'deiconify', 'lift', 'focus_force'} <= attributes)
+        self.assertTrue({'clear_text_diff', 'deiconify', 'lift', 'focus_force'} <= attributes)
+        self.assertNotIn('update', attributes)
         imports = [node for node in UI_TREE.body if isinstance(node, ast.ImportFrom)
                    and node.module == 'diff_window']
         self.assertEqual(len(imports), 1)
