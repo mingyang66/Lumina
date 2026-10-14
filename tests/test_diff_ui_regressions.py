@@ -1,15 +1,16 @@
 import ast
 import gc
-from pathlib import Path
 import queue
 import threading
-from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, patch
 from contextlib import suppress
+from pathlib import Path
+from types import SimpleNamespace
+from typing import ClassVar
+from unittest.mock import MagicMock, patch
 
-
-ROOT = Path(__file__).resolve().parent
+# 测试位于 tests/ 子目录，上跳一层才是项目根（lumina/ 与 main.py 所在处）。
+ROOT = Path(__file__).resolve().parent.parent
 UI_SOURCE = ROOT / 'lumina' / 'ui.py'
 DIFF_SOURCE = ROOT / 'lumina' / 'diff_window.py'
 UI_TREE = ast.parse(UI_SOURCE.read_text(encoding='utf-8'))
@@ -83,6 +84,7 @@ class FakeDiffWindow:
 
 # 只加载 UiServer AST，隔离 Win32、真实 Tk 和其他 UI 组件。
 NAMESPACE = {'queue': queue, 'threading': threading, 'gc': gc,
+             'ClassVar': ClassVar,
              'DiffWindow': FakeDiffWindow}
 UiServer = load_class(UI_TREE, 'UiServer', NAMESPACE)
 

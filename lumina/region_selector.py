@@ -1,16 +1,14 @@
 """Region selector for screenshot area capture."""
 import io
+import itertools
 import math
 import os
 import shutil
 import time
 import traceback
-import ctypes
-from ctypes import wintypes
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageFont, ImageTk
+from PIL import Image, ImageFont
 
-from . import clipboard_api
 
 class RegionSelector:
     """全屏遮罩：显示冻结画面并压暗，鼠标拖拽框选区域，松手完成截图。
@@ -273,7 +271,7 @@ class RegionSelector:
                min(self.src.width, box[2]), min(self.src.height, box[3]))
         if box[2] - box[0] < 1 or box[3] - box[1] < 1:
             return None
-        from PIL import ImageDraw, ImageFont, ImageStat
+        from PIL import ImageDraw, ImageStat
         result = self.src.crop(box).convert("RGBA")
         if not include_annotations:
             buf = io.BytesIO()
@@ -628,7 +626,8 @@ class RegionSelector:
         except tk.TclError:
             pass
         ui_scale = self._toolbar_scale()
-        px = lambda value: max(1, int(round(value * ui_scale)))
+        def px(value):
+            return max(1, int(round(value * ui_scale)))
         tip = px(8)
         body_h = self._tb_bg_photo.height() if self._tb_bg_photo is not None else px(44)
         width, height = px(128), body_h + tip
@@ -752,7 +751,8 @@ class RegionSelector:
         frame = tk.Frame(popup, bg="#ffffff", bd=0,
                          highlightthickness=0)
         ui_scale = self._toolbar_scale()
-        px = lambda value: max(1, int(round(value * ui_scale)))
+        def px(value):
+            return max(1, int(round(value * ui_scale)))
         frame.pack(padx=px(8), pady=(px(10), px(8)))
         block_size = px(28)
         sizes = (("小", 2), ("中", 6), ("大", 12)) if drawing_tool else (("小", 14), ("中", 18), ("大", 26))
@@ -979,7 +979,6 @@ class RegionSelector:
     @staticmethod
     def _smooth_oval_image(a, b, width=3, color="#ff3b30"):
         """超采样椭圆描边，透明图片覆盖截图，避免原生椭圆锯齿。"""
-        from PIL import ImageDraw
         pad = int(math.ceil(width)) + 2
         x0, x1 = sorted((int(a[0]), int(b[0])))
         y0, y1 = sorted((int(a[1]), int(b[1])))
@@ -1000,7 +999,6 @@ class RegionSelector:
     @staticmethod
     def _smooth_stroke_image(points, width=3, color="#ff3b30", arrow=False):
         """箭头/画笔统一超采样，圆端点与圆连接消除斜线、拐点毛边。"""
-        from PIL import ImageDraw
         points = [(float(x), float(y)) for x, y in points]
         if not points:
             return Image.new("RGBA", (1, 1)), (0, 0)
@@ -1025,7 +1023,7 @@ class RegionSelector:
         w = math.ceil(max(x for x, _ in all_points)) - x0 + pad + 1
         h = math.ceil(max(y for _, y in all_points)) - y0 + pad + 1
         # 每段仅进入相交瓦片；长画笔不会在每块重扫全部历史点。
-        segments = list(zip(line_points, line_points[1:])) or [(points[0], points[0])]
+        segments = list(itertools.pairwise(line_points)) or [(points[0], points[0])]
         bins = {}
         margin = width / 2 + 4
         for a, b in segments:
@@ -1072,7 +1070,7 @@ class RegionSelector:
             # 增量消费新采样，绝不逐次重绘整条历史笔划。
             if self._tool == "brush":
                 points = self._draw_points[self._preview_point_index:]
-                for a, b in zip(points, points[1:]):
+                for a, b in itertools.pairwise(points):
                     item_id = self.canvas.create_line(*a, *b, fill=color,
                         width=width, capstyle="round", joinstyle="round")
                     self._draw_preview_items.append(item_id)
@@ -1209,7 +1207,8 @@ class RegionSelector:
                    min(self.disp.height, int(y + radius + 1)))
             from PIL import ImageStat
             mean = ImageStat.Stat(self.disp.crop(box).convert("RGB")).mean
-            return "#%02x%02x%02x" % tuple(max(0, min(255, int(v))) for v in mean)
+            return "#{:02x}{:02x}{:02x}".format(
+                *(max(0, min(255, int(v))) for v in mean))
         except Exception:
             return "#808080"
 
@@ -1339,7 +1338,7 @@ class RegionSelector:
             self.canvas.itemconfigure(live_item, image=photo)
             bbox = self.canvas.bbox(live_item)
             if bbox:
-                left, top, right, bottom = bbox
+                _left, top, right, bottom = bbox
                 self.canvas.coords(input_box, x, y,
                                   max(x + 132, right + 6), max(y + 40, bottom + 6))
                 caret_x = right + 2
@@ -1501,7 +1500,7 @@ class RegionSelector:
         panel_h = min(max(360, content_h + 96), int(self.sh * .88))
         text_w = min(420, max(300, int(self.sw * .26)))
         panel_w = min(max(580, preview_w + text_w + 48), max(620, int(self.sw * .88)))
-        x0, y0, x1, y1 = self._sel_box
+        x0, y0, x1, _y1 = self._sel_box
         px = x1 + 18
         if px + panel_w > self.sw:
             px = max(12, x0 - panel_w - 18)
@@ -1729,7 +1728,7 @@ class RegionSelector:
                               fill="#fbfcfe", outline="#c3cbd5", width=border_w * ss)
         self._tb_bg_photo = ImageTk.PhotoImage(bg.resize((bw, bh), Image.LANCZOS))
 
-        x0, y0, x1, y1 = self._sel_box
+        _x0, y0, x1, y1 = self._sel_box
         tx = min(max(0, x1 - bw), max(0, self.sw - bw))
         ty = y1 + 8
         if ty + bh > self.sh:

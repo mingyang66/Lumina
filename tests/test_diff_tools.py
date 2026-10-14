@@ -1,8 +1,8 @@
 import dataclasses
 import json
-from difflib import SequenceMatcher
 import random
 import unittest
+from difflib import SequenceMatcher
 from unittest.mock import patch
 
 from lumina import diff_tools, json_tools
@@ -321,6 +321,26 @@ class DiffToolsTests(unittest.TestCase):
         result = compare_text('{"a":1}', 'not json\n{"a":2}')
         self.assertNotIn('neutral', [row.kind for row in result.rows])
 
+    def test_original_mode_keeps_row_position_even_for_json(self):
+        """原文比较模式即使两侧都是 JSON，也绝不按字段名对齐、不产生新 kind。"""
+        left = '{\n "a": 1,\n "op_station": "old",\n "query_mode": null\n}'
+        right = '{\n "a": 1,\n "query_mode": null,\n "op_station": "new"\n}'
+        result = compare_text(left, right)
+        self.assert_reconstructs(result)
+        # 纯按行位置：逐行一一对应，不插入占位行。
+        self.assertEqual(len(result.rows), 5)
+        self.assertEqual([row.kind for row in result.rows],
+                         ['equal', 'equal', 'replace', 'replace', 'equal'])
+        self.assertEqual([row.left_no for row in result.rows], [1, 2, 3, 4, 5])
+        self.assertEqual([row.right_no for row in result.rows], [1, 2, 3, 4, 5])
+        self.assertEqual(result.blocks, (2,))
+        for kind in ('neutral', 'shared_change'):
+            self.assertNotIn(kind, [row.kind for row in result.rows])
+        # 对照：JSON 格式化模式才按字段名对齐并引入 neutral。
+        formatted = compare_text(left, right, json_format=True)
+        self.assertIn('neutral', [row.kind for row in formatted.rows])
+        self.assertNotEqual(len(formatted.rows), len(result.rows))
+
 
 class JsonFieldDiffTests(unittest.TestCase):
     def compare(self, left, right):
@@ -411,7 +431,7 @@ class JsonFieldDiffTests(unittest.TestCase):
 
     def test_paths_escaping_and_display_is_single_line(self):
         keys = ['simple', 'a.b', 'a"b', '', '中', '0', 'a[b]', 'line\nkey', 'slash\\key']
-        raw = json.dumps({k: 'line\n"\\\t' for k in keys})
+        raw = json.dumps(dict.fromkeys(keys, 'line\n"\\\t'))
         result = self.compare(raw, raw)
         for row, key in zip(result.rows, sorted(keys)):
             suffix = '.simple' if key == 'simple' else '[' + json.dumps(key) + ']'

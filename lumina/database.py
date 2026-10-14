@@ -59,7 +59,7 @@ class Database:
             "data", "schema.sql")
 
     def _load_schema(self):
-        with open(self._schema_path(), "r", encoding="utf-8") as stream:
+        with open(self._schema_path(), encoding="utf-8") as stream:
             return stream.read()
 
     def resolve_file_path(self, stored_path):
@@ -166,7 +166,7 @@ class Database:
         digest_data = content.encode("utf-8") if content is not None else blob
         h = hashlib.sha256(digest_data).hexdigest()
         try:
-            cur = self.conn.execute(
+            self.conn.execute(
                 "INSERT INTO clipboard(kind, category, content, data, hash, "
                 "source, created_at) "
                 "VALUES (?,?,?,?,?,?,strftime('%Y-%m-%d %H:%M:%f','now','localtime')) "
@@ -297,32 +297,61 @@ class Database:
         self.checkpoint()
         return deleted
 
-    def list_recent(self, n=20):
+    @staticmethod
+    def _filter_clauses(category, pinned, alias=""):
+        """收藏/分类筛选条件，供下推到 SQL 复用。
+
+        历史上列表页是「先取最近 N 条、再在内存里筛选」，导致收藏等匹配记录
+        被后续新记录挤出窗口后凭空"消失"（库中仍在，界面看不到）。筛选必须
+        在 SQL 层完成，LIMIT 才会作用在匹配集合上。
+
+        category 为空串时的归类与面板 _cat_of 保持一致（按 kind 兜底），
+        否则 SQL 结果集会与 UI 语义出现偏差。
+        """
+        prefix = f"{alias}." if alias else ""
+        clauses, params = [], []
+        if pinned:
+            clauses.append(f"{prefix}pinned=1")
+        elif category:
+            if category in ("text", "image"):
+                clauses.append(f"({prefix}category=? OR "
+                               f"({prefix}category='' AND {prefix}kind=?))")
+                params.extend((category, category))
+            else:
+                clauses.append(f"{prefix}category=?")
+                params.append(category)
+        return clauses, params
+
+    def list_recent(self, n=20, category=None, pinned=False):
+        clauses, params = self._filter_clauses(category, pinned)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
         return self.conn.execute(
-            f"SELECT {LIST_COLUMNS} FROM clipboard "
+            f"SELECT {LIST_COLUMNS} FROM clipboard{where} "
             "ORDER BY created_at DESC, id DESC LIMIT ?",
-            (n,),
+            (*params, n),
         ).fetchall()
 
-    def search(self, query, n=20):
+    def search(self, query, n=20, category=None, pinned=False):
         query = (query or "").strip()
         if not query:
             return []
+        clauses, params = self._filter_clauses(category, pinned, alias="c")
+        extra = " AND " + " AND ".join(clauses) if clauses else ""
         if self._fts and len(query) >= 3:
             match = '"' + query.replace('"', '""') + '"'
             return self.conn.execute(
                 f"SELECT {JOIN_COLUMNS} "
                 "FROM clipboard_fts f JOIN clipboard c ON c.id = f.rowid "
-                "WHERE clipboard_fts MATCH ? "
+                f"WHERE clipboard_fts MATCH ?{extra} "
                 "ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
-                (match, n),
+                (match, *params, n),
             ).fetchall()
         like = f"%{query}%"
         return self.conn.execute(
-            f"SELECT {LIST_COLUMNS} FROM clipboard "
-            "WHERE content LIKE ? OR tags LIKE ? OR source LIKE ? "
-            "ORDER BY created_at DESC, id DESC LIMIT ?",
-            (like, like, like, n),
+            f"SELECT {LIST_COLUMNS} FROM clipboard c "
+            f"WHERE (c.content LIKE ? OR c.tags LIKE ? OR c.source LIKE ?){extra} "
+            "ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
+            (like, like, like, *params, n),
         ).fetchall()
 
     def count(self, query="", category=None, pinned=False):

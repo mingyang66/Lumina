@@ -2,18 +2,18 @@ import contextlib
 import io
 import json
 import os
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import main
-from lumina.database import Database
 from lumina import settings
+from lumina.database import Database
 
 
 class StorageTests(unittest.TestCase):
@@ -334,16 +334,74 @@ class StorageTests(unittest.TestCase):
         self.db.complete_file(clip, b'')
         target = self.root / 'empty.out'
         command = [sys.executable, '-B', str(Path(main.__file__).resolve()), '-c', str(config), 'export']
-        result = subprocess.run(command + [str(clip), str(target)], cwd=self.root,
+        result = subprocess.run([*command, str(clip), str(target)], cwd=self.root,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(target.read_bytes(), b'')
         missing = self.pending('missing')
-        result = subprocess.run(command + [str(missing), str(self.root / 'missing.out')],
+        result = subprocess.run([*command, str(missing), str(self.root / 'missing.out')],
                                 cwd=self.root, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 1)
         self.assertIn('export failed', result.stderr)
         self.assertFalse((self.root / 'missing.out').exists())
+
+    def test_pinned_and_category_filters_are_pushed_into_sql(self):
+        """收藏/分类筛选必须下推到 SQL，不得依赖「先取最近 N 条再内存过滤」。
+
+        回归背景：列表页原先固定 list_recent(60) 后再在内存里筛收藏，导致被
+        后续新记录挤出前 60 名的收藏在界面上凭空"消失"（库中仍有 8 条，界面
+        只显示 1 条）。这里用「收藏早于大量非收藏记录」的构造复现该场景。
+        """
+        pinned_id = self.db.add_text('最早的收藏', source='old')
+        self.db.set_pinned(pinned_id)
+        for i in range(80):
+            self.db.add_text(f'后续记录 {i}', source='new')
+
+        # 未下推时：最近 N 条窗口内已看不到那条收藏。
+        window = {r['id'] for r in self.db.list_recent(60)}
+        self.assertNotIn(pinned_id, window)
+
+        # 下推后：LIMIT 作用在匹配集合上，收藏必然可见。
+        pinned_rows = self.db.list_recent(60, pinned=True)
+        self.assertEqual([r['id'] for r in pinned_rows], [pinned_id])
+        self.assertEqual(self.db.count('', pinned=True), 1)
+
+        # 分类筛选同样下推：结果全部属于该分类，且不超过 limit；
+        # limit 内的条数等于「该分类总数」与 limit 的较小值。
+        for category in ('text', 'code'):
+            rows = self.db.list_recent(60, category=category)
+            total = self.db.count('', category=category)
+            self.assertEqual(len(rows), min(60, total))
+            for row in rows:
+                self.assertEqual(row['category'], category)
+
+    def test_search_pushes_filters_into_sql(self):
+        """搜索与筛选组合时，条件也必须同时下推，否则命中会被窗口截断。"""
+        pinned_id = self.db.add_text('needle 收藏', source='old')
+        self.db.set_pinned(pinned_id)
+        for i in range(80):
+            self.db.add_text(f'needle 后续 {i}', source='new')
+
+        # 窗口内未下推时搜不到那条老收藏。
+        window = {r['id'] for r in self.db.search('needle', 60)}
+        self.assertNotIn(pinned_id, window)
+
+        rows = self.db.search('needle', 60, pinned=True)
+        self.assertEqual([r['id'] for r in rows], [pinned_id])
+
+        # 分类 + 搜索组合下推，结果必须同时满足两个条件。
+        code_id = self.db.add_text('needle code', category='code')
+        rows = self.db.search('needle', 60, category='code')
+        self.assertEqual([r['id'] for r in rows], [code_id])
+
+    def test_category_filter_matches_empty_category_fallback(self):
+        """category 为空串时按 kind 归类，SQL 下推需与面板 _cat_of 语义一致。"""
+        clip = self.db.add_text('无分类文本')
+        with self.db.conn:
+            self.db.conn.execute("UPDATE clipboard SET category='' WHERE id=?", (clip,))
+        rows = self.db.list_recent(60, category='text')
+        self.assertIn(clip, [r['id'] for r in rows])
+        self.assertNotIn(clip, [r['id'] for r in self.db.list_recent(60, category='code')])
 
     def test_empty_export_and_missing_data_nonzero(self):
         cfg = {'db_path': self.db.path}

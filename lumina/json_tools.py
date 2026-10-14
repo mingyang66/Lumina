@@ -2,7 +2,6 @@ import json
 import re
 from dataclasses import dataclass
 
-
 MAX_INPUT_BYTES = 2 * 1024 * 1024
 MAX_DEPTH = 128
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024

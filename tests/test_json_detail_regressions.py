@@ -1,22 +1,23 @@
 import ast
-from collections import deque
-from contextlib import contextmanager
-from copy import deepcopy
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import tempfile
 import traceback
 import types
 import unittest
+from collections import deque
+from contextlib import contextmanager
+from copy import deepcopy
+from pathlib import Path
+from typing import ClassVar
 from unittest.mock import Mock, patch
 
 from lumina import json_tools
 
-
-ROOT = Path(__file__).resolve().parent
+# 测试位于 tests/ 子目录，上跳一层才是项目根（lumina/ 与 main.py 所在处）。
+ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / 'lumina' / 'history_panel.py'
 
 
@@ -28,6 +29,7 @@ def load_detail_pane():
         '__name__': 'lumina._json_detail_regressions',
         '__package__': 'lumina',
         're': re, 'json': json, 'os': os, 'traceback': traceback,
+        'ClassVar': ClassVar,
         # 不导入 history_panel 或真实 threading/剪贴板模块。
         'threading': types.SimpleNamespace(Thread=None),
         'FlatMenu': Mock(),
@@ -218,9 +220,9 @@ class JsonDetailRegressionTests(unittest.TestCase):
         self.set_row(' { "a" : [1, true, null] } ')
 
     def make_row(self, raw, row_id=1, category='text', pinned=0):
-        return dict(id=row_id, content=raw, kind='text', category=category,
-                    pinned=pinned, data=None, data_size=0, source='test',
-                    created_at='2000-01-01', tags='', file_status='none')
+        return {'id': row_id, 'content': raw, 'kind': 'text', 'category': category,
+                    'pinned': pinned, 'data': None, 'data_size': 0, 'source': 'test',
+                    'created_at': '2000-01-01', 'tags': '', 'file_status': 'none'}
 
     def set_row(self, raw, row_id=1, category='text'):
         row = self.make_row(raw, row_id, category)

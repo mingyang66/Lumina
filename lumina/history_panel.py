@@ -4,28 +4,29 @@ import io
 import json
 import os
 import re
-import threading
 import tempfile
+import threading
 import time
 import traceback
 from datetime import datetime, timedelta
-
-from PIL import Image, ImageDraw, ImageTk
+from typing import ClassVar
 
 from . import clipboard_api
+
 
 class HistoryPanel:
     COMPACT_W = 1160
     COMPACT_H = 720
     TRANS_COLOR = "#010203"
-    FILTERS = (("all", "全部"), ("text", "文本"), ("code", "代码"),
-               ("link", "链接"), ("image", "图片"), ("file", "文件"),
-               ("pinned", "收藏"))
-    CATEGORY_LABELS = {"text": "文本", "code": "代码", "link": "链接",
+    FILTERS: ClassVar[tuple] = (
+        ("all", "全部"), ("text", "文本"), ("code", "代码"),
+        ("link", "链接"), ("image", "图片"), ("file", "文件"),
+        ("pinned", "收藏"))
+    CATEGORY_LABELS: ClassVar[dict] = {"text": "文本", "code": "代码", "link": "链接",
                         "image": "图片", "file": "文件"}
     # source 进程名（小写）→ (显示名, 系统色, 渲染风格)
     # 渲染风格：ide=代码风格 term=控制台风格 chat=聊天气泡 browser=地址栏+正文
-    SOURCE_APPS = {
+    SOURCE_APPS: ClassVar[dict] = {
         # IDE / 代码编辑器
         "idea64.exe": ("IDEA", "orange", "ide"),
         "pycharm64.exe": ("PyCharm", "green", "ide"),
@@ -81,7 +82,7 @@ class HistoryPanel:
 
     # ---------- Apple 设计令牌 ----------
     # 系统色板：(浅色, 深色)，取自 iOS/macOS system colors
-    SYS_COLORS = {
+    SYS_COLORS: ClassVar[dict] = {
         "blue":   ("#007AFF", "#0A84FF"),
         "green":  ("#34C759", "#30D158"),
         "indigo": ("#5856D6", "#5E5CE6"),
@@ -93,7 +94,7 @@ class HistoryPanel:
         "gray":   ("#8E8E93", "#98989D"),
     }
     # 语义令牌：(浅色, 深色)
-    THEME = {
+    THEME: ClassVar[dict] = {
         "window_bg":   ("#F2F2F7", "#161618"),  # systemGroupedBackground
         "card_bg":     ("#FFFFFF", "#2C2C2E"),  # secondarySystemGroupedBackground
         "field":       ("#E7E7EA", "#2C2C2E"),  # 搜索/输入填充
@@ -110,7 +111,7 @@ class HistoryPanel:
         "shadow":      ("#9AA0A8", "#000000"),
     }
     # 分类 → (系统色名, 字形名)
-    CAT_STYLE = {
+    CAT_STYLE: ClassVar[dict] = {
         "text":  ("gray",   "doc"),
         "code":  ("orange", "code"),
         "link":  ("blue",   "link"),
@@ -334,7 +335,7 @@ class HistoryPanel:
         im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         dr = ImageDraw.Draw(im)
         dr.rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.24),
-                             fill=rgb + (255,))
+                             fill=(*rgb, 255))
         self._draw_glyph(dr, glyph, s, (255, 255, 255, 255))
         out = im.resize((size, size), Image.LANCZOS)
         self._tile_cache[key] = out
@@ -374,7 +375,7 @@ class HistoryPanel:
         dr = ImageDraw.Draw(im)
         bg = self._hex_to_rgb(color)
         dr.rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.24),
-                             fill=bg + (255,))
+                             fill=(*bg, 255))
         font_size = max(8, int(s * 0.32))
         font = self._load_font(font_size)
         while font_size > 8:
@@ -411,7 +412,7 @@ class HistoryPanel:
         image = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle((0, 0, s - 1, s - 1), radius=int(s * 0.22),
-                               fill=color + (255,))
+                               fill=(*color, 255))
         font = self._load_font(max(8, int(s * (0.25 if len(label) > 3 else 0.34))))
         bbox = draw.textbbox((0, 0), label, font=font)
         draw.text(((s - bbox[2] + bbox[0]) / 2,
@@ -558,14 +559,14 @@ class HistoryPanel:
             h = canvas.winfo_height()
             if h <= 1:
                 return
-            f, l = float(first), float(last)
-            if l - f >= 0.999:
+            first_x, last_x = float(first), float(last)
+            if last_x - first_x >= 0.999:
                 if self._scroll_ind is not None:
                     canvas.delete(self._scroll_ind)
                     self._scroll_ind = None
                 return
-            y0 = max(2, f * h)
-            y1 = min(h - 2, l * h)
+            y0 = max(2, first_x * h)
+            y1 = min(h - 2, last_x * h)
             if y1 - y0 < 24:
                 y1 = min(h - 2, y0 + 24)
             w = max(3, int(round(4 * self._dpi)))
@@ -954,23 +955,23 @@ class HistoryPanel:
 
     def _open_popup_menu(self, kind):
         tk = self.tk
-        T, dark = self._theme()
+        T, _dark = self._theme()
         pop = tk.Toplevel(self.win)
         pop.overrideredirect(True)
         pop.configure(bg=T["hairline"])
         frame = tk.Frame(pop, bg=T["card_bg"])
         frame.pack(fill="both", expand=True, padx=7, pady=7)
         f = self._font(11)
-        btn_kw = dict(anchor="w", relief="flat", font=f, bd=0, cursor="hand2",
-                      bg=T["card_bg"], fg=T["label"],
-                      activebackground=T["fill_hover"], activeforeground=T["label"],
-                      highlightthickness=0, padx=16, pady=7)
+        btn_kw = {"anchor": "w", "relief": "flat", "font": f, "bd": 0, "cursor": "hand2",
+                      "bg": T["card_bg"], "fg": T["label"],
+                      "activebackground": T["fill_hover"], "activeforeground": T["label"],
+                      "highlightthickness": 0, "padx": 16, "pady": 7}
 
         def sm_icon(draw_fn, size, color_name="label", color_hex=None):
             """创建一个小尺寸图标 PhotoImage，供弹出菜单项右侧使用。"""
             from PIL import Image, ImageDraw, ImageTk
             s = size * 2  # 超采样保证平滑
-            rgb = self._hex_to_rgb(color_hex or self._sys(color_name)) + (255,)
+            rgb = (*self._hex_to_rgb(color_hex or self._sys(color_name)), 255)
             im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
             draw_fn(ImageDraw.Draw(im), s, rgb, max(1, int(s * 0.062)))
             return ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
@@ -1116,8 +1117,8 @@ class HistoryPanel:
         scale = 2
         image = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        fill = self._hex_to_rgb(theme["card_bg"]) + (255,)
-        border = self._hex_to_rgb(theme["hairline"]) + (255,)
+        fill = (*self._hex_to_rgb(theme["card_bg"]), 255)
+        border = (*self._hex_to_rgb(theme["hairline"]), 255)
         draw.rounded_rectangle(
             (0, 0, width * scale - 1, height * scale - 1),
             radius=10 * scale, fill=fill, outline=border, width=scale)
@@ -1366,11 +1367,20 @@ class HistoryPanel:
         base_removed = self._validate_diff_base()
         q = self.search_var.get().strip()
         limit = 60
-        rows = self.db.search(q, limit) if q else self.db.list_recent(limit)
+        # 筛选条件下推到 SQL：只有 LIMIT 作用在「匹配集合」上，收藏等记录
+        # 才不会因为被后续新记录挤出窗口而在界面上凭空消失。若先取最近
+        # limit 条再在内存里筛，库中有 8 条收藏时界面可能只显示 1 条。
+        pinned = self._filter == "pinned"
+        category = None if self._filter in ("all", "pinned") else self._filter
+        if q:
+            rows = self.db.search(q, limit, category=category, pinned=pinned)
+        else:
+            rows = self.db.list_recent(limit, category=category, pinned=pinned)
+        # 兜底：兼容 list_recent/search 未按新签名实现的桩件（如测试替身）。
         rows = self._apply_filter(rows)
         self._rows = {str(r["id"]): r for r in rows}
         self._refresh_cards(rows)
-        if self._filter == "pinned":
+        if pinned:
             total = self.db.count(q, pinned=True)
         elif self._filter == "all":
             total = self.db.count(q)
@@ -1425,7 +1435,7 @@ class HistoryPanel:
     def _render_list(self, canvas, rows, now, row_h, tile_size, margin,
                      title_size, meta_size):
         """Apple 分组卡片列表：分类彩色 tile + 标题/副标题 + 分组标题 + 选中态。"""
-        T, dark = self._theme()
+        T, _dark = self._theme()
         cw = canvas.winfo_width()
         if cw <= 1:
             cw = self._left_col_width()
@@ -1568,7 +1578,8 @@ class HistoryPanel:
         from PIL import ImageTk
         dark = self._is_dark_mode()
         if cat in ("image", "code", "file", "text", "link"):
-            source = r["source"] if "source" in r.keys() else ""
+            # r 为 sqlite3.Row，无 .get()，不能改用 dict.get 写法。
+            source = r["source"] if "source" in r else ""  # noqa: SIM401
             source_key = (source or "").lower()
             key = f"tile:source:{source_key}:{size}:{dark}"
             hit = self._thumb_cache.get(key)
@@ -1593,8 +1604,8 @@ class HistoryPanel:
         except Exception:
             return None
         img.thumbnail((size - 4, size - 4), Image.LANCZOS)
-        tile_bg = self._hex_to_rgb(self._c("card_bg")) + (255,)
-        border = self._hex_to_rgb(self._c("hairline")) + (255,)
+        tile_bg = (*self._hex_to_rgb(self._c("card_bg")), 255)
+        border = (*self._hex_to_rgb(self._c("hairline")), 255)
         out = Image.new("RGBA", (size, size), tile_bg)
         out.paste(img, ((size - img.width) // 2, (size - img.height) // 2), img)
         ss = 2
@@ -1636,8 +1647,8 @@ class HistoryPanel:
             bw = ss
         im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         ImageDraw.Draw(im).rounded_rectangle(
-            [0, 0, W - 1, H - 1], radius=radius, fill=fill + (255,),
-            outline=border + (255,), width=max(1, bw))
+            [0, 0, W - 1, H - 1], radius=radius, fill=(*fill, 255),
+            outline=(*border, 255), width=max(1, bw))
         photo = ImageTk.PhotoImage(im.resize((max(1, w), max(1, h)), Image.LANCZOS))
         self._cardbg_cache[key] = photo
         return photo
@@ -1650,7 +1661,7 @@ class HistoryPanel:
         if hit is not None:
             return hit
         from PIL import Image, ImageDraw, ImageTk
-        rgb = self._hex_to_rgb(self._sys("orange")) + (255,)
+        rgb = (*self._hex_to_rgb(self._sys("orange")), 255)
         ss = 2
         s = size * ss
         im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
@@ -1676,12 +1687,12 @@ class HistoryPanel:
         hit = self._marker_cache.get(key)
         if hit is not None:
             return hit
-        from PIL import Image, ImageDraw, ImageTk
         import math
 
+        from PIL import Image, ImageDraw, ImageTk
+
         color_name = "orange" if selected else "gray"
-        color = self._hex_to_rgb(
-            self._sys(color_name) if selected else self._c("label2")) + (255,)
+        color = (*self._hex_to_rgb(self._sys(color_name) if selected else self._c("label2")), 255)
         ss = 3
         s = size * ss
         image = Image.new("RGBA", (s, s), (0, 0, 0, 0))
@@ -1697,7 +1708,7 @@ class HistoryPanel:
         if selected:
             draw.polygon(points, fill=color)
         else:
-            draw.line(points + [points[0]], fill=color, width=max(2, s // 14),
+            draw.line([*points, points[0]], fill=color, width=max(2, s // 14),
                       joint="curve")
         photo = ImageTk.PhotoImage(image.resize((size, size), Image.LANCZOS))
         self._marker_cache[key] = photo
@@ -1969,7 +1980,7 @@ class HistoryPanel:
         self.win.bind_all("<B1-Motion>", self._global_border_move, add="+")
         self.win.bind_all("<ButtonRelease-1>", self._global_border_release, add="+")
 
-        T, dark = self._theme()
+        T, _dark = self._theme()
         win_bg = T["window_bg"]
         # 内容容器不透明（避免缝隙透出桌面）；其内缩大于圆角背景的角排除区，故不产生直角溢出
         self._cmp_root = tk.Frame(self.win, bg=win_bg)
@@ -1986,11 +1997,11 @@ class HistoryPanel:
         tk.Label(title_bar, text="Lumina", bg=win_bg, fg=T["accent"],
                  font=("Segoe UI", max(13, int(round(14 * dpi))), "bold"),
                  anchor="w").pack(side="left", padx=(10, 14))
-        menu_btn_kw = dict(
-            bd=0, bg=win_bg, activebackground=T["fill_hover"],
-            activeforeground=T["label"], relief="flat", cursor="hand2",
-            highlightthickness=0, font=self._font(11, "bold"),
-            fg=T["label"], padx=6, pady=2)
+        menu_btn_kw = {
+            "bd": 0, "bg": win_bg, "activebackground": T["fill_hover"],
+            "activeforeground": T["label"], "relief": "flat", "cursor": "hand2",
+            "highlightthickness": 0, "font": self._font(11, "bold"),
+            "fg": T["label"], "padx": 6, "pady": 2}
         self._settings_btn = tk.Button(
             title_bar, text="设置",
             command=lambda: self._toggle_popup_menu("settings", self._settings_btn),
@@ -2235,7 +2246,7 @@ class HistoryPanel:
             s = size * scale
             image = Image.new("RGBA", (s, s), (0, 0, 0, 0))
             draw = ImageDraw.Draw(image)
-            color = self._hex_to_rgb(color) + (255,)
+            color = (*self._hex_to_rgb(color), 255)
             width = max(2, round(s * 0.07))
             left, right = s * 0.28, s * 0.72
             center = s * 0.50
@@ -2264,7 +2275,7 @@ class HistoryPanel:
         box = max(8, int(box))
         ss = 2
         s = box * ss
-        rgb = self._hex_to_rgb(color_hex) + (255,)
+        rgb = (*self._hex_to_rgb(color_hex), 255)
         im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         draw_fn(ImageDraw.Draw(im), s, rgb, max(2, int(round(s * weight))))
         return ImageTk.PhotoImage(im.resize((box, box), Image.LANCZOS))
@@ -2274,7 +2285,7 @@ class HistoryPanel:
         box = max(14, int(round(16 * dpi)))
         ss = 2
         s = box * ss
-        rgb = self._hex_to_rgb(color_hex) + (255,)
+        rgb = (*self._hex_to_rgb(color_hex), 255)
         im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         dr = ImageDraw.Draw(im)
         w = max(2, int(round(s * 0.10)))
@@ -2289,7 +2300,7 @@ class HistoryPanel:
         ss = 2
         im = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
         dr = ImageDraw.Draw(im)
-        rgb = self._hex_to_rgb(fill_hex) + (255,)
+        rgb = (*self._hex_to_rgb(fill_hex), 255)
         dr.rounded_rectangle([0, 0, w * ss - 1, h * ss - 1], radius=(h * ss) // 2,
                              fill=rgb)
         return ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
@@ -2395,14 +2406,14 @@ class HistoryPanel:
         im = Image.new("RGBA", (s_w, s_h), (0, 0, 0, 0))
         dr = ImageDraw.Draw(im)
         if sel:
-            fill = self._hex_to_rgb(T["accent"]) + (255,)
+            fill = (*self._hex_to_rgb(T["accent"]), 255)
             fg = (255, 255, 255, 255)
         elif hover:
-            fill = self._hex_to_rgb(self._chip_color(key, T, soft=True)) + (255,)
-            fg = self._hex_to_rgb(self._chip_color(key, T)) + (255,)
+            fill = (*self._hex_to_rgb(self._chip_color(key, T, soft=True)), 255)
+            fg = (*self._hex_to_rgb(self._chip_color(key, T)), 255)
         else:
-            fill = self._hex_to_rgb(T["field"]) + (255,)
-            fg = self._hex_to_rgb(T["label"]) + (235,)
+            fill = (*self._hex_to_rgb(T["field"]), 255)
+            fg = (*self._hex_to_rgb(T["label"]), 235)
         dr.rounded_rectangle([0, 0, s_w - 1, s_h - 1], radius=s_h // 2, fill=fill)
         dr.text(((s_w - tw) / 2 - bb[0], (s_h - th) / 2 - bb[1]), label,
                 font=fnt, fill=fg)
@@ -2531,10 +2542,10 @@ class HistoryPanel:
         """Place corner hit areas at the actual outer window edges."""
         size = max(10, int(round(self.RESIZE_GRIP * self._dpi)))
         positions = {
-            "nw": dict(x=0, y=0),
-            "ne": dict(relx=1, x=-size, y=0),
-            "sw": dict(x=0, rely=1, y=-size),
-            "se": dict(relx=1, rely=1, x=-size, y=-size),
+            "nw": {"x": 0, "y": 0},
+            "ne": {"relx": 1, "x": -size, "y": 0},
+            "sw": {"x": 0, "rely": 1, "y": -size},
+            "se": {"relx": 1, "rely": 1, "x": -size, "y": -size},
         }
         for edges, place_options in positions.items():
             grip = self.tk.Frame(
@@ -2858,8 +2869,8 @@ class HistoryPanel:
         try:
             rect = (ctypes.c_long * 4)()
             if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, rect, 0):
-                l, t, r, b = rect[0], rect[1], rect[2], rect[3]
-                return l, t, r - l, b - t
+                left, top, right, bottom = rect[0], rect[1], rect[2], rect[3]
+                return left, top, right - left, bottom - top
         except Exception:
             pass
         return None
@@ -3061,7 +3072,7 @@ class DetailPane:
         r"|function|var|let|const|new|delete|typeof|instanceof|this|null|true"
         r"|false|switch|case|default|do|throw|catch|of|export|extends|super)\b)",
         re.S)
-    EXT_COLORS = {
+    EXT_COLORS: ClassVar[dict] = {
         "folder": "gray",
         ".zip": "orange", ".rar": "orange", ".7z": "orange", ".gz": "orange",
         ".tar": "orange", ".doc": "blue", ".docx": "blue", ".txt": "gray",
@@ -3286,7 +3297,7 @@ class DetailPane:
             meta += f" · 归档：{row['file_status'] or 'none'}"
         self._meta_title.configure(text=title)
         self._meta.configure(text=meta)
-        source_name, source_color, _style = self.panel._source_app(row["source"])
+        source_name, _source_color, _style = self.panel._source_app(row["source"])
         from PIL import ImageTk
         icon = ImageTk.PhotoImage(self.panel._source_code_tile(
             row["source"], max(24, int(round(28 * self.panel._dpi)))))
@@ -3322,7 +3333,7 @@ class DetailPane:
                 image = Image.new("RGBA", (width * 2, height * 2), (0, 0, 0, 0))
                 ImageDraw.Draw(image).rounded_rectangle(
                     (0, 0, width * 2 - 1, height * 2 - 1),
-                    radius=radius * 2, fill=self.panel._hex_to_rgb(color) + (255,))
+                    radius=radius * 2, fill=(*self.panel._hex_to_rgb(color), 255))
                 return ImageTk.PhotoImage(image.resize((width, height), Image.LANCZOS))
 
             normal_photo = pill(fill)
@@ -3384,14 +3395,14 @@ class DetailPane:
             return
         self._close_menu()
         items = [
-            dict(label="格式化", hint="2 空格", kind="format",
-                 command=lambda: self._transform_json("format"),
-                 enabled=not self._json_busy, selected=self._json_mode == "format"),
-            dict(label="压缩", hint="紧凑输出", kind="compress",
-                 command=lambda: self._transform_json("compress"),
-                 enabled=not self._json_busy, selected=self._json_mode == "compress"),
-            dict(label="恢复原文", hint="", kind="restore", command=self._restore_json,
-                 enabled=self._json_text is not None or self._json_busy, selected=False),
+            {"label": "格式化", "hint": "2 空格", "kind": "format",
+                 "command": lambda: self._transform_json("format"),
+                 "enabled": not self._json_busy, "selected": self._json_mode == "format"},
+            {"label": "压缩", "hint": "紧凑输出", "kind": "compress",
+                 "command": lambda: self._transform_json("compress"),
+                 "enabled": not self._json_busy, "selected": self._json_mode == "compress"},
+            {"label": "恢复原文", "hint": "", "kind": "restore", "command": self._restore_json,
+                 "enabled": self._json_text is not None or self._json_busy, "selected": False},
         ]
         self._in_menu = True
         self._flat_menu = JsonPopup(self.tk, self.panel.win, items,
@@ -3404,7 +3415,7 @@ class DetailPane:
     def _transform_json(self, mode):
         if self.row is None or self.cat not in ("text", "code"):
             return
-        from .json_tools import transform_json, MAX_INPUT_BYTES
+        from .json_tools import MAX_INPUT_BYTES, transform_json
         raw = self.row["content"] or ""
         # 当前记录仅允许一个任务；忙时不改变有效请求编号。
         if self._json_busy:
@@ -3537,7 +3548,7 @@ class DetailPane:
         full_text = row["content"] or ""
         truncated = len(full_text) > self.TEXT_MAX
         content = full_text[:self.TEXT_MAX]
-        src_name, src_color, src_style = p._source_app(row["source"])
+        _src_name, src_color, src_style = p._source_app(row["source"])
         is_code = self.cat == "code" or src_style in ("ide", "term")
         console = src_style == "term"
         chat = src_style == "chat"
@@ -3604,8 +3615,8 @@ class DetailPane:
             h = h.lstrip("#")
             return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
         a, b = _p(c1), _p(c2)
-        return "#%02X%02X%02X" % tuple(
-            int(a[i] * t + b[i] * (1 - t)) for i in range(3))
+        return "#{:02X}{:02X}{:02X}".format(
+            *(int(a[i] * t + b[i] * (1 - t)) for i in range(3)))
 
     def _app_tile(self, color_name, letter, size):
         """应用色圆角 tile + 白色首字符，返回 PhotoImage。"""
@@ -3617,7 +3628,7 @@ class DetailPane:
         im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         dr = ImageDraw.Draw(im)
         dr.rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.22),
-                             fill=rgb + (255,))
+                             fill=(*rgb, 255))
         font = p._load_font(int(s * 0.52))
         bb = dr.textbbox((0, 0), letter, font=font)
         dr.text(((s - (bb[2] - bb[0])) / 2 - bb[0],
@@ -3764,7 +3775,6 @@ class DetailPane:
 
     def _file_row(self, parent, tk, path, T):
         resolved_path = self.panel._resolve_file_path(self.row)
-        display_path = path
         open_path = resolved_path or path
         exists = os.path.exists(open_path)
         is_dir = os.path.isdir(open_path)

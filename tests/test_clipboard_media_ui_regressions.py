@@ -1,20 +1,20 @@
 import ast
 import ctypes
-import traceback
 import importlib.util
 import io
-from pathlib import Path
 import struct
 import sys
 import threading
+import traceback
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
-
-ROOT = Path(__file__).resolve().parent
+# 测试位于 tests/ 子目录，上跳一层才是项目根（lumina/ 与 main.py 所在处）。
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def load_module(name, filename):
@@ -29,12 +29,28 @@ with patch.object(ctypes, 'windll', types.SimpleNamespace(
         user32=MagicMock(), kernel32=MagicMock(), shell32=MagicMock()), create=True):
     clipboard = load_module('clipboard_under_test', 'clipboard_api.py')
 media = load_module('media_under_test', 'media.py')
-with patch.dict(sys.modules, {
-        'lumina.clipboard_api': clipboard,
-        'lumina.region_selector': types.SimpleNamespace(RegionSelector=object),
-        'lumina.history_panel': types.SimpleNamespace(HistoryPanel=object),
-        'lumina.settings': types.SimpleNamespace(save_config=MagicMock())}):
+
+# 只替换用到的 4 个键。切勿改用 patch.dict(sys.modules, ...)：它在退出时按
+# 入口快照 clear+update，会把块内新导入的 lumina.diff_window / diff_tools /
+# json_tools 一并逐出，导致同名模块出现两份对象，后续 patch.object 打在陈旧
+# 模块上失效、dataclass 相等性判定失败（曾使 discover 出现 13 项假失败）。
+_FAKE_SUBMODULES = {
+    'lumina.clipboard_api': clipboard,
+    'lumina.region_selector': types.SimpleNamespace(RegionSelector=object),
+    'lumina.history_panel': types.SimpleNamespace(HistoryPanel=object),
+    'lumina.settings': types.SimpleNamespace(save_config=MagicMock()),
+}
+_MISSING = object()
+_saved_submodules = {name: sys.modules.get(name, _MISSING) for name in _FAKE_SUBMODULES}
+sys.modules.update(_FAKE_SUBMODULES)
+try:
     ui = load_module('lumina.ui_under_test', 'ui.py')
+finally:
+    for _name, _previous in _saved_submodules.items():
+        if _previous is _MISSING:
+            sys.modules.pop(_name, None)
+        else:
+            sys.modules[_name] = _previous
 
 
 class FakeWin32:
@@ -73,7 +89,6 @@ class FakeWin32:
 
     def free(self, handle):
         del self.blocks[handle]
-        return None
 
     def create_window(self, *args):
         with self.lock:

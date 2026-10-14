@@ -9,9 +9,9 @@ from PIL import Image
 
 from . import clipboard_api
 from .clipboard_listener import ClipboardListener
-from .media import grab_screen, image_to_dib, to_png
-from .settings import default_config_path, _resolve_db_path, save_config, set_autostart
 from .database import Database
+from .media import grab_screen, image_to_dib, to_png
+from .settings import _resolve_db_path, default_config_path, save_config, set_autostart
 from .system_tray import TrayIcon
 from .text_classifier import classify_text
 from .ui import UiServer
@@ -218,14 +218,15 @@ class LuminaApp:
         否则按文本写回文件路径。
         """
         try:
-            data = row["data"] if "data" in row.keys() else None
-            file_path = row["file_path"] if "file_path" in row.keys() else ""
+            # 注意：row 为 sqlite3.Row，无 .get()，不能改用 dict.get 写法。
+            data = row["data"] if "data" in row else None  # noqa: SIM401
+            file_path = row["file_path"] if "file_path" in row else ""  # noqa: SIM401
             if data is None and row["id"]:
                 full_row = self.db.get(row["id"])
                 if full_row is not None:
                     row = full_row
                     data = row["data"]
-                    file_path = row["file_path"] if "file_path" in row.keys() else ""
+                    file_path = row["file_path"] if "file_path" in row else ""  # noqa: SIM401
 
             if file_path and data is None:
                 archived = self.db.get_file_data(row['id'])

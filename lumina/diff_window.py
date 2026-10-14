@@ -31,9 +31,9 @@ class _ToolbarControl:
         self._segments = []
         self._group = None
         self._segment_start = 0
-        self.options = dict(text=text, state='normal', bg=owner.theme['toolbar_bg'],
-                            fg=owner.theme['label'], command=self.invoke,
-                            font=owner._ui_font, marker=None, icon=None)
+        self.options = {'text': text, 'state': 'normal', 'bg': owner.theme['toolbar_bg'],
+                            'fg': owner.theme['label'], 'command': self.invoke,
+                            'font': owner._ui_font, 'marker': None, 'icon': None}
         self.canvas = owner.tk.Canvas(
             parent, width=self._width, height=self._height,
             bg=owner.theme['window_bg'], bd=0, highlightthickness=0,
@@ -78,7 +78,8 @@ class _ToolbarControl:
             self._group._draw()
             return
         aa, s = 4, self.owner._scale
-        rgb = lambda color: tuple(value // 257 for value in self.canvas.winfo_rgb(color))
+        def rgb(color):
+            return tuple(value // 257 for value in self.canvas.winfo_rgb(color))
         bg, border, fg = self._colors()
         image = Image.new('RGB', (self._width * aa, self._height * aa),
                           rgb(self.owner.theme['window_bg']))
@@ -109,18 +110,18 @@ class _ToolbarControl:
             contour = Image.new('RGBA', image.size)
             contour_draw = ImageDraw.Draw(contour)
             contour_draw.rounded_rectangle(
-                bounds, radius=self._radius * aa, outline=rgb(segment_border) + (255,),
+                bounds, radius=self._radius * aa, outline=(*rgb(segment_border), 255),
                 width=segment_stroke)
             if x:
                 contour_draw.rectangle((x, inset + stroke, x + segment_stroke - 1,
                                         image.height - 1 - inset - stroke),
-                                       fill=rgb(segment_border if focused else border) + (255,))
+                                       fill=(*rgb(segment_border if focused else border), 255))
             end = x + segment._width * aa
             if focused and end < bounds[2]:
                 # 共享分隔线在焦点段内侧加粗，不改变相邻段的像素。
                 contour_draw.rectangle((end - segment_stroke, inset + stroke, end - 1,
                                         image.height - 1 - inset - stroke),
-                                       fill=rgb(segment_border) + (255,))
+                                       fill=(*rgb(segment_border), 255))
             region = (x, 0, end, image.height)
             image.paste(contour.crop(region), (x, 0), contour.crop(region))
         surface = image.resize((self._width, self._height), Image.Resampling.LANCZOS)
@@ -171,7 +172,7 @@ class _ToolbarControl:
             text_x = left + icon_width + gap + text_width / 2
             icon = Image.new('RGBA', (self._width * aa, self._height * aa))
             draw = ImageDraw.Draw(icon)
-            color = tuple(value // 257 for value in self.canvas.winfo_rgb(fg)) + (255,)
+            color = (*tuple(value // 257 for value in self.canvas.winfo_rgb(fg)), 255)
             stroke = max(1, round(1.25 * s * aa))
             x1, x2, y = left * aa, (left + icon_width) * aa, self._height * aa / 2
             for start, end, row in ((x1, x2, y - 3 * s * aa),
@@ -376,7 +377,8 @@ class _PopupMenu:
         if self._closed or self.owner._closed:
             return
         t, s, aa = self.owner.theme, self.owner._scale, 4
-        rgb = lambda color: tuple(value // 257 for value in self.canvas.winfo_rgb(color))
+        def rgb(color):
+            return tuple(value // 257 for value in self.canvas.winfo_rgb(color))
         w, h = self._view_width, self._view_height
         image = Image.new('RGB', (w * aa, h * aa), rgb(t['window_bg']))
         draw = ImageDraw.Draw(image)
@@ -388,7 +390,7 @@ class _PopupMenu:
         rows_image = image.copy()
         rows_draw = ImageDraw.Draw(rows_image)
         self._row_colors = []
-        for i, (_, title, description) in enumerate(self.rows):
+        for i in range(len(self.rows)):
             enabled, selected = self._enabled(i), self._selected(i)
             active = i == self._hover or (self._keyboard and i == self._active)
             bg = t['accent_soft'] if selected and enabled else (
@@ -514,7 +516,7 @@ class _BlockLabel:
         self.owner = owner
         self.frame = owner.tk.Frame(parent, bg=owner.theme['window_bg'],
                                     bd=0, highlightthickness=0, takefocus=0)
-        self.options = dict(text='', fg=owner.theme['label2'])
+        self.options = {'text': '', 'fg': owner.theme['label2']}
         self.labels = []
         for _ in range(3):
             label = owner.tk.Label(self.frame, text='', font=owner._ui_font,
@@ -711,10 +713,10 @@ class DiffWindow:
                 self._meta_left, self._summary_left, self._copy_left = meta, summary, copy_button
             else:
                 self._meta_right, self._summary_right, self._copy_right = meta, summary, copy_button
-            common = dict(font=('Consolas', 11), wrap='none', bd=0,
-                          highlightthickness=0, padx=4, pady=4, spacing1=0,
-                          spacing2=0, spacing3=0, state='disabled', undo=False,
-                          exportselection=False)
+            common = {'font': ('Consolas', 11), 'wrap': 'none', 'bd': 0,
+                          'highlightthickness': 0, 'padx': 4, 'pady': 4, 'spacing1': 0,
+                          'spacing2': 0, 'spacing3': 0, 'state': 'disabled', 'undo': False,
+                          'exportselection': False}
             gutter_frame = tk.Frame(pane, bg=t['field'], bd=0)
             gutter_frame.grid(row=1, column=0, sticky='ns')
             gutter_frame.grid_rowconfigure(0, weight=1)

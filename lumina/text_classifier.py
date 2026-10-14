@@ -49,7 +49,7 @@ def is_link(text):
     t = (text or "").strip()
     if not t or len(t) > 4096:
         return False
-    lines = [l.strip() for l in t.splitlines() if l.strip()]
+    lines = [line.strip() for line in t.splitlines() if line.strip()]
     if not lines or len(lines) > 20:
         return False
     for line in lines:
@@ -73,10 +73,10 @@ def is_code(text):
     if s.count("[") >= 1 and s.count("]") >= 1:
         score += 1
     score += min(sum(1 for k in _CODE_KEYWORDS if k in s), 4)
-    if any(l.rstrip().endswith((";", "{", "}")) for l in lines):
+    if any(line.rstrip().endswith((";", "{", "}")) for line in lines):
         score += 1
     if len(lines) >= 2 and any(
-            l.startswith(("    ", "\t")) and l.strip() for l in lines):
+            line.startswith(("    ", "\t")) and line.strip() for line in lines):
         score += 1
     if _COMMENT_RE.search(s):
         score += 1

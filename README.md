@@ -27,6 +27,36 @@ python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Lumina" `
 
 打包结果默认生成在 `dist/` 目录中，可执行文件为 `dist/Lumina.exe`。
 
+# 运行测试
+
+单元测试集中在 `tests/` 目录，全部基于标准库 `unittest`（不依赖 pytest）。
+
+在项目根目录执行：
+
+```bash
+python -m unittest discover
+```
+
+也可显式指定起始目录与顶层目录：
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+或单独运行某个测试模块（包路径形式，需带 `tests.` 前缀）：
+
+```bash
+python -m unittest tests.test_storage_regressions
+```
+
+说明：
+
+- `tests/__init__.py` 不可删除。`unittest discover` 只递归进入包含 `__init__.py`
+  的子目录，移除后整个测试集会被静默跳过。
+- 测试文件中通过 `Path(__file__).resolve().parent.parent` 定位项目根，新增测试
+  文件时请沿用该写法。
+- 当前用例数：328 项通过、2 项跳过（跳过项依赖符号链接权限）。
+
 # Lumina Clipboard Manager - Database Documentation
 
 ## Overview

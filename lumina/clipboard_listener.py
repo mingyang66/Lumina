@@ -150,13 +150,11 @@ class ClipboardListener(threading.Thread):
     def _consume_ignore(self, sequence):
         with self._ignore_lock:
             rng = self._ignore_range
-            if (rng and sequence and rng[0] < sequence <= rng[1]
-                    and time.monotonic() <= self._ignored_until):
-                return True
             # 不匹配时不清除区间：同一次写入会产生多条通知，需逐条比对；
             # 过期(2s)或下次写入自然覆盖。区间外的序列号只可能来自外部
             # 写入（写入期间剪贴板被我方持有，外部无法插入区间内）。
-            return False
+            return bool(rng and sequence and rng[0] < sequence <= rng[1]
+                        and time.monotonic() <= self._ignored_until)
 
     def stop(self):
         if self._hwnd:
@@ -178,9 +176,10 @@ class ClipboardListener(threading.Thread):
             wc.lpfnWndProc = self._wndproc_ref
             wc.hInstance = hinst
             wc.lpszClassName = self.CLASS_NAME
-            if not user32.RegisterClassExW(ctypes.byref(wc)):
-                if ctypes.GetLastError() != ERROR_CLASS_ALREADY_EXISTS:
-                    raise ctypes.WinError()
+            # 窗口类已存在（重复启动或热重载）不算失败，仅其他错误才抛出。
+            if (not user32.RegisterClassExW(ctypes.byref(wc))
+                    and ctypes.GetLastError() != ERROR_CLASS_ALREADY_EXISTS):
+                raise ctypes.WinError()
             hwnd = user32.CreateWindowExW(
                 0, self.CLASS_NAME, "Lumina", 0, 0, 0, 0, 0,
                 HWND_MESSAGE, None, hinst, None,

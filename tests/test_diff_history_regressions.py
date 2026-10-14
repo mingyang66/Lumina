@@ -1,12 +1,12 @@
 import ast
+import unittest
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
 from unittest.mock import Mock, call, patch
 
-
-ROOT = Path(__file__).resolve().parent
+# 测试位于 tests/ 子目录，上跳一层才是项目根（lumina/ 与 main.py 所在处）。
+ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / 'lumina' / 'history_panel.py'
 TREE = ast.parse(SOURCE.read_text(encoding='utf-8'), filename=str(SOURCE))
 METHOD_NAMES = {
@@ -115,8 +115,13 @@ class DiffHistoryRegressionTests(unittest.TestCase):
         self.panel = HistoryPanel()
         self.panel.db = Mock()
         self.panel.db.get_text.side_effect = lambda cid: self.records.get(str(cid))
-        self.panel.db.list_recent.side_effect = lambda limit: list(self.records.values())
-        self.panel.db.search.side_effect = lambda query, limit: [self.records['2']]
+        # 替身需接受下推筛选参数：refresh() 现在把 category/pinned 传给查询，
+        # 由 SQL 层完成筛选（避免匹配记录被 LIMIT 窗口挤出）。此处仍返回全集，
+        # 交由 _apply_filter 兜底筛选，以保持既有断言语义不变。
+        self.panel.db.list_recent.side_effect = (
+            lambda limit, category=None, pinned=False: list(self.records.values()))
+        self.panel.db.search.side_effect = (
+            lambda query, limit, category=None, pinned=False: [self.records['2']])
         self.panel.db.count.return_value = len(self.records)
         self.panel.ui = SimpleNamespace(show_text_diff=Mock())
         self.panel._diff_base_id = None
@@ -159,10 +164,10 @@ class DiffHistoryRegressionTests(unittest.TestCase):
 
     @staticmethod
     def make_row(cid, category, content, pinned=0, tags=''):
-        return dict(id=cid, category=category, content=content, pinned=pinned,
-                    kind='image' if category == 'image' else 'text',
-                    source='test.exe', created_at='2000-01-01', tags=tags,
-                    data_size=0, preview='截断列表预览')
+        return {'id': cid, 'category': category, 'content': content, 'pinned': pinned,
+                    'kind': 'image' if category == 'image' else 'text',
+                    'source': 'test.exe', 'created_at': '2000-01-01', 'tags': tags,
+                    'data_size': 0, 'preview': '截断列表预览'}
 
     def refresh_cards(self, rows):
         self.panel._rows_displayed = rows
@@ -418,7 +423,7 @@ class DiffHistoryRegressionTests(unittest.TestCase):
                            for cat in ('image', 'file', '', 'other')]
         invalid += [self.make_row(9, cat, value)
                     for cat in ('text', 'code', 'link')
-                    for value in (None, '正文'.encode('utf-8'), 123)]
+                    for value in (None, '正文'.encode(), 123)]
         for row in invalid:
             with self.subTest(row=row):
                 with patch.object(self.panel.db, 'get_text', return_value=row):
@@ -500,7 +505,8 @@ class DiffHistoryRegressionTests(unittest.TestCase):
                 self.assertIn('比对基准 ID 1', self.panel.status_var.get())
                 self.assertEqual(self.panel._refresh_cards.call_args.args[0],
                                  list(self.panel._rows.values()))
-        self.panel.db.search.assert_called_once_with('只匹配右侧', 60)
+        self.panel.db.search.assert_called_once_with(
+            '只匹配右侧', 60, category=None, pinned=False)
         self.panel.db.count.assert_has_calls([
             call('只匹配右侧'), call('', category='code'), call('', pinned=True)])
         self.panel._filter = 'all'
@@ -605,7 +611,7 @@ class DiffHistoryRegressionTests(unittest.TestCase):
     def test_invalid_target_never_opens_and_keeps_valid_base(self):
         invalid = [None, self.records['4'], self.records['5'],
                    dict(self.records['2'], content=None),
-                   dict(self.records['2'], content='非文本'.encode('utf-8'))]
+                   dict(self.records['2'], content='非文本'.encode())]
         for row in invalid:
             with self.subTest(row=row):
                 self.panel._diff_base_id = '1'

@@ -2,8 +2,8 @@ import argparse
 import os
 import sys
 
-from lumina.settings import default_config_path, load_config
 from lumina.database import Database
+from lumina.settings import default_config_path, load_config
 
 
 def cmd_run(cfg, config_path=None):
@@ -95,7 +95,7 @@ def cmd_export(cfg, clip_id, out):
                     raise ValueError('record has no archived file data')
             except (OSError, ValueError) as exc:
                 print(f'export failed: record {clip_id}: {exc}', file=sys.stderr)
-                raise SystemExit(1)
+                raise SystemExit(1) from None
             with open(out, 'wb') as stream:
                 stream.write(data)
         else:
@@ -136,10 +136,11 @@ def cmd_stats(cfg):
 def main():
     # pythonw.exe has no standard streams; keep background startup from failing
     # when the application logs status messages.
+    # 句柄需存活到进程结束（供后续 print 使用），故不适用 context manager。
     if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
     if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
     parser = argparse.ArgumentParser(prog="lumina",
                                      description="clipboard & screenshot archiver (SQLite)")
     default_config = default_config_path()

@@ -9,7 +9,8 @@ from unittest.mock import Mock, patch
 
 import lumina
 
-SOURCE = Path(__file__).parent / 'lumina' / 'json_popup.py'
+# 测试位于 tests/ 子目录，上跳一层才是项目根（lumina/ 与 main.py 所在处）。
+SOURCE = Path(__file__).resolve().parent.parent / 'lumina' / 'json_popup.py'
 MOUSE = types.SimpleNamespace(mouse_button_down=Mock(return_value=False))
 spec = importlib.util.spec_from_file_location('lumina._test_json_popup', SOURCE)
 MODULE = importlib.util.module_from_spec(spec)
@@ -580,7 +581,8 @@ class JsonPopupTests(unittest.TestCase):
         self.assertTrue(menu._closed)
 
     def test_cleanup_preserves_existing_bindings_and_reentrant_close(self):
-        old = lambda event: None
+        def old(event):
+            return None
         for target in (self.parent, self.text):
             target.bind('<Up>', old, add='+')
         closed = []

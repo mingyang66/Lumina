@@ -1,18 +1,22 @@
 import ast
 import importlib.util
 import sys
+import unittest
 from pathlib import Path
 from threading import Event, get_ident
 from types import SimpleNamespace
-import unittest
 from unittest.mock import mock_open, patch
 
 from lumina import diff_tools
-from test_diff_ui_regressions import UiServer, NAMESPACE as UI_GLOBALS
 
+# 同包内互相引用必须用相对导入：测试已成为 tests 包成员，绝对导入
+# `from test_diff_ui_regressions import ...` 在 discover 下会找不到模块。
+from .test_diff_ui_regressions import NAMESPACE as UI_GLOBALS
+from .test_diff_ui_regressions import UiServer
 
 # 隔离加载，不依赖 Tcl/Tk 安装，也不污染其他测试的 tkinter 模块。
-SOURCE = Path(__file__).parent / 'lumina' / 'diff_window.py'
+# 测试位于 tests/ 子目录，上跳一层才是项目根（lumina/ 与 main.py 所在处）。
+SOURCE = Path(__file__).resolve().parent.parent / 'lumina' / 'diff_window.py'
 spec = importlib.util.spec_from_file_location('lumina._test_diff_window', SOURCE)
 diff_window = importlib.util.module_from_spec(spec)
 fake_tkinter = SimpleNamespace(TclError=type('TclError', (Exception,), {}),
@@ -328,9 +332,7 @@ class DiffWindowTests(unittest.TestCase):
         self.photo_patch.start()
         self.addCleanup(self.photo_patch.stop)
         self.copies = []
-        self.tk = SimpleNamespace(**{name: FakeWidget for name in
-                                    ('Toplevel', 'Frame', 'Text', 'Label', 'Button',
-                                     'Scrollbar', 'Checkbutton', 'Canvas')}, BooleanVar=FakeVar, Misc=FakeWidget)
+        self.tk = SimpleNamespace(**dict.fromkeys(('Toplevel', 'Frame', 'Text', 'Label', 'Button', 'Scrollbar', 'Checkbutton', 'Canvas'), FakeWidget), BooleanVar=FakeVar, Misc=FakeWidget)
         self.ui = SimpleNamespace(_root=FakeWidget(), _tk=self.tk,
                                   actions=SimpleNamespace(copy_to_clipboard=self.copy))
         self.left = self.row('a\r\nb\n最后', 1)
@@ -500,7 +502,8 @@ class DiffWindowTests(unittest.TestCase):
                     self.assertEqual(popup.canvas.canvas_texts[2][1]['fill'], t['label'])
                     self.assertTrue(all(item[1]['fill'] == t['label2']
                                         for item in popup.canvas.canvas_texts[1::2]))
-                    rgb = lambda color: tuple(value // 257 for value in popup.canvas.winfo_rgb(color))
+                    def rgb(color):
+                        return tuple(value // 257 for value in popup.canvas.winfo_rgb(color))
                     self.assertEqual(popup._photo.getpixel((0, 0)), rgb(t['window_bg']))
                     self.assert_aa_pixel(popup._photo, (popup._width // 2, 0), t['card_border'], 35)
                     self.assertEqual(popup._photo.getpixel((popup._width // 2, popup._pad + popup._row_height // 2)),
@@ -1507,7 +1510,7 @@ class DiffWindowTests(unittest.TestCase):
         self.finish()
         self.assertIs(window._result, previous)
         self.assertEqual(window._summary_left.options['text'], summary)
-        self.assertFalse((window._mode == 'json_format'))
+        self.assertFalse(window._mode == 'json_format')
         self.assertFalse(window._options['ignore_line_endings'].get())
         self.assertEqual(window._rules_button._tooltip_text, '未启用比较规则')
         self.assertEqual(window._block_label.options['text'], f'待定位 / {len(previous.blocks)} 处')
@@ -1743,7 +1746,7 @@ class DiffWindowTests(unittest.TestCase):
         self.finish()
         self.assertIs(window._result, previous)
         self.assertTrue(window._retained)
-        self.assertFalse((window._mode == 'json_format'))
+        self.assertFalse(window._mode == 'json_format')
         self.assertIn('保留上次结果', window._status.options['text'])
         self.assertEqual([text.content for text in window._texts], texts)
         self.assertEqual([gutter.content for gutter in window._gutters], gutters)
@@ -1881,9 +1884,10 @@ class DiffWindowTests(unittest.TestCase):
                         ((x2 - 12 * s, y - 24 * s), (x2, y - 12 * s), (x2 - 12 * s, y)),
                         ((x2, y + 12 * s), (x1, y + 12 * s)),
                         ((x1 + 12 * s, y), (x1, y + 12 * s), (x1 + 12 * s, y + 24 * s))])
-                    rgb = lambda color: tuple(value // 257 for value in button.canvas.winfo_rgb(color))
+                    def rgb(color):
+                        return tuple(value // 257 for value in button.canvas.winfo_rgb(color))
                     for call in arrow_calls:
-                        self.assertEqual(call.kwargs['fill'], rgb(t['label']) + (255,))
+                        self.assertEqual(call.kwargs['fill'], (*rgb(t['label']), 255))
                         self.assertEqual(call.kwargs['width'], round(5 * s))
                     text_x, text_y = button.canvas.options['canvas_text_position']
                     self.assertAlmostEqual(text_x + text_width / 2, button._width - left)
@@ -1937,8 +1941,8 @@ class DiffWindowTests(unittest.TestCase):
     def test_swap_mouse_button_preserves_complete_rows_roles_rules_and_reopened_session(self):
         server = self.use_session_server()
         rows = (self.row('{"a":1}', 51), self.row('{"a":2}', 52))
-        rows[0].update(data='完整 A'.encode('utf-8'), file_path='A.txt', extra={'value': 1})
-        rows[1].update(data='完整 B'.encode('utf-8'), file_path='B.txt', extra={'value': 2})
+        rows[0].update(data='完整 A'.encode(), file_path='A.txt', extra={'value': 1})
+        rows[1].update(data='完整 B'.encode(), file_path='B.txt', extra={'value': 2})
         server.show_text_diff(*rows)
         self.window = server._diff_window
         self.finish()
@@ -1974,8 +1978,8 @@ class DiffWindowTests(unittest.TestCase):
         self.finish()
         self.assert_display(rows, ('A', 'B'), ignore_trailing_space=True,
                             ignore_line_endings=True, json_format=True)
-        self.assertEqual(rows[0]['data'], '完整 A'.encode('utf-8'))
-        self.assertEqual(rows[1]['data'], '完整 B'.encode('utf-8'))
+        self.assertEqual(rows[0]['data'], '完整 A'.encode())
+        self.assertEqual(rows[1]['data'], '完整 B'.encode())
 
     def test_toolbar_mouse_click_restores_border_and_navigation_group(self):
         for dpi in (96, 144):
@@ -2181,7 +2185,7 @@ class DiffWindowTests(unittest.TestCase):
             self.assertIsNotNone(window._mode_popup)
             request.assert_not_called()
             self.menu_click(window._mode_popup, 1)
-            self.assertTrue((window._mode == 'json_format'))
+            self.assertTrue(window._mode == 'json_format')
             request.assert_called_once_with()
             window._refresh_rules()
             self.assertEqual(window._mode_button.options['marker'], 'check')
@@ -2295,7 +2299,8 @@ class DiffWindowTests(unittest.TestCase):
             window = diff_window.DiffWindow(self.ui, self.left, self.right, theme=({}, dark))
             self.addCleanup(window.close)
             t, button = window.theme, window._rules_button
-            rgb = lambda color: tuple(value // 257 for value in button.winfo_rgb(color))
+            def rgb(color):
+                return tuple(value // 257 for value in button.winfo_rgb(color))
             with self.subTest(dark=dark):
                 self.assertNotEqual(t['toolbar_bg'], t['accent_soft'])
                 self.assertNotEqual(t['toolbar_bg'], t['toolbar_border'])
@@ -2413,7 +2418,8 @@ class DiffWindowTests(unittest.TestCase):
             self.addCleanup(window.close)
             button, s = window._mode_button, window._scale
             t = window.theme
-            rgb = lambda color: tuple(value // 257 for value in button.winfo_rgb(color))
+            def rgb(color):
+                return tuple(value // 257 for value in button.winfo_rgb(color))
             with self.subTest(dpi=dpi):
                 self.assertEqual(button._photo.size, (round(172 * s), round(30 * s)))
                 self.assertEqual(button._radius, round(7 * s))
@@ -2449,7 +2455,8 @@ class DiffWindowTests(unittest.TestCase):
                     window = diff_window.DiffWindow(self.ui, self.left, self.right, theme=({}, dark))
                 self.addCleanup(window.close)
                 group, s, t = window._navigation, window._scale, window.theme
-                rgb = lambda color: tuple(value // 257 for value in group.winfo_rgb(color))
+                def rgb(color):
+                    return tuple(value // 257 for value in group.winfo_rgb(color))
                 with self.subTest(dpi=dpi, dark=dark):
                     window._previous.configure(state='normal')
                     window._next.configure(state='normal')
@@ -2631,7 +2638,7 @@ class DiffWindowTests(unittest.TestCase):
                                             self.assertIn(('missing_field', f'{line}.0', f'{line}.5'), text.tags)
                                         elif present:
                                             tag = 'changed' if row.kind == 'replace' else 'one_sided'
-                                            for begin, end in getattr(row, side + '_spans'):
+                                            for begin, _end in getattr(row, side + '_spans'):
                                                 self.assertEqual(text.background_at(f'{line}.{begin}'),
                                                                  text.options['emphasis_' + tag]['background'])
                                 text.tag_add('sel', '1.0', '100.0')
@@ -2665,7 +2672,7 @@ class DiffWindowTests(unittest.TestCase):
                         if window._busy:
                             window._worker.finish()
                             window._poll()
-                        for swapped in (False, True):
+                        for _swapped in (False, True):
                             missing_count = 0
                             for side, text in zip(('left', 'right'), window._texts):
                                 self.assertEqual(text.options['missing']['background'],
@@ -2710,12 +2717,12 @@ class DiffWindowTests(unittest.TestCase):
                             for _ in window._result.blocks:
                                 window._navigate(1)
                                 for text in window._texts:
-                                    for _, start, stop in (t for t in text.tags if t[0] == 'one_sided'):
+                                    for _, start, _stop in (t for t in text.tags if t[0] == 'one_sided'):
                                         line = int(start.split('.')[0])
                                         self.assertEqual(text.background_at(f'{line}.1000'),
                                                          text.options['one_sided']['background'])
                                         side = 'left' if text is window._texts[0] else 'right'
-                                        for begin, end in getattr(window._result.rows[line - 1], side + '_spans'):
+                                        for begin, _end in getattr(window._result.rows[line - 1], side + '_spans'):
                                             self.assertEqual(text.background_at(f'{line}.{begin}'),
                                                              text.options['emphasis_one_sided']['background'])
                                     for _, start, stop in (t for t in text.tags if t[0] == 'missing'):
@@ -2763,7 +2770,7 @@ class DiffWindowTests(unittest.TestCase):
                         window._mode = mode
                         window.update(*(rows[::-1] if reverse else rows))
                         self.finish()
-                        for swapped in (False, True):
+                        for _swapped in (False, True):
                             for current in (False, True):
                                 if current:
                                     for _ in window._result.blocks:
@@ -2783,7 +2790,7 @@ class DiffWindowTests(unittest.TestCase):
                                             if row.kind in ('insert', 'delete'):
                                                 self.assertIn('one_sided', text.tag_names(start))
                                                 self.assertIn('one_sided', text.tag_names(f'{line}.end'))
-                                                for begin, end in getattr(row, side + '_spans'):
+                                                for begin, _end in getattr(row, side + '_spans'):
                                                     self.assertIn('emphasis_one_sided',
                                                                   text.tag_names(f'{line}.{begin}'))
                                             continue
@@ -3008,7 +3015,7 @@ class DiffWindowTests(unittest.TestCase):
             self.assertEqual(marker.options['grid']['column'], 1)
             self.assertIs(marker.parent, gutter.parent)
             self.assertEqual(marker.rectangles, [((0, 16, 2, 50),
-                                                 dict(fill=window.theme['accent'], outline='', tags='block'))])
+                                                 {'fill': window.theme['accent'], 'outline': '', 'tags': 'block'})])
         self.assertEqual([[tag for tag in text.tags if tag[0] != 'current']
                           for text in window._texts], original_tags)
         for text in window._texts:
@@ -3073,7 +3080,7 @@ class DiffWindowTests(unittest.TestCase):
                             self.assertLess(priority.index('current'), priority.index(tag))
                             self.assertLess(priority.index(tag), priority.index('sel'))
                     window._navigate(1)
-                    for side, text in enumerate(window._texts):
+                    for text in window._texts:
                         self.assertEqual([tag for tag in text.tags if tag[0] == 'current'],
                                          [('current', '2.0', '4.0')])
                         # replace 未强调字符及空占位使用蓝底，单侧存在行保持红底。

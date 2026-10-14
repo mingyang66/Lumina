@@ -3,26 +3,27 @@
 tkinter 要求所有窗口操作在创建它的同一线程内进行，且一个进程最好只有一个
 Tk 解释器。因此 toast 与面板共用这里的一个 UI 线程，通过队列接收外部指令。
 """
-import io
 import gc
-import os
+import io
 import queue
 import threading
 import time
 import traceback
+from typing import ClassVar
 
 from . import clipboard_api
-from .region_selector import RegionSelector
-from .history_panel import HistoryPanel
 from .diff_window import DiffWindow
+from .history_panel import HistoryPanel
+from .region_selector import RegionSelector
 from .settings import save_config
+
 
 class UiServer:
     BG = "#1e1e2e"
     BORDER = "#45475a"
     TITLE_FG = "#a6e3a1"
     TEXT_FG = "#cdd6f4"
-    LABELS = {"text": "文本", "image": "图片", "screenshot": "截图",
+    LABELS: ClassVar[dict] = {"text": "文本", "image": "图片", "screenshot": "截图",
               "region": "选区截图", "download": "下载", "code": "代码",
               "link": "链接", "file": "文件"}
 
@@ -590,8 +591,7 @@ class FloatingBall:
             bottom_rgb = bottom_color[:3]
             for y in range(top, bottom + 1):
                 ratio = (y - top) / max(1, bottom - top)
-                color = tuple(round(top_rgb[i] * (1 - ratio) + bottom_rgb[i] * ratio)
-                              for i in range(3)) + (top_color[3],)
+                color = (*tuple(round(top_rgb[i] * (1 - ratio) + bottom_rgb[i] * ratio) for i in range(3)), top_color[3])
                 gradient_draw.line((left, y, right, y), fill=color, width=1)
             mask = Image.new("L", (size, size), 0)
             ImageDraw.Draw(mask).rounded_rectangle(
@@ -683,10 +683,7 @@ class FloatingBall:
         bw = self.win.winfo_width()
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
-        if bx - pw - 12 >= 0:
-            x = bx - pw - 12
-        else:
-            x = bx + bw + 12
+        x = bx - pw - 12 if bx - pw - 12 >= 0 else bx + bw + 12
         y = by + (self.size - ph) // 2
         return max(0, min(x, sw - pw)), max(0, min(y, sh - ph))
 

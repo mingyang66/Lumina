@@ -1,28 +1,29 @@
 import ast
 import io
+import itertools
 import math
 import os
-from pathlib import Path
 import shutil
 import time
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image, ImageFont
 
-
 # 只加载实际源码中的类，隔离包初始化和剪贴板模块的导入副作用。
-SOURCE_PATH = Path(__file__).parent / "lumina" / "region_selector.py"
+# 测试位于 tests/ 子目录，上跳一层才是项目根（lumina/ 与 main.py 所在处）。
+SOURCE_PATH = Path(__file__).resolve().parent.parent / "lumina" / "region_selector.py"
 SOURCE = SOURCE_PATH.read_text(encoding="utf-8")
 CLASS_NODE = next(
     node for node in ast.parse(SOURCE).body
     if isinstance(node, ast.ClassDef) and node.name == "RegionSelector"
 )
-NAMESPACE = dict(
-    Image=Image, ImageFont=ImageFont, io=io, math=math,
-    os=os, time=time, shutil=shutil,
-)
+NAMESPACE = {
+    "Image": Image, "ImageFont": ImageFont, "io": io, "math": math,
+    "os": os, "time": time, "shutil": shutil, "itertools": itertools,
+}
 exec(compile(ast.Module(body=[CLASS_NODE], type_ignores=[]),
              str(SOURCE_PATH), "exec"), NAMESPACE)
 RegionSelector = NAMESPACE["RegionSelector"]
@@ -152,20 +153,20 @@ def make_selector():
         StringVar=FakeStringVar, Entry=FakeTkWidget, TclError=RuntimeError,
     ))
     selector._ImageTk = SimpleNamespace(PhotoImage=lambda image: image)
-    state = dict(
-        done=False, _annotations=[], _undo_stack=[], _redo=[], _edit_items=[],
-        _oval_photos={}, _text_editor=None, _text_live_item=None,
-        _text_commit=None, _text_cancel=None, _text_refresh=None,
-        _text_edit_index=None, _text_click_bindings=[], _text_click_binding=None,
-        _text_caret_job=None, _text_tool_anchor=None, _text_font_size=18,
-        _text_color="#ff3b30", _draw_start=None, _draw_points=[],
-        _draw_preview=None, _draw_preview_items=[], _preview_point_index=0,
-        _annotation_draw_time=0.0, _tool="text", _mosaic_radius=12,
-        _draw_mosaic_radius=12, _draw_style=(6, "#ff3b30"),
-        _drawing_styles={tool: [6, "#ff3b30"]
+    state = {
+        "done": False, "_annotations": [], "_undo_stack": [], "_redo": [], "_edit_items": [],
+        "_oval_photos": {}, "_text_editor": None, "_text_live_item": None,
+        "_text_commit": None, "_text_cancel": None, "_text_refresh": None,
+        "_text_edit_index": None, "_text_click_bindings": [], "_text_click_binding": None,
+        "_text_caret_job": None, "_text_tool_anchor": None, "_text_font_size": 18,
+        "_text_color": "#ff3b30", "_draw_start": None, "_draw_points": [],
+        "_draw_preview": None, "_draw_preview_items": [], "_preview_point_index": 0,
+        "_annotation_draw_time": 0.0, "_tool": "text", "_mosaic_radius": 12,
+        "_draw_mosaic_radius": 12, "_draw_style": (6, "#ff3b30"),
+        "_drawing_styles": {tool: [6, "#ff3b30"]
                          for tool in ("rect", "oval", "arrow", "brush")},
-        _sel_box=(0, 0, 100, 100), sx=1, sy=1, sw=100, sh=100,
-    )
+        "_sel_box": (0, 0, 100, 100), "sx": 1, "sy": 1, "sw": 100, "sh": 100,
+    }
     for name, value in state.items():
         setattr(selector, name, value)
     selector.src = Image.new("RGB", (100, 100), "white")

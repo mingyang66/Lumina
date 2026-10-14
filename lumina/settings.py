@@ -63,7 +63,7 @@ def load_config(path=None):
         bundle_dir = sys._MEIPASS
         # 首次启动仅使用 bundle 默认模板，后续读取稳定配置。
         source = os.path.join(bundle_dir, 'config.json')
-    with open(source, 'r', encoding='utf-8') as stream:
+    with open(source, encoding='utf-8') as stream:
         cfg = json.load(stream)
     if not isinstance(cfg, dict):
         raise ValueError(f'配置文件必须是 JSON 对象: {source}')

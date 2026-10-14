@@ -1,14 +1,13 @@
 """保真文本比较；超出匹配预算时拒绝比较，不返回近似的行差异。"""
 
-from dataclasses import dataclass
-from difflib import SequenceMatcher
-from decimal import Decimal, InvalidOperation, MAX_EMAX
 import json
 import re
+from dataclasses import dataclass
+from decimal import MAX_EMAX, Decimal, InvalidOperation
+from difflib import SequenceMatcher
 from time import monotonic
 
 from . import json_tools
-
 
 MAX_CHARACTERS = 1024 * 1024
 MAX_TOTAL_LINES = 10000
@@ -560,9 +559,10 @@ def compare_text(left, right, ignore_trailing_space=False, ignore_line_endings=F
     left_keys = _keys(left_lines, ignore_trailing_space, ignore_line_endings)
     right_keys = _keys(right_lines, ignore_trailing_space, ignore_line_endings)
     rule_equal = left_keys == right_keys
-    # 两侧都是 JSON 时按"深度 + 键名"合并对齐，让同名字段必然配到同一行；
-    # 其余文本完全沿用按行位置对齐的原有语义。
-    json_aligned = not rule_equal and _json_document(left) and _json_document(right)
+    # 仅 JSON 格式化模式下（两侧都是 JSON）按"深度 + 键名"合并对齐，让同名字段
+    # 必然配到同一行。原文比较模式必须保持按行位置对齐的原始语义，不得格式化。
+    json_aligned = (json_format and not rule_equal
+                    and _json_document(left) and _json_document(right))
     matcher = _BoundedMatcher(left_keys, right_keys, budget)
     # 完全规则相等时跳过重复行搜索，仍使用准确的完整 equal opcode。
     if rule_equal:
@@ -609,7 +609,9 @@ def compare_text(left, right, ignore_trailing_space=False, ignore_line_endings=F
                     ls, rs = _spans(lt, rt, budget)
                 rows.append(AlignedRow(lt, rt, li + 1 if li is not None else None,
                                        ri + 1 if ri is not None else None, kind, ls, rs, le, reol))
-    if not rule_equal:
+    # 同名字段跨行改判（shared_change/neutral）只属于 JSON 对齐路径的产物；
+    # 原文比较模式不做此改判，单侧字段一律保持 insert/delete 的红色语义。
+    if not rule_equal and json_aligned:
         rows = _reclassify_shared_keys(rows)
     # 连续非 equal 显示区段的起点；neutral（同名同值）与 equal 一样不构成差异。
     blocks, previous_equal = [], True

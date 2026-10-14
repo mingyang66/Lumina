@@ -1,0 +1,52 @@
+[tool.ruff]
+# 项目仅面向 Python 3.13（见 binary_context）；生产代码在 lumina/，测试在 tests/。
+target-version = "py313"
+line-length = 100
+exclude = [".venv", "build", "dist", "data"]
+
+[tool.ruff.lint]
+# 显式钉住规则集，避免依赖 ruff 版本的默认值漂移（本机默认集含 BLE001/S110
+# 等非标准规则，会让基线噪声掩盖真实问题）。
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes（含 F401 未用导入、F811 重定义、F841 未用变量）
+    "I",    # isort 导入排序
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff 自有规则
+]
+ignore = [
+    # 主编排/监听/UI 层需要在边界统一兜底并记录，逐层窄化捕获会掩盖真实
+    # 故障面；此处保留盲捕但要求已有 traceback/logging 记录。
+    "BLE001",
+    # Tk 计数器与 DPI 换算中 `int(round(x))` 是刻意的取整意图表达。
+    "RUF046",
+    # 与既有宽容基线的兼容项。
+    "S110",  # try-except-pass：清理/回收路径的尽力操作
+    "E501",  # 行宽由 formatter 负责
+    # 项目注释/文案以中文为主，全角标点与符号是内容的一部分，不是输入错误。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # B905：Tk/ctypes 场景下按最短序列 zip 是既有语义，改动风险大于收益。
+    "B905",
+    # SIM105：`try/except/pass` 与 `contextlib.suppress` 语义等价，但测试用例
+    # 直接断言源码结构，改写会破坏既有断言；保持原样。
+    "SIM105",
+    # E741：`l` 在 get_opcodes 元组解包等场景语义明确，改名收益低。
+    "E741",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试代码允许更宽松的断言与 Mock 用法。
+# B023：测试里大量「在循环内定义闭包、并在本轮内立即调用」的写法（如按循环变量
+#       拼装断言、给 Mock 绑定 side_effect），不存在延迟调用，绑定循环变量无意义。
+# 模式对任意层级生效，故 tests/ 子目录下的测试文件同样命中。
+"test_*.py" = ["B011", "B023", "SIM117", "RUF012"]
+"lumina/history_panel.py" = ["F811"]  # 函数内重复导入 PIL 子模块，便于局部作用域
+
+[tool.ruff.lint.isort]
+known-first-party = ["lumina"]
