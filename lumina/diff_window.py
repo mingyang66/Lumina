@@ -228,6 +228,9 @@ class _ToolbarControl:
         return 'break'
 
     def _press(self, event):
+        if not self._closed and not self.owner._closed:
+            # break 会阻止顶层绑定，禁用控件的外点也需主动关闭弹层。
+            self.owner._outside_rules(event, self.canvas)
         if (not self._closed and not self.owner._closed and self.options['state'] != 'disabled' and self._command
                 and 0 <= event.x < self._width and 0 <= event.y < self._height):
             self._clear_press()
@@ -310,6 +313,200 @@ class _ToolbarControl:
         self._photo = None
 
 
+class _PopupMenu:
+    """单 Canvas 面板；背景和细勾以 4 倍 RGB 合成，文字交给 Tk。"""
+
+    def __init__(self, owner, trigger, rows, rules=False):
+        self.owner, self.trigger, self.rows, self.rules = owner, trigger, rows, rules
+        self._closed = False
+        self._photo = None
+        self._hover = self._pressed = None
+        self._keyboard = not trigger._mouse_focus
+        s = owner._scale
+        self._width = round(240 * s)
+        self._row_height = round(48 * s)
+        self._pad = round(4 * s)
+        self._height = self._pad * 2 + len(rows) * self._row_height
+        self._view_width, self._view_height = self._width, self._height
+        self._active = None
+        self.canvas = owner.tk.Canvas(owner.win, width=self._width, height=self._height,
+                                      bg=owner.theme['window_bg'], bd=0,
+                                      highlightthickness=0, takefocus=1)
+        self.canvas.bind('<Motion>', self._motion)
+        self.canvas.bind('<Leave>', self._leave)
+        self.canvas.bind('<ButtonPress-1>', self._press)
+        self.canvas.bind('<ButtonRelease-1>', self._release)
+        self.canvas.bind('<Up>', lambda event: self._move(-1))
+        self.canvas.bind('<Down>', lambda event: self._move(1))
+        for key in ('<Return>', '<space>'):
+            self.canvas.bind(key, self._enter)
+        self.canvas.bind('<Escape>', self._escape)
+        self.canvas.bind('<FocusOut>', owner._rules_focus_out)
+        self.canvas.bind('<Destroy>', self._destroy)
+        self.refresh()
+
+    def __getattr__(self, name):
+        return getattr(self.canvas, name)
+
+    def _enabled(self, index):
+        return (index is not None and 0 <= index < len(self.rows)
+                and not (self.rules and self.owner._mode == 'json_fields'))
+
+    def _selected(self, index):
+        key = self.rows[index][0]
+        return self.owner._options[key].get() if self.rules else key == self.owner._mode
+
+    def refresh(self):
+        if self._closed or self.owner._closed:
+            return
+        if not self._enabled(self._active):
+            enabled = [i for i in range(len(self.rows)) if self._enabled(i)]
+            self._active = next((i for i in enabled if self._selected(i)),
+                                enabled[0] if enabled else None)
+        if not self._enabled(self._hover):
+            self._hover = None
+        self._draw()
+
+    def resize(self, width, height):
+        self._view_width, self._view_height = width, height
+        self.canvas.configure(width=width, height=height)
+        self._draw()
+
+    def _draw(self):
+        if self._closed or self.owner._closed:
+            return
+        t, s, aa = self.owner.theme, self.owner._scale, 4
+        rgb = lambda color: tuple(value // 257 for value in self.canvas.winfo_rgb(color))
+        w, h = self._view_width, self._view_height
+        image = Image.new('RGB', (w * aa, h * aa), rgb(t['window_bg']))
+        draw = ImageDraw.Draw(image)
+        bounds = (0, 0, image.width - 1, image.height - 1)
+        radius, stroke = round(8 * s * aa), max(1, round(s * aa))
+        draw.rounded_rectangle(bounds, radius=radius, fill=rgb(t['card_bg']))
+        mask = Image.new('L', image.size)
+        ImageDraw.Draw(mask).rounded_rectangle(bounds, radius=radius, fill=255)
+        rows_image = image.copy()
+        rows_draw = ImageDraw.Draw(rows_image)
+        self._row_colors = []
+        for i, (_, title, description) in enumerate(self.rows):
+            enabled, selected = self._enabled(i), self._selected(i)
+            active = i == self._hover or (self._keyboard and i == self._active)
+            bg = t['accent_soft'] if selected and enabled else (
+                t['toolbar_hover_bg'] if active and enabled else t['card_bg'])
+            fg = t['label2'] if not enabled else t['accent'] if selected else t['label']
+            self._row_colors.append((bg, fg))
+            y = self._pad + i * self._row_height
+            rows_draw.rectangle((stroke, y * aa, image.width - 1 - stroke,
+                                 (y + self._row_height) * aa - 1), fill=rgb(bg))
+            cy = (y + self._row_height / 2) * aa
+            if self.rules:
+                x, r = 18 * s * aa, 6 * s * aa
+                rows_draw.rounded_rectangle((x - r, cy - r, x + r, cy + r),
+                                            radius=2 * s * aa,
+                                            fill=rgb(t['accent'] if selected and enabled else bg),
+                                            outline=rgb(fg if selected else t['label2']), width=stroke)
+            if selected:
+                x = (18 * s if self.rules else w - 22 * s) * aa
+                color = '#FFFFFF' if self.rules and enabled else fg
+                rows_draw.line(((x - 4 * s * aa, cy), (x - s * aa, cy + 3 * s * aa),
+                                (x + 5 * s * aa, cy - 4 * s * aa)),
+                               fill=rgb(color), width=max(1, round(1.25 * s * aa)), joint='curve')
+        image.paste(rows_image, (0, 0), mask)
+        draw.rounded_rectangle(bounds, radius=radius, outline=rgb(t['card_border']), width=stroke)
+        self.canvas.delete('all')
+        self._photo = ImageTk.PhotoImage(image.resize((w, h), Image.Resampling.LANCZOS), master=self.canvas)
+        self.canvas.create_image(0, 0, anchor='nw', image=self._photo)
+        for i, (_, title, description) in enumerate(self.rows):
+            y = self._pad + i * self._row_height
+            if self.rules and not self._enabled(i):
+                description = '不适用于字段比较；设置已保留'
+            x = (34 if self.rules else 12) * s
+            self.canvas.create_text(x, y + 14 * s, anchor='w', text=title,
+                                    font=self.owner._ui_font, fill=self._row_colors[i][1])
+            self.canvas.create_text(x, y + 33 * s, anchor='w', text=description,
+                                    font=('Microsoft YaHei UI', 8), fill=t['label2'])
+
+    def _hit(self, event):
+        if self._closed or self.owner._closed:
+            return None
+        if not (0 <= event.x < self._view_width and 0 <= event.y < self._view_height):
+            return None
+        index = (int(event.y) - self._pad) // self._row_height
+        return index if self._enabled(index) else None
+
+    def _motion(self, event):
+        self._keyboard = False
+        self._hover = self._hit(event)
+        self._draw()
+
+    def _leave(self, event):
+        self._hover = self._pressed = None
+        self._draw()
+
+    def _press(self, event):
+        if not self._closed and not self.owner._closed:
+            self._keyboard = False
+            self._pressed = self._hit(event)
+            self.canvas.focus_set()
+            self._motion(event)
+        return 'break'
+
+    def _release(self, event):
+        pressed, self._pressed = self._pressed, None
+        if pressed is not None and pressed == self._hit(event):
+            self._choose(pressed)
+        return 'break'
+
+    def _move(self, direction):
+        if self._closed or self.owner._closed:
+            return 'break'
+        self._keyboard = True
+        self._hover = None
+        start = self._active if self._active is not None else (-1 if direction > 0 else 0)
+        for step in range(1, len(self.rows) + 1):
+            index = (start + step * direction) % len(self.rows)
+            if self._enabled(index):
+                self._active = index
+                break
+        self._draw()
+        return 'break'
+
+    def _enter(self, event):
+        self._keyboard = True
+        self._choose(self._active)
+        return 'break'
+
+    def _choose(self, index):
+        if self._closed or self.owner._closed or not self._enabled(index):
+            return
+        key = self.rows[index][0]
+        if self.rules:
+            var = self.owner._options[key]
+            var.set(not var.get())
+            self.owner._request()
+            self.refresh()
+        else:
+            self.owner._select_mode(key)
+
+    def _escape(self, event):
+        if not self._closed and not self.owner._closed:
+            self._keyboard = True
+            self.owner._close_rules()
+        return 'break'
+
+    def _destroy(self, event):
+        if event.widget is self.canvas and not self._closed:
+            self.owner._close_rules(restore_focus=False)
+
+    def destroy(self):
+        self._closed = True
+        self._photo = None
+        self._hover = self._active = self._pressed = None
+        with suppress(TclError):
+            self.canvas.delete('all')
+            self.canvas.destroy()
+
+
 class _BlockLabel:
     """框外纯文本计数，仅当前序号使用强调色。"""
 
@@ -357,7 +554,12 @@ class DiffWindow:
         self._display_roles = None
         self._badges = []
         self._rules_popup = None
+        self._mode_popup = None
         self._popup_after = None
+        self._mode = 'text'
+        self._display_mode = None
+        self._mode_labels = {'text': '原文比较', 'json_format': 'JSON格式化比较',
+                             'json_fields': 'JSON按字段比较'}
         self._retained = False
         self._block_index = -1
         self._marker_after = None
@@ -434,6 +636,7 @@ class DiffWindow:
         win.bind('<Escape>', self._escape)
         win.bind('<ButtonPress-1>', self._outside_rules, add='+')
         win.bind('<FocusOut>', self._rules_focus_out, add='+')
+        win.bind('<Configure>', self._popup_configure, add='+')
         win.grid_rowconfigure(2, weight=1)
         win.grid_columnconfigure(0, weight=1)
         # 标题与只读说明合并到原生标题栏，正文不再占用重复标题行。
@@ -441,14 +644,13 @@ class DiffWindow:
         options.grid(row=1, column=0, sticky='ew', padx=pad,
                      pady=(round(4 * self._scale), round(4 * self._scale)))
         self._options = {key: tk.BooleanVar(master=win, value=False) for key in
-                         ('ignore_trailing_space', 'ignore_line_endings', 'json_format')}
+                         ('ignore_trailing_space', 'ignore_line_endings')}
         self._toolbar_controls = []
         gap = round(6 * self._scale)
         self._rules_button = self._toolbar_control(options, '比较规则 ▾', self._toggle_rules, 116)
         self._rules_button.pack(side='left')
-        self._json_toggle = self._toolbar_control(options, '格式化 JSON', self._toggle_json, 126)
-        self._json_toggle.pack(side='left', padx=(gap, 0))
-        self._json_toggle.set_tooltip('格式化 JSON，原始记录不变')
+        self._mode_button = self._toolbar_control(options, '原文比较 ▾', self._toggle_mode, 172)
+        self._mode_button.pack(side='left', padx=(gap, 0))
         self._block_label = _BlockLabel(self, options)
         self._block_label.pack(side='right', padx=(pad, 0))
         self._navigation = self._toolbar_control(options, width=152)
@@ -546,17 +748,7 @@ class DiffWindow:
                 for event in ('<<Copy>>', '<Control-c>', '<Control-C>', '<Control-Insert>'):
                     widget.bind(event, lambda event, s=side, w=widget, g=gutter:
                                 self._copy_event(s) if w is not g else 'break')
-            text.tag_configure('removed', background='#512F3C' if self._dark else '#FBE9EF')
-            text.tag_configure('added', background='#294740' if self._dark else '#E4F4EF')
-            text.tag_configure('emphasis_removed', background='#784052' if self._dark else '#F1B8CA')
-            text.tag_configure('emphasis_added', background='#326558' if self._dark else '#A9DFCF')
-            text.tag_configure('missing', background='#303034' if self._dark else '#F1F2F5')
-            text.tag_configure('current', background='#304F73' if self._dark else '#CFE2FF')
-            # 普通行底 < 当前块 < 字符强调 < 原生选择；只覆盖背景，不改变字色。
-            text.tag_raise('current')
-            text.tag_raise('emphasis_removed', 'current')
-            text.tag_raise('emphasis_added', 'emphasis_removed')
-            text.tag_raise('sel')
+        self._configure_diff_tags()
         self._footer = footer = tk.Frame(win, bg=t['window_bg'])
         footer.grid(row=3, column=0, sticky='ew', padx=pad,
                     pady=(round(4 * self._scale), round(4 * self._scale)))
@@ -571,6 +763,25 @@ class DiffWindow:
         self._sync_footer()
         self._refresh_rules()
         self._refresh_actions()
+
+    def _configure_diff_tags(self):
+        # 两侧都存在但值不同的行统一琥珀底，不再左红右绿；红底只留给单侧存在的行。
+        palette = ({'missing': '#38383C', 'current': '#304F73',
+                    'changed': '#514126', 'emphasis_changed': '#715321',
+                    'one_sided': '#512F3C', 'emphasis_one_sided': '#784052',
+                    'missing_field': '#48484E'} if self._dark else
+                   {'missing': '#E7E7EA', 'current': '#CFE2FF',
+                    'changed': '#F5D99B', 'emphasis_changed': '#E8BC60',
+                    'one_sided': '#FBE9EF', 'emphasis_one_sided': '#F1B8CA',
+                    'missing_field': '#D8D8DC'})
+        for text in self._texts:
+            for tag, color in palette.items():
+                text.tag_configure(tag, background=color)
+            text.tag_configure('missing_field', foreground='#C4C4CC' if self._dark else '#55555C')
+            # 普通行底/空占位 < 当前块 < 单侧存在红底 < 字符强调/字段缺失灰提示 < 原生选择。
+            for tag in ('changed', 'missing', 'current', 'one_sided',
+                        'emphasis_changed', 'emphasis_one_sided', 'missing_field', 'sel'):
+                text.tag_raise(tag)
 
     def _set_status(self, text):
         self._status_text = text
@@ -609,70 +820,119 @@ class DiffWindow:
         self._toolbar_controls.append(control)
         return control
 
-    def _toggle_json(self):
-        var = self._options['json_format']
-        var.set(not var.get())
-        self._request()
+    def _select_mode(self, mode):
+        if not self.is_alive():
+            return
+        self._close_rules()
+        if mode != self._mode:
+            self._mode = mode
+            self._request()
+
+    def _toggle_mode(self):
+        if self._mode_popup is not None:
+            self._mode_popup._keyboard = not self._mode_button._mouse_focus
+            self._close_rules()
+            return
+        self._close_rules(restore_focus=False)
+        if not self.is_alive():
+            return
+        descriptions = ('逐行比较，保留空白与换行差异', '统一排版后比较文本',
+                        '按字段路径、类型和值比较')
+        popup = _PopupMenu(self, self._mode_button,
+                           [(mode, label, description) for (mode, label), description in
+                            zip(self._mode_labels.items(), descriptions)])
+        self._mode_popup = popup
+        self._place_popup(popup, self._mode_button)
+
+    def _place_popup(self, popup, button, focus=True):
+        self.win.update_idletasks()
+        width = min(popup._width, max(1, self.win.winfo_width()))
+        height = min(popup._height, max(1, self.win.winfo_height()))
+        x = button.winfo_rootx() - self.win.winfo_rootx()
+        y = button.winfo_rooty() - self.win.winfo_rooty() + button.winfo_height() + round(4 * self._scale)
+        x = max(0, min(x, self.win.winfo_width() - width))
+        y = max(0, min(y, self.win.winfo_height() - height))
+        popup.resize(width, height)
+        popup.place(x=x, y=y)
+        self.tk.Misc.lift(popup.canvas)
+        if focus:
+            button._hide_tooltip()
+            button._clear_press()
+            popup.canvas.focus_set()
 
     def _refresh_rules(self):
         labels = [('ignore_trailing_space', '忽略行尾空白'),
                   ('ignore_line_endings', '忽略换行符')]
-        enabled = [label for key, label in labels if self._options[key].get()]
+        fields = self._mode == 'json_fields'
+        enabled = [label for key, label in labels if self._options[key].get() and not fields]
         t = self.theme
-        self._rules_button.configure(marker='dot' if enabled else None,
+        self._rules_button.configure(state='disabled' if fields else 'normal',
+                                     marker='dot' if enabled else None,
                                      bg=t['accent_soft'] if enabled else t['toolbar_bg'],
                                      fg=t['accent'] if enabled else t['label'])
         self._rules_button.set_tooltip('已启用：' + '、'.join(enabled) if enabled else '未启用比较规则')
-        selected = self._options['json_format'].get()
-        background = t['accent_soft'] if selected else t['toolbar_bg']
-        foreground = t['accent'] if selected else t['label']
-        self._json_toggle.configure(bg=background, fg=foreground,
+        if fields:
+            self._rules_button.set_tooltip('JSON按字段比较不适用文本忽略规则；已保留规则设置')
+        selected = self._mode != 'text'
+        self._mode_button.configure(text=self._mode_labels[self._mode] + ' ▾',
+                                    bg=t['accent_soft'] if selected else t['toolbar_bg'],
+                                    fg=t['accent'] if selected else t['label'],
                                     marker='check' if selected else None)
+        self._mode_button.set_tooltip('三种模式互斥；JSON按字段比较复制原文')
+        for popup in (self._rules_popup, self._mode_popup):
+            if popup is not None:
+                popup.refresh()
 
     def _toggle_rules(self):
         if self._rules_popup is not None:
+            self._rules_popup._keyboard = not self._rules_button._mouse_focus
             self._close_rules()
             return
+        self._close_rules(restore_focus=False)
         if not self.is_alive():
             return
-        tk, t = self.tk, self.theme
-        popup = tk.Frame(self.win, bg=t['card_bg'], highlightthickness=1,
-                         highlightbackground=t['field'], bd=0)
+        popup = _PopupMenu(self, self._rules_button, [
+            ('ignore_trailing_space', '忽略行尾空格 / Tab', '比较时忽略行尾空格与 Tab'),
+            ('ignore_line_endings', '忽略换行符类型', '比较时忽略 LF / CR / CRLF 差异'),
+        ], rules=True)
         self._rules_popup = popup
-        for key, label in (('ignore_trailing_space', '忽略行尾空格 / Tab'),
-                           ('ignore_line_endings', '忽略换行符类型')):
-            tk.Checkbutton(popup, text=label, variable=self._options[key],
-                           command=self._request, font=self._ui_font, anchor='w',
-                           bg=t['card_bg'], fg=t['label'], selectcolor=t['field'],
-                           activebackground=t['fill'], activeforeground=t['label']).pack(
-                               fill='x', padx=8, pady=4)
-        self._button(popup, '关闭', self._close_rules).pack(anchor='e', padx=8, pady=(0, 6))
-        self.win.update_idletasks()
-        popup.place(x=self._rules_button.winfo_rootx() - self.win.winfo_rootx(),
-                    y=self._rules_button.winfo_rooty() - self.win.winfo_rooty()
-                    + self._rules_button.winfo_height() + 4)
-        popup.lift()
+        self._place_popup(popup, self._rules_button)
 
-    def _close_rules(self):
+    def _close_rules(self, restore_focus=True):
         if self._popup_after is not None:
             with suppress(TclError):
                 self.win.after_cancel(self._popup_after)
             self._popup_after = None
-        popup, self._rules_popup = self._rules_popup, None
-        if popup is not None:
-            with suppress(TclError):
-                popup.destroy()
+        popups = (self._rules_popup, self._mode_popup)
+        self._rules_popup = self._mode_popup = None
+        for popup in popups:
+            if popup is not None:
+                with suppress(TclError):
+                    popup.destroy()
+                    trigger = popup.trigger
+                    if restore_focus and not self._closed and trigger.options['state'] != 'disabled':
+                        trigger._mouse_focus = not popup._keyboard
+                        trigger.canvas.focus_set()
+                        trigger._focus(True)
 
-    def _outside_rules(self, event):
-        widget = event.widget
+    def _outside_rules(self, event, fallback_widget=None):
+        widget = getattr(event, 'widget', fallback_widget)
         while widget is not None:
-            if widget is self._rules_popup or widget is self._rules_button.canvas:
+            if (widget in (self._rules_button.canvas, self._mode_button.canvas)
+                    or any(popup is not None and widget is popup.canvas
+                           for popup in (self._rules_popup, self._mode_popup))):
                 return
             widget = getattr(widget, 'master', getattr(widget, 'parent', None))
-        self._close_rules()
+        self._close_rules(restore_focus=False)
+
+    def _popup_configure(self, event):
+        if event.widget is self.win and not self._closed:
+            for popup in (self._rules_popup, self._mode_popup):
+                if popup is not None:
+                    self._place_popup(popup, popup.trigger, focus=False)
 
     def _rules_focus_out(self, event):
-        if self._rules_popup is not None and self._popup_after is None:
+        if (self._rules_popup is not None or self._mode_popup is not None) and self._popup_after is None:
             self._popup_after = self.win.after(0, self._check_rules_focus)
 
     def _check_rules_focus(self):
@@ -681,10 +941,10 @@ class DiffWindow:
             return
         focus = self.win.focus_get()
         if focus is None or focus.winfo_toplevel() is not self.win:
-            self._close_rules()
+            self._close_rules(restore_focus=False)
 
     def _escape(self, event):
-        if self._rules_popup is not None:
+        if self._rules_popup is not None or self._mode_popup is not None:
             self._close_rules()
         else:
             self.close()
@@ -701,7 +961,7 @@ class DiffWindow:
     def export_session(self):
         """UI 线程读取当前请求配置，不保存结果或滚动位置。"""
         return {'rows': (dict(self._left_row), dict(self._right_row)),
-                'roles': tuple(self._roles),
+                'roles': tuple(self._roles), 'mode': self._mode,
                 'options': {key: var.get() for key, var in self._options.items()}}
 
     def restore_session(self, session):
@@ -709,6 +969,7 @@ class DiffWindow:
             return
         self._left_row, self._right_row = map(dict, session['rows'])
         self._roles = tuple(session['roles'])
+        self._mode = session['mode']
         for key, value in session['options'].items():
             self._options[key].set(value)
         self._request()
@@ -755,7 +1016,7 @@ class DiffWindow:
             return
         self._generation += 1
         self._pending = (self._generation, dict(self._left_row), dict(self._right_row),
-                         {key: var.get() for key, var in self._options.items()})
+                         dict(mode=self._mode, **{key: var.get() for key, var in self._options.items()}))
         self._save_session()
         self._busy = True
         self._retained = False
@@ -772,7 +1033,13 @@ class DiffWindow:
     def _compare(request, outcomes):
         generation, left, right, options = request
         try:
-            result = diff_tools.compare_text(left['content'], right['content'], **options)
+            options = dict(options)
+            mode = options.pop('mode')
+            if mode == 'json_fields':
+                result = diff_tools.compare_json_fields(left['content'], right['content'])
+            else:
+                result = diff_tools.compare_text(left['content'], right['content'],
+                                                 json_format=mode == 'json_format', **options)
             outcome = (generation, result, None, (left, right))
         except Exception as error:
             outcome = (generation, None, str(error), (left, right))
@@ -811,6 +1078,7 @@ class DiffWindow:
                     if self._display_options is not None:
                         for key, value in self._display_options.items():
                             self._options[key].set(value)
+                        self._mode = self._display_mode
                         self._refresh_rules()
                     self._set_status('比较失败' +
                                      ('；保留上次结果' if self._retained else '') + f'：{error}')
@@ -820,6 +1088,7 @@ class DiffWindow:
                     self._retained = False
                     self._result = result
                     self._display_options = {key: var.get() for key, var in self._options.items()}
+                    self._display_mode = self._mode
                     self._display_rows = rows
                     self._display_roles = self._roles
                     self._set_meta(rows)
@@ -831,6 +1100,7 @@ class DiffWindow:
             self._schedule_poll()
 
     def _render(self, result):
+        self._configure_diff_tags()
         self._block_index = -1
         if self._marker_after is not None:
             with suppress(TclError):
@@ -841,14 +1111,19 @@ class DiffWindow:
         self._syncing = True
         try:
             for side, text, gutter in zip(('left', 'right'), self._texts, self._gutters):
-                text.tag_remove('current', '1.0', 'end')
+                for tag in ('changed', 'one_sided', 'missing', 'current',
+                            'emphasis_changed', 'emphasis_one_sided', 'missing_field'):
+                    text.tag_remove(tag, '1.0', 'end')
                 gutter.tag_remove('block', '1.0', 'end')
                 lines, numbers = [], []
                 for row in result.rows:
-                    lines.append(getattr(row, side + '_text'))
+                    value = getattr(row, side + '_text')
+                    if result.mode == 'json_fields' and getattr(row, side + '_no') is None:
+                        value = '字段不存在'
+                    lines.append(value)
                     number = getattr(row, side + '_no')
                     label = '' if number is None else str(number)
-                    if number is not None and row.left_eol != row.right_eol:
+                    if result.mode != 'json_fields' and number is not None and row.left_eol != row.right_eol:
                         label += ' ' + eol_names[getattr(row, side + '_eol')]
                     numbers.append(label)
                 for widget, content in ((text, lines), (gutter, numbers)):
@@ -861,10 +1136,19 @@ class DiffWindow:
                 gutter.tag_add('numbers', '1.0', 'end')
                 for index, row in enumerate(result.rows, 1):
                     present = getattr(row, side + '_no') is not None
-                    tag = 'removed' if side == 'left' else 'added'
-                    if not present:
+                    if row.kind in ('insert', 'delete'):
+                        tag = 'one_sided'
+                    elif row.kind == 'neutral':
+                        # 同名字段值相同、仅位置错开：不标任何底色，空侧也不涂灰。
+                        tag = None
+                    else:
+                        # 两侧都存在（replace / shared_change）统一琥珀底与同色字符强调。
+                        tag = 'changed'
+                    if not present and row.kind not in ('neutral', 'shared_change'):
                         text.tag_add('missing', f'{index}.0', f'{index + 1}.0')
-                    if present and row.kind != 'equal':
+                        if result.mode == 'json_fields':
+                            text.tag_add('missing_field', f'{index}.0', f'{index}.{len(lines[index - 1])}')
+                    if present and tag is not None and row.kind != 'equal':
                         text.tag_add(tag, f'{index}.0', f'{index + 1}.0')
                         for start, end in getattr(row, side + '_spans'):
                             text.tag_add('emphasis_' + tag, f'{index}.{start}', f'{index}.{end}')
@@ -877,19 +1161,21 @@ class DiffWindow:
         if result.exact_equal:
             status = '原文一致'
         elif result.rule_equal:
-            json_only_equal = (self._options['json_format'].get()
-                               and result.left_text == result.right_text)
-            status = '格式化后一致，原文有差异' if json_only_equal else '按规则一致，原文有差异'
+            json_only_equal = (self._display_mode == 'json_format' and result.left_text == result.right_text)
+            status = ('按字段一致，原文有差异' if result.mode == 'json_fields' else
+                      '格式化后一致，原文有差异' if json_only_equal else '按规则一致，原文有差异')
         else:
             status = ''
         self._set_status(status)
         hints = []
-        if any(row.left_eol != row.right_eol for row in result.rows):
+        if result.mode != 'json_fields' and any(row.left_eol != row.right_eol for row in result.rows):
             hints.append('行号旁 LF / CR / CRLF / ∅ 表示换行差异')
         if result.left_duplicate_keys or result.right_duplicate_keys:
             hints.append('JSON 含重复键')
-        if self._options['json_format'].get():
+        if self._display_mode == 'json_format':
             hints.append('已格式化显示，原始记录不变')
+        if result.mode == 'json_fields':
+            hints.append('字段模式：行号为侧项目序号，非原文行号；文本忽略规则不适用；复制保留原文')
         self._set_hint('；'.join(hints))
 
     def _refresh_actions(self):
@@ -900,15 +1186,16 @@ class DiffWindow:
         for button in (self._previous, self._next):
             button.configure(state='normal' if ready and blocks else 'disabled')
         current = ''
+        unit = '项' if self._result is not None and self._result.mode == 'json_fields' else '处'
         if self._busy:
             text = '比较中…'
         elif not blocks:
             text = '无差异'
         elif self._block_index < 0:
-            text = f'待定位 / {len(blocks)} 处'
+            text = f'待定位 / {len(blocks)} {unit}'
         else:
             current = str(self._block_index + 1)
-            text = f'第 {current} / {len(blocks)} 处'
+            text = f'第 {current} / {len(blocks)} {unit}'
         self._block_label.configure(text=text, current=current)
 
     def _queue_marker_redraw(self, event=None):
@@ -927,7 +1214,8 @@ class DiffWindow:
                     continue
                 start = self._result.blocks[self._block_index]
                 stop = start + 1
-                while stop < len(self._result.rows) and self._result.rows[stop].kind != 'equal':
+                while (self._result.mode != 'json_fields' and stop < len(self._result.rows)
+                       and self._result.rows[stop].kind not in ('equal', 'neutral')):
                     stop += 1
                 # dlineinfo 对不可见行返回 None；只查询视口内的行，避免扫描长区段。
                 first = max(start + 1, int(text.index('@0,0').split('.')[0]))
@@ -994,7 +1282,8 @@ class DiffWindow:
         index = f'{blocks[self._block_index] + 1}.0'
         self._scroll_y(index)
         stop = blocks[self._block_index] + 1
-        while stop < len(self._result.rows) and self._result.rows[stop].kind != 'equal':
+        while (self._result.mode != 'json_fields' and stop < len(self._result.rows)
+               and self._result.rows[stop].kind not in ('equal', 'neutral')):
             stop += 1
         for text, gutter in zip(self._texts, self._gutters):
             text.tag_remove('current', '1.0', 'end')
@@ -1018,7 +1307,9 @@ class DiffWindow:
                    'data': None, 'file_path': ''}
         try:
             ok = self.ui.actions.copy_to_clipboard(payload)
-            self._set_status('已复制完整有效文本' if ok else '复制失败')
+            success = ('已复制完整原文（非字段列表）' if self._result.mode == 'json_fields'
+                       else '已复制完整有效文本')
+            self._set_status(success if ok else '复制失败')
         except Exception as error:
             self._set_status(f'复制失败：{error}')
 
@@ -1049,8 +1340,10 @@ class DiffWindow:
         save = getattr(self, '_save_session', None)
         if callable(save):
             save()
-        if getattr(self, '_rules_popup', None) is not None or getattr(self, '_popup_after', None) is not None:
-            self._close_rules()
+        if (getattr(self, '_rules_popup', None) is not None
+                or getattr(self, '_mode_popup', None) is not None
+                or getattr(self, '_popup_after', None) is not None):
+            self._close_rules(restore_focus=False)
         self._closed = True
         if getattr(self, '_marker_after', None) is not None:
             with suppress(TclError):

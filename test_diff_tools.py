@@ -1,4 +1,5 @@
 import dataclasses
+import json
 from difflib import SequenceMatcher
 import random
 import unittest
@@ -268,6 +269,206 @@ class DiffToolsTests(unittest.TestCase):
                 if not trailing and not endings:
                     self.assertEqual(result.rule_equal, result.exact_equal)
                 self.assert_reconstructs(result)
+
+    def test_json_members_align_by_key_not_by_row_position(self):
+        """同名字段按字段名配对：同一行两侧都标黄，单侧字段仍标红。"""
+        left = ('{\n "a": 1,\n "op_station": "old",\n "query_mode": null,\n'
+                ' "query_direction": "sd"\n}')
+        right = ('{\n "a": 1,\n "query_mode": null,\n "op_station": "new",\n'
+                 ' "position_str": null,\n "query_direction": null\n}')
+        result = compare_text(left, right, json_format=True)
+        self.assert_reconstructs(result)
+        by_key = {}
+        for row in result.rows:
+            match = diff_tools._JSON_MEMBER_RE.match(row.left_text or row.right_text)
+            if match:
+                by_key.setdefault(match.group(1), []).append(row)
+        # op_station 两侧都有且值不同：配到同一显示行，两侧都标黄。
+        station = by_key['op_station']
+        self.assertEqual(len(station), 1)
+        self.assertEqual(station[0].kind, 'replace')
+        self.assertEqual(station[0].left_no, 3)
+        self.assertTrue(station[0].left_spans and station[0].right_spans)
+        # query_direction 两侧都有：即使原文行号不同，也对齐到同一显示行都标黄。
+        self.assertEqual([row.kind for row in by_key['query_direction']], ['replace'])
+        # query_mode 两侧值相同：不属于差异，两侧都不标色。
+        self.assertEqual([row.kind for row in by_key['query_mode']], ['neutral', 'neutral'])
+        # position_str 只有右侧存在：保持红色语义。
+        self.assertEqual(by_key['position_str'][0].kind, 'insert')
+
+    def test_same_field_at_different_depth_splits_into_two_rows(self):
+        """同名字段层级不同、无法对齐时，各占一行都标黄，不再标红。"""
+        left = '{\n "outer": {\n  "target": "1"\n }\n}'
+        right = '{\n "target": "2"\n}'
+        result = compare_text(left, right, json_format=True)
+        self.assert_reconstructs(result)
+        targets = [row for row in result.rows
+                   if diff_tools._member_key(row.left_text or row.right_text) == 'target']
+        self.assertEqual([row.kind for row in targets], ['shared_change', 'shared_change'])
+        self.assertEqual([(row.left_no, row.right_no) for row in targets],
+                         [(None, 2), (3, None)])
+        # 两侧都标黄：存在侧有整行强调，另一侧留空。
+        self.assertEqual(targets[0].right_spans, ((0, len(targets[0].right_text)),))
+        self.assertEqual(targets[0].left_spans, ())
+        self.assertEqual(targets[1].left_spans, ((0, len(targets[1].left_text)),))
+
+    def test_plain_text_and_invalid_json_keep_row_position_alignment(self):
+        """非 JSON 输入、或只有一侧是 JSON 时，完全沿用按行位置对齐。"""
+        result = compare_text('x\nop_station: old\ny\n', 'x\ny\nop_station: new\n')
+        self.assertEqual([row.kind for row in result.rows],
+                         ['equal', 'delete', 'equal', 'insert'])
+        self.assertEqual(result.blocks, (1, 3))
+        result = compare_text('{"a":1}', 'not json\n{"a":2}')
+        self.assertNotIn('neutral', [row.kind for row in result.rows])
+
+
+class JsonFieldDiffTests(unittest.TestCase):
+    def compare(self, left, right):
+        return diff_tools.compare_json_fields(left, right)
+
+    def test_order_decoded_values_copy_and_immutable_contract(self):
+        left = ' { "z": 1e0, "a": "\\u4e2d", "empty": {} }\r\n'
+        right = '{"empty":{},"a":"中","z":1.0}'
+        result = compare_text(left, right, True, True, True, json_fields=True)
+        self.assertEqual(result, self.compare(left, right))
+        self.assertEqual(result.mode, 'json_fields')
+        self.assertEqual(compare_text('', '').mode, 'text')
+        self.assertFalse(result.exact_equal)
+        self.assertTrue(result.rule_equal)
+        self.assertEqual((result.left_text, result.right_text), (left, right))
+        self.assertEqual(result.blocks, ())
+        self.assertEqual(result.unified_diff, '')
+        self.assertEqual([r.left_text.split(' = ')[0] for r in result.rows],
+                         ['$.a', '$.empty', '$.z'])
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            result.mode = 'text'
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            result.rows[0].left_text = '修改'
+
+    def test_array_index_order_and_independent_navigation(self):
+        result = self.compare('[1,2,3]', '[3,2,1,4]')
+        self.assertEqual([r.kind for r in result.rows], ['replace', 'equal', 'replace', 'insert'])
+        self.assertEqual(result.blocks, (0, 2, 3))
+        self.assertEqual(result.rows[-1].right_text, '$[3] = 4')
+        self.assertEqual(result.rows[-1].left_no, None)
+        consecutive = self.compare('[1,2,3]', '[4,5,6]')
+        self.assertEqual(consecutive.blocks, (0, 1, 2))
+        for side in ('left', 'right'):
+            values = [getattr(r, side + '_no') for r in result.rows
+                      if getattr(r, side + '_no') is not None]
+            self.assertEqual(values, list(range(1, len(values) + 1)))
+
+    def test_missing_null_empty_and_single_subtree(self):
+        result = self.compare('{"null":null,"s":"","obj":{},"arr":[]}', '{}')
+        self.assertEqual([r.kind for r in result.rows], ['delete'] * 4)
+        self.assertEqual([r.left_text for r in result.rows],
+                         ['$.arr = []', '$.null = null', '$.obj = {}', '$.s = ""'])
+        for value in ('null', '""', '{}', '[]'):
+            self.assertFalse(self.compare('{"x":' + value + '}', '{}').rule_equal)
+        result = self.compare('{}', '{"x":{"z":[1,2],"a":true}}')
+        self.assertEqual(len(result.rows), 1)
+        self.assertEqual(result.rows[0].right_text, '$.x = {"a":true,"z":[1,2]}')
+        self.assertTrue(self.compare('{}', '{}').rule_equal)
+        self.assertTrue(self.compare('[]', '[]').rule_equal)
+        self.assertEqual(self.compare('{}', '{}').rows[0].left_text, '$ = {}')
+
+    def test_nested_same_type_containers_recurse_stably(self):
+        result = self.compare('{"x":[{"b":2,"a":1},[]],"y":{}}',
+                              '{"y":{},"x":[{"a":1,"b":3},[]]}')
+        self.assertEqual([r.left_text for r in result.rows],
+                         ['$.x[0].a = 1', '$.x[0].b = 2', '$.x[1] = []', '$.y = {}'])
+        self.assertEqual(result.blocks, (1,))
+        self.assertFalse(result.rule_equal)
+        for left, right in (('[{}]', '[]'), ('{"x":{}}', '{"x":{"a":1}}'),
+                            ('[]', '[null]')):
+            result = self.compare(left, right)
+            self.assertEqual(len(result.rows), 1)
+            self.assertIn(result.rows[0].kind, ('insert', 'delete'))
+
+    def test_type_changes_do_not_expand(self):
+        for left, right in (('{"a":[1]}', '[1,2]'), ('[1]', '1'), ('{}', 'null'),
+                            ('[]', '{}'), ('true', '1'), ('false', '0'), ('"1"', '1'),
+                            ('null', '""')):
+            with self.subTest(left=left, right=right):
+                result = self.compare(left, right)
+                self.assertFalse(result.rule_equal)
+                self.assertEqual(len(result.rows), 1)
+                self.assertEqual(result.rows[0].kind, 'replace')
+                self.assertTrue(result.rows[0].left_text.startswith('$ = '))
+
+    def test_decimal_precision_no_rounding_or_float_overflow(self):
+        for left, right in (('1', '1.0'), ('1.0', '1e0'), ('-0', '0.000e99'),
+                            ('1e10000', '10e9999'), ('0.0001', '1e-4'),
+                            ('1234567890123456789012345678901', '1234567890123456789012345678901.0'),
+                            ('1e' + '0' * 5000 + '1', '10')):
+            with self.subTest(left=left):
+                self.assertTrue(self.compare(left, right).rule_equal)
+        self.assertFalse(self.compare('9007199254740992', '9007199254740993').rule_equal)
+        self.assertFalse(self.compare('1.00000000000000000000001', '1').rule_equal)
+        for value in ('1e999999999999999999999999999', '1e-999999999999999999999', '1e1048577'):
+            with self.assertRaisesRegex(ValueError, '左侧.*指数.*行.*列'):
+                self.compare(value, '0')
+
+    def test_paths_escaping_and_display_is_single_line(self):
+        keys = ['simple', 'a.b', 'a"b', '', '中', '0', 'a[b]', 'line\nkey', 'slash\\key']
+        raw = json.dumps({k: 'line\n"\\\t' for k in keys})
+        result = self.compare(raw, raw)
+        for row, key in zip(result.rows, sorted(keys)):
+            suffix = '.simple' if key == 'simple' else '[' + json.dumps(key) + ']'
+            self.assertTrue(row.left_text.startswith('$' + suffix + ' = '))
+            self.assertNotIn('\n', row.left_text)
+            self.assertNotIn('\r', row.left_text)
+        self.assertFalse(self.compare('{"a.b":1}', '{"a":{"b":1}}').rule_equal)
+        self.assertTrue(self.compare('"\\ud83d\\ude00"', '"😀"').rule_equal)
+
+    def test_invalid_both_sides_and_duplicate_decoded_keys(self):
+        for left, right in (('NaN', 'Infinity'), ('[1,]', '{"a":}'),
+                            ('{"a":1,"\\u0061":2}', '{"x":{"k":1,"k":2}}'),
+                            ('-Infinity', '{"a":1,}')):
+            with self.subTest(left=left, right=right):
+                with self.assertRaises(ValueError) as caught:
+                    self.compare(left, right)
+                error = str(caught.exception)
+                self.assertIn('左侧 JSON', error)
+                self.assertIn('右侧 JSON', error)
+                self.assertEqual(error.count('行'), 2)
+                self.assertEqual(error.count('列'), 2)
+        with self.assertRaisesRegex(ValueError, '第 3 行，第 2 列'):
+            self.compare('{\n "a":1,\n "a":2}', '{}')
+        self.assertTrue(self.compare('{"a":{"k":1},"b":{"k":2}}',
+                                     '{"b":{"k":2},"a":{"k":1}}').rule_equal)
+
+    def test_input_depth_fields_output_and_shared_budgets(self):
+        for left, right in ((None, '{}'), ('{}', b'{}')):
+            with self.assertRaises(TypeError):
+                self.compare(left, right)
+        with self.assertRaisesRegex(ValueError, '1 MiB'):
+            self.compare(' ' * (diff_tools.MAX_CHARACTERS + 1), '{}')
+        with self.assertRaisesRegex(ValueError, '输入过大'):
+            self.compare('"' + '中' * 700000 + '"', 'null')
+        depth = json_tools.MAX_DEPTH
+        self.assertTrue(self.compare('[' * depth + '0' + ']' * depth, '0').rows)
+        with self.assertRaisesRegex(ValueError, '嵌套过深'):
+            self.compare('[' * (depth + 1) + '0' + ']' * (depth + 1), '0')
+        raw = '[' + ','.join(['0'] * 5000) + ']'
+        self.assertEqual(len(self.compare(raw, raw).rows), 5000)
+        with self.assertRaisesRegex(ValueError, '10000'):
+            self.compare(raw, raw[:-1] + ',0]')
+        # 缺失子树也计入字段预算，不能折叠显示绕过上限。
+        with self.assertRaisesRegex(ValueError, '10000'):
+            self.compare('[]', '[' + ','.join(['0'] * 10001) + ']')
+        with patch.object(diff_tools, 'MAX_JSON_OUTPUT_CHARACTERS', 10):
+            with self.assertRaisesRegex(ValueError, '展示输出'):
+                self.compare('{"long":{"key":[1,2,3]}}', '{}')
+        with patch.object(diff_tools, 'MAX_MATCH_OPERATIONS', 2):
+            with self.assertRaisesRegex(ValueError, '复杂度'):
+                self.compare('[1,2]', '[]')
+        with patch.object(diff_tools, 'monotonic', side_effect=[0, 3]):
+            with self.assertRaisesRegex(ValueError, '时间预算'):
+                self.compare('{}', '{}')
+        with patch.object(json_tools, 'transform_json', wraps=json_tools.transform_json) as transform:
+            self.compare('{"x":1}', '{}')
+            self.assertEqual(transform.call_count, 2)
 
 
 if __name__ == '__main__':

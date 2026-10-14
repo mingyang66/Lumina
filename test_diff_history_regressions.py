@@ -1017,7 +1017,8 @@ class DiffHistoryRegressionTests(unittest.TestCase):
     def test_theme_rebuild_initial_refresh_preserves_session_and_view(self):
         self.select_pair()
         snapshot = {'rows': ('完整 A', '完整 B'), 'roles': ('B', 'A'),
-                    'options': {'json_format': True}}
+                    'mode': 'json_fields',
+                    'options': {'ignore_trailing_space': True, 'ignore_line_endings': False}}
         self.panel.ui._diff_session = snapshot
         self.panel.ui.clear_text_diff = Mock()
         self.panel._root = object()

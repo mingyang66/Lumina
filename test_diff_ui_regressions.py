@@ -52,8 +52,9 @@ class FakeDiffWindow:
         self.alive = True
         self.rows = tuple(map(dict, session['rows'] if session else (left_row, right_row)))
         self.roles = tuple(session['roles']) if session else ('A', 'B')
+        self.mode = session['mode'] if session else 'text'
         self.options = dict(session['options']) if session else dict.fromkeys(
-            ('ignore_trailing_space', 'ignore_line_endings', 'json_format'), False)
+            ('ignore_trailing_space', 'ignore_line_endings'), False)
         self.updates = []
         self.close_count = 0
         self.instances.append(self)
@@ -68,7 +69,7 @@ class FakeDiffWindow:
 
     def export_session(self):
         self.win.record('export_session')
-        return {'rows': tuple(map(dict, self.rows)), 'roles': self.roles,
+        return {'rows': tuple(map(dict, self.rows)), 'roles': self.roles, 'mode': self.mode,
                 'options': dict(self.options)}
 
     def close(self):
@@ -152,6 +153,7 @@ class DiffUiTests(unittest.TestCase):
         old.rows = old.rows[::-1]
         old.roles = ('B', 'A')
         old.options = dict.fromkeys(old.options, True)
+        old.mode = 'json_fields'
         old.close()
         expected = self.server._diff_session
         self.left['content'] = '数据库或调用方已改变'
@@ -162,16 +164,35 @@ class DiffUiTests(unittest.TestCase):
         self.assertEqual(len(new.rows[1]['content']), 160000)
         self.assertEqual(new.updates, [])
 
+    def test_all_modes_roundtrip_reopen_and_new_pair_defaults(self):
+        for mode in ('text', 'json_format', 'json_fields'):
+            with self.subTest(mode=mode):
+                self.server.show_text_diff(self.left, self.right)
+                old = self.server._diff_window
+                old.mode = mode
+                old.options['ignore_trailing_space'] = True
+                old.roles = ('B', 'A')
+                old.rows = old.rows[::-1]
+                old.close()
+                expected = self.server._diff_session
+                self.server.view_text_diff()
+                self.assertEqual(self.server._diff_window.export_session(), expected)
+                self.assertEqual(self.server._diff_window.mode, mode)
+                self.server.show_text_diff(self.left, self.right)
+                self.assertEqual(self.server._diff_session['mode'], 'text')
+                self.assertFalse(any(self.server._diff_session['options'].values()))
+
     def test_new_pair_replaces_settings_and_stale_close_cannot_overwrite(self):
         self.server.show_text_diff(self.left, self.right)
         old = self.server._diff_window
-        old.options['json_format'] = True
+        old.mode = 'json_fields'
         old.rows = old.rows[::-1]
         old.roles = ('B', 'A')
         self.server.show_text_diff(self.right, {'id': 3, 'content': '新记录'})
         new = self.server._diff_window
         expected = new.export_session()
         self.assertFalse(any(expected['options'].values()))
+        self.assertEqual(expected['mode'], 'text')
         self.assertEqual(expected['roles'], ('A', 'B'))
         self.assertEqual(self.server._diff_session, expected)
         old.close()

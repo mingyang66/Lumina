@@ -482,9 +482,8 @@ class UiServer:
         window = DiffWindow(self, left_row, right_row)
         self.clear_text_diff()
         self._diff_session = {
-            'rows': (dict(left_row), dict(right_row)), 'roles': ('A', 'B'),
-            'options': dict.fromkeys(('ignore_trailing_space', 'ignore_line_endings',
-                                     'json_format'), False)}
+            'rows': (dict(left_row), dict(right_row)), 'roles': ('A', 'B'), 'mode': 'text',
+            'options': dict.fromkeys(('ignore_trailing_space', 'ignore_line_endings'), False)}
         self._diff_window = window
         window.win.deiconify()
         window.win.lift()
