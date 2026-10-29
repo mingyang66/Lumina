@@ -1,3 +1,40 @@
+# Lumina
+
+Windows 剪贴板管理器。常驻托盘，自动记录文本 / 图片 / 文件的复制历史，支持全文检索、
+分类标签、Pin 固定、JSON 格式化查看，以及带标注（矩形、圆形、箭头、画笔、马赛克、
+文字）的区域截图。
+
+技术栈：Python 3.13 + Tkinter，数据库 SQLite（含 FTS5 全文索引）。主入口 `main.py`，
+业务代码在 `lumina/`，测试在 `tests/`，数据库在 `data/lumina.db`。
+
+# 快速开始
+
+依赖只装在项目 `.venv` 里，**系统 `python` 没有**，所以下面统一用虚拟环境解释器。
+先装依赖：
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+再启动（不带子命令即等价于 `run`）：
+
+```powershell
+.venv\Scripts\python.exe main.py
+```
+
+常用快捷键在 `config.json` 里配置，默认 `ctrl+alt+v` 采集、`ctrl+alt+s` 区域截图、
+`alt+v` 打开历史面板。
+
+除图形界面外还带一组命令行子命令（`-c` 可指定配置文件）：
+
+```powershell
+.venv\Scripts\python.exe main.py list      # 列出最近记录
+.venv\Scripts\python.exe main.py search "关键字"   # 全文检索
+.venv\Scripts\python.exe main.py stats     # 数据库统计
+```
+
+其余子命令：`pin` / `unpin` / `tag` / `export` / `clean`。
+
 # 打包命令
 
 使用 PyInstaller 将 Lumina 打包为 Windows 应用程序：
@@ -16,6 +53,10 @@ python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Lumina" `
 参数说明：
 
 - `python -m PyInstaller`：使用当前 Python 环境中的 PyInstaller 打包工具。建议在项目 `.venv` 激活后执行。
+  PyInstaller 属于**打包时的开发依赖，不在 `requirements.txt` 里**（运行时并不需要它），首次打包前需单独安装：
+  ```powershell
+  pip install pyinstaller
+  ```
 - `--clean`：清理 PyInstaller 的临时缓存后再开始构建，避免旧缓存影响打包结果。
 - `--noconfirm`：自动确认覆盖并删除已有的输出目录，不再显示确认提示。
 - `--windowed`：生成窗口程序，运行 GUI 应用时不显示命令行窗口。该参数也可以写成 `--noconsole`。
@@ -27,11 +68,30 @@ python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Lumina" `
 
 打包结果默认生成在 `dist/` 目录中，可执行文件为 `dist/Lumina.exe`。
 
+> **打包前务必检查 `config.json` 里的 `db_path`。**
+> 该文件会被原样嵌进 exe，并在用户首次启动时复制到 `%LOCALAPPDATA%/Lumina/config.json`
+> 长期生效。如果它是开发机的绝对路径（如 `D:\workplace-python\Lumina\data\lumina.db`），
+> 在别人机器上会指向一个不存在的盘符目录。发布前请确认它是相对路径：
+>
+> ```json
+> { "db_path": "data/lumina.db" }
+> ```
+>
+> 相对路径会按配置文件所在目录解析（打包后即 `%LOCALAPPDATA%/Lumina/data/lumina.db`），
+> 具体见下文 Path Configuration。
+
 # 运行测试
 
 单元测试集中在 `tests/` 目录，全部基于标准库 `unittest`（不依赖 pytest）。
 
-在项目根目录执行：
+测试本身不装第三方包，但会被测代码在导入时就要 `PIL` / `mss`，而这两个依赖只装在
+项目 `.venv` 里。**务必用虚拟环境的解释器跑，直接用系统 `python` 会 `ModuleNotFoundError`**：
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover
+```
+
+在项目根目录执行（下方命令中的 `python` 均指 `.venv\Scripts\python.exe`）：
 
 ```bash
 python -m unittest discover
@@ -55,7 +115,7 @@ python -m unittest tests.test_storage_regressions
   的子目录，移除后整个测试集会被静默跳过。
 - 测试文件中通过 `Path(__file__).resolve().parent.parent` 定位项目根，新增测试
   文件时请沿用该写法。
-- 当前用例数：328 项通过、2 项跳过（跳过项依赖符号链接权限）。
+- 当前用例数：356 项通过、2 项跳过（跳过项依赖符号链接权限）。
 
 # Lumina Clipboard Manager - Database Documentation
 
