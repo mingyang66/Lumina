@@ -2,6 +2,7 @@
 
 需要真实 Tk；TTY 环境无 Tk 时整体跳过，避免 CI 报错。
 """
+import ctypes
 import os
 import sys
 import time
@@ -17,6 +18,9 @@ from lumina.tool_window import (  # noqa: E402
     TOOLS,
     WS_EX_APPWINDOW,
     WS_EX_TOOLWINDOW,
+    WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX,
+    WS_SYSMENU,
     JsonParamWindow,
     JwtWindow,
     open_tool,
@@ -31,6 +35,34 @@ except Exception:  # pragma: no cover - 仅在无图形环境时触发
     TK_OK = False
 
 SKIP_REASON = '本机 Tk 不可用'
+
+WM_SETICON = 0x0080
+WM_GETICON = 0x007F
+
+
+def _icon_slots(hwnd):
+    """读窗口两个图标槽位的 HICON，用于断言「最小化前后没变」。
+
+    **必须用独立的 ``WinDLL`` 句柄**：``history_panel`` 已给模块级
+    ``user32.GetWindowRect`` 设过自己的 RECT argtypes，共用句柄会让别处的
+    类型校验串味。
+    """
+    user32 = ctypes.WinDLL('user32')
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    user32.SendMessageW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+    return tuple(
+        user32.SendMessageW(ctypes.c_void_p(hwnd), WM_GETICON, index, 0)
+        for index in (0, 1))
+
+
+def _write_exstyle(hwnd, value):
+    """直接改写扩展样式，用来模拟「样式被外部重设」的场景。"""
+    user32 = ctypes.WinDLL('user32')
+    setter = user32.SetWindowLongPtrW
+    setter.restype = ctypes.c_void_p
+    setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    setter(ctypes.c_void_p(hwnd), -20, ctypes.c_void_p(value))
 
 
 class FakePanel:
@@ -195,16 +227,31 @@ class ToolWindowTests(unittest.TestCase):
             self.assertTrue(set(kinds) <= {'line', 'rectangle'},
                             f'{name} 图形类型异常：{kinds}')
 
-    def test_minimize_requires_dropping_border_first(self):
-        """无边框窗口直接 iconify 会抛 TclError，实现必须先取消 overrideredirect。"""
+    def test_minimize_keeps_borderless_without_rebuilding_hwnd(self):
+        """最小化必须**不翻转 overrideredirect**：那会重建 HWND，图标和框位标志全丢。
+
+        早先的实现是 ``overrideredirect(False)`` → ``iconify()`` → 唤回再翻回来。
+        实测每次翻转都重建 HWND（``0x3a2e1480`` → ``0x559a07c8`` → ``0x1f40160c``），
+        新窗口带着 Tk 重设的 ``WS_EX_TOOLWINDOW`` 回来，explorer 于是撤掉任务栏
+        按钮——用户看到的就是「显示后图标消失、点击切换失效」。
+
+        现在走 ``ShowWindow(SW_MINIMIZE)``，无边框标志全程不动、HWND 不变。
+        """
         window = self._open(JsonParamWindow)
+        hwnd_before = window._top_level_hwnd()
+        flag_before = str(window.win.overrideredirect()).lower()
+
         window._min_btn.event_generate('<Button-1>')
         window.win.update()
+
         self.assertEqual(window.win.state(), 'iconic')
-        # 最小化期间必须已放开无边框标志（查询关闭态返回 None），
-        # 否则 iconify 根本不会成功。
-        flag = window.win.overrideredirect()
-        self.assertIn(str(flag).lower(), ('0', 'false', 'none'))
+        # 无边框必须还在——翻转它就是重建 HWND
+        self.assertIn(str(window.win.overrideredirect()).lower(),
+                      ('1', 'true'),
+                      '最小化翻转了 overrideredirect → HWND 会重建，任务栏按钮会丢')
+        self.assertEqual(window._top_level_hwnd(), hwnd_before,
+                         '最小化后 HWND 变了 → 图标与框位标志不会跟着搬过去')
+        self.assertEqual(str(window.win.overrideredirect()).lower(), flag_before)
         self._restore(window)
 
     def _restore(self, window):
@@ -228,50 +275,52 @@ class ToolWindowTests(unittest.TestCase):
         self.assertEqual(window.win.wm_geometry(), before)
         self.assertIn(str(window.win.overrideredirect()).lower(), ('1', 'true'))
 
-    def test_minimize_keeps_window_managed_until_restored(self):
-        """最小化期间窗口**必须保持受管状态**，不能提前把无边框装回去。
+    def test_minimize_keeps_style_and_icon_stable(self):
+        """最小化前后样式与图标必须**完全一致**。
 
-        这是「窗口飘在任务栏上面」的根因回归测试。真实时序：用户点最小化后
-        窗口进入 iconic，此时若立刻 ``overrideredirect(True)``，窗口会被摘掉
-        任务栏按钮、矩形从屏幕外的 ``-32000`` 变成贴在任务栏上沿的
-        ``160x28`` 悬浮碎片（实测）。
+        这是「显示后图标消失、点击切换失效」的根因回归测试：只要最小化过程
+        重建了 HWND 或让 Tk 重设了扩展样式，``WS_EX_TOOLWINDOW`` 就会回来，
+        任务栏按钮被撤掉、``WM_SETICON`` 的结果也一并丢失。
 
-        正确行为：最小化后 ``_pending_chrome`` 为真、``overrideredirect`` 仍是
-        关闭态，直到窗口被唤回（触发 ``<Map>``）才装回外壳。
+        正确行为：最小化 → 唤回 多轮往返后，APPWINDOW / 框位标志 / 两个图标
+        槽位都保持原值。
         """
+        if os.name != 'nt':
+            self.skipTest('仅 Windows 有意义')
         window = self._open(JsonParamWindow)
         before = window.win.wm_geometry()
+        hwnd = window._top_level_hwnd()
+        ex_before = window._read_exstyle(hwnd)
+        style_before = window._read_style(hwnd)
+        icons_before = _icon_slots(hwnd)
+
         window._min_btn.event_generate('<Button-1>')
         window.win.update()
-
         self.assertEqual(window.win.state(), 'iconic')
-        # 无边框必须处于放开状态，否则 iconify 根本不会成功
-        self.assertIn(str(window.win.overrideredirect()).lower(),
-                      ('0', 'false', 'none'))
-        self.assertTrue(window._pending_chrome,
-                        '没标记待恢复，唤回时就不会把外壳装回去')
 
-        # 停一会儿：真实用户此时不会去点任务栏，任何定时器都该跑完了
-        deadline = time.time() + 0.8
+        # 停一会儿：任何延迟定时器都该跑完了
+        deadline = time.time() + 0.5
         while time.time() < deadline:
             window.win.update()
             time.sleep(0.01)
 
-        # 关键：等完之后仍然是「最小化 + 受管窗口」，没有被偷偷改成无边框
         self.assertEqual(window.win.state(), 'iconic')
-        self.assertIn(str(window.win.overrideredirect()).lower(),
-                      ('0', 'false', 'none'),
-                      '最小化期间恢复了无边框 → 窗口会变成悬浮在任务栏上的碎片')
+        self.assertEqual(window._read_exstyle(hwnd), ex_before,
+                         '最小化期间扩展样式变了 → 任务栏按钮会被撤掉')
+        self.assertEqual(_icon_slots(hwnd), icons_before,
+                         '最小化期间图标槽位变了 → 任务栏图标消失')
 
-        # 点任务栏唤回，此时才装回外壳
+        # 唤回后一切照旧
         window.win.deiconify()
+        window._restore_chrome()
         window.win.update()
         self.assertEqual(window.win.state(), 'normal')
-        self.assertFalse(window._pending_chrome, '唤回后应清掉待恢复标记')
-        self.assertIn(str(window.win.overrideredirect()).lower(), ('1', 'true'))
         self.assertEqual(window.win.winfo_viewable(), 1,
                          '窗口从最小化唤回后不可见，用户会彻底找不到它')
         self.assertEqual(window.win.wm_geometry(), before)
+        self.assertEqual(window._read_exstyle(hwnd), ex_before)
+        self.assertEqual(window._read_style(hwnd), style_before)
+        self.assertEqual(_icon_slots(hwnd), icons_before)
 
     def test_window_rect_goes_offscreen_when_minimized(self):
         """最小化后窗口矩形必须移到屏幕外（-32000），而不是停在任务栏上沿。
@@ -346,6 +395,41 @@ class ToolWindowTests(unittest.TestCase):
         self.assertFalse(ex_style & WS_EX_TOOLWINDOW,
                          '残留 WS_EX_TOOLWINDOW，任务栏仍会隐藏它')
 
+    def test_window_style_allows_taskbar_toggle(self):
+        """必须补 WS_MINIMIZEBOX / WS_MAXIMIZEBOX / WS_SYSMENU。
+
+        无边框窗口是纯 WS_POPUP，三个框位标志全为 0。缺了它们，点任务栏按钮
+        只会激活窗口，不会「点一下最小化、再点一下还原」。
+        """
+        if os.name != 'nt':
+            self.skipTest('仅 Windows 有意义')
+        window = self._open(JsonParamWindow)
+        window._claim_taskbar()
+        style = window._read_style(window._top_level_hwnd())
+        self.assertTrue(style & WS_MINIMIZEBOX, '缺少 WS_MINIMIZEBOX')
+        self.assertTrue(style & WS_MAXIMIZEBOX, '缺少 WS_MAXIMIZEBOX')
+        self.assertTrue(style & WS_SYSMENU, '缺少 WS_SYSMENU')
+        # 补框位标志不能把原生标题栏带出来（WS_CAPTION = WS_BORDER|WS_DLGFRAME）
+        self.assertEqual(style & 0xC00000, 0,
+                         '补样式后冒出了原生标题栏')
+
+    def test_window_has_taskbar_icon(self):
+        """窗口必须挂上任务栏图标。
+
+        iconphoto 对无边框窗口无效（实测 WM_GETICON 恒为 0），只有
+        iconbitmap(<ico>) 生效。用 WM_GETICON 直接确认拿到了非零 HICON。
+        """
+        if os.name != 'nt':
+            self.skipTest('仅 Windows 有意义')
+        window = self._open(JsonParamWindow)
+        user32 = ctypes.WinDLL('user32')
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        user32.SendMessageW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+        hicon = user32.SendMessageW(
+            ctypes.c_void_p(window._top_level_hwnd()), 0x007F, 0, 0)
+        self.assertNotEqual(hicon, 0, '任务栏没有图标（WM_GETICON 为 0）')
+
     def test_taskbar_flag_survives_minimize_roundtrip(self):
         """最小化会先取消无边框，样式被重设；还原后必须重新声明。"""
         if os.name != 'nt':
@@ -374,8 +458,7 @@ class ToolWindowTests(unittest.TestCase):
         hwnd = window._top_level_hwnd()
         # 故意打回 Tk 的默认样式，模拟「刚被 overrideredirect 重设」
         style = window._read_exstyle(hwnd)
-        window._write_exstyle(
-            hwnd, (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW)
+        _write_exstyle(hwnd, (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW)
         self.assertFalse(window._read_exstyle(hwnd) & WS_EX_APPWINDOW)
         # 触发一次 Map（真实场景是窗口从最小化恢复/首次显示）
         window.win.event_generate('<Map>')

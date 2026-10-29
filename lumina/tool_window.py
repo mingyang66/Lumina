@@ -28,7 +28,7 @@ import ctypes
 import os
 from tkinter import TclError
 
-from . import jwt_tools
+from . import jwt_tools, taskbar
 from .json_tools import transform_json
 
 # 等宽字体：Windows 上 Consolas 覆盖 ASCII 与数字对齐；中文回退由 Tk 处理。
@@ -50,21 +50,29 @@ MIN_W, MIN_H = 660, 440    # 允许缩到的最小尺寸
 SECTION_MARK = "▍"
 
 # ---------- Win32 窗口扩展样式 ----------
+# 具体实现统一在 lumina/taskbar.py（与主面板共用），这里只做常量再导出，
+# 便于测试直接按名字断言。
+#
 # 无边框（overrideredirect）会让 Tk 给顶层窗口打上 WS_EX_TOOLWINDOW，
 # 该标志的语义就是「不进任务栏、不进 Alt+Tab」。要让它像普通窗口一样
 # 出现在任务栏，必须换成 WS_EX_APPWINDOW。
-GWL_EXSTYLE = -20
-GWL_STYLE = -16
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_APPWINDOW = 0x00040000
-WS_MINIMIZEBOX = 0x00020000
-WS_MAXIMIZEBOX = 0x00010000
-WS_SYSMENU = 0x00080000
-SWP_NOSIZE = 0x0001
-SWP_NOMOVE = 0x0002
-SWP_NOZORDER = 0x0004
-SWP_NOACTIVATE = 0x0010
-SWP_FRAMECHANGED = 0x0020
+#
+# WS_MINIMIZEBOX / WS_MAXIMIZEBOX / WS_SYSMENU 是**纯行为标志**：无边框窗口
+# 是纯 WS_POPUP，三个框位标志全为 0，缺了它们点任务栏按钮只会激活窗口，
+# 不会「点一下最小化、再点一下还原」。补上后 Windows 自己接管该交互，
+# 实测**不会**因此露出原生标题栏。
+GWL_EXSTYLE = taskbar.GWL_EXSTYLE
+GWL_STYLE = taskbar.GWL_STYLE
+WS_EX_TOOLWINDOW = taskbar.WS_EX_TOOLWINDOW
+WS_EX_APPWINDOW = taskbar.WS_EX_APPWINDOW
+WS_MINIMIZEBOX = taskbar.WS_MINIMIZEBOX
+WS_MAXIMIZEBOX = taskbar.WS_MAXIMIZEBOX
+WS_SYSMENU = taskbar.WS_SYSMENU
+SWP_NOSIZE = taskbar.SWP_NOSIZE
+SWP_NOMOVE = taskbar.SWP_NOMOVE
+SWP_NOZORDER = taskbar.SWP_NOZORDER
+SWP_NOACTIVATE = taskbar.SWP_NOACTIVATE
+SWP_FRAMECHANGED = taskbar.SWP_FRAMECHANGED
 
 
 class _MiniScroll:
@@ -184,8 +192,6 @@ class _ToolWindow:
         self._normal_geom = None
         self._min_geom = None
         self._chrome_id = None
-        # 为真表示「窗口正处于最小化，无边框还没装回去」，由 <Map> 负责收尾
-        self._pending_chrome = False
         theme = panel._theme()
         self.T, self.dark = theme if isinstance(theme, tuple) else (theme, False)
         self.win = self.tk.Toplevel(panel.win)
@@ -207,9 +213,9 @@ class _ToolWindow:
         self.win.overrideredirect(True)
         self.win.configure(bg=self.T["window_bg"])
         self._follow_topmost()
-        # 首次构造时窗口还没映射，Tk 会在映射那一刻才应用 overrideredirect 的
-        # 扩展样式并把 WS_EX_TOOLWINDOW 打上，所以构建期设置会被覆盖（实测：
-        # 这里改完读回来仍是 0x80）。必须等 <Map> 之后再改一次。
+        # 任务栏归属与图标。构造期窗口还没映射，Tk 会在映射那一刻才应用
+        # overrideredirect 的扩展样式并把 WS_EX_TOOLWINDOW 打上，所以构建期
+        # 这里设的会被覆盖——必须等 <Map> 之后再改一次（见 _on_map_claim_taskbar）。
         self.win.bind("<Map>", self._on_map_claim_taskbar, add="+")
         self._claim_taskbar()
         self.shell = tk.Canvas(self.win, bg=self.T["window_bg"],
@@ -225,75 +231,25 @@ class _ToolWindow:
         ``<Map>`` 里 Tk 已经把 overrideredirect 对应的扩展样式应用完了，
         此时改才不会被覆盖。
 
-        **这里同时负责「最小化唤回」的收尾**：最小化期间窗口必须保持受管
-        状态（见 ``_minimize``），用户点任务栏唤回才会重新触发 ``<Map>``，
-        此刻才把无边框装回去。判断依据是 ``wm state``——只有 normal 才恢复，
-        避免在 iconic 阶段又把窗口变成悬浮碎片。
+        最小化已改为 Win32 ``ShowWindow(SW_MINIMIZE)``，不再翻转
+        ``overrideredirect``，所以这里**没有**「最小化后收尾还原」的分支了。
         """
         if event.widget is not self.win or self._closed:
             return
-        if self._pending_chrome:
-            self._restore_chrome()
-        else:
-            self._claim_taskbar()
+        self._claim_taskbar()
 
     def _claim_taskbar(self):
-        """让无边框窗口出现在任务栏与 Alt+Tab 里。
-
-        **根因**：Tk 在 ``overrideredirect(True)`` 时会给顶层窗口加上
-        ``WS_EX_TOOLWINDOW``（0x80）——实测普通 Toplevel 是 ``0x100``，无边框
-        变成 ``0x80 | WS_POPUP``。带这个扩展样式的窗口按设计就不进任务栏、
-        不进 Alt+Tab，于是**最小化之后用户没有任何入口把它找回来**。
-
-        解法：给顶层 HWND 加上 ``WS_EX_APPWINDOW``（0x40000）并去掉
-        ``WS_EX_TOOLWINDOW``。注意 ``winfo_id()`` 返回的是内层 ``TkChild``，
-        真正决定任务栏归属的是取不到父窗口的那层 ``TkTopLevel``，必须先向上
-        找。改完还要 ``SetWindowPos`` 带 ``SWP_FRAMECHANGED`` 才会让任务栏
-        立刻刷新，否则要等窗口下次显隐才生效。
-        """
-        self._taskbar_hwnd = None
-        if os.name != "nt":
-            return
-        hwnd = self._top_level_hwnd()
-        if not hwnd:
-            return
-        try:
-            ex_style = self._read_exstyle(hwnd)
-            wanted = (ex_style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
-            if wanted != ex_style:
-                self._write_exstyle(hwnd, wanted)
-                # 改扩展样式不会自动重算窗口框架/任务栏，必须显式通知。
-                # 两个坑都要避开：
-                # ① argtypes 必须声明，否则 64 位下后续 int 参数按 32 位传；
-                # ② hwndInsertAfter **不能传 0**（CW_USEDEFAULT 语义），实测
-                #    会把窗口挪到 (0,0)。传自身 + SWP_NOZORDER 才保持原位。
-                set_pos = ctypes.windll.user32.SetWindowPos
-                set_pos.restype = ctypes.c_bool
-                set_pos.argtypes = [
-                    ctypes.c_void_p, ctypes.c_void_p,
-                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                    ctypes.c_uint]
-                set_pos(
-                    ctypes.c_void_p(hwnd), ctypes.c_void_p(hwnd), 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
-                    | SWP_NOACTIVATE | SWP_FRAMECHANGED)
-            self._taskbar_hwnd = hwnd
-        except Exception:
-            self._taskbar_hwnd = None
+        """声明任务栏归属并补框位标志，见 ``taskbar.claim_taskbar``。"""
+        self._taskbar_hwnd = taskbar.top_level_hwnd(self.win)
+        return taskbar.claim_taskbar(self.win)
 
     @staticmethod
     def _read_exstyle(hwnd):
-        getter = ctypes.windll.user32.GetWindowLongPtrW
-        getter.restype = ctypes.c_void_p
-        getter.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        return getter(ctypes.c_void_p(hwnd), GWL_EXSTYLE) or 0
+        return taskbar.read_style(hwnd, taskbar.GWL_EXSTYLE)
 
     @staticmethod
-    def _write_exstyle(hwnd, value):
-        setter = ctypes.windll.user32.SetWindowLongPtrW
-        setter.restype = ctypes.c_void_p
-        setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-        setter(ctypes.c_void_p(hwnd), GWL_EXSTYLE, ctypes.c_void_p(value))
+    def _read_style(hwnd):
+        return taskbar.read_style(hwnd, taskbar.GWL_STYLE)
 
     def _window_rect(self):
         """窗口的 Win32 屏幕矩形 ``(left, top, right, bottom)``。
@@ -323,22 +279,8 @@ class _ToolWindow:
             return None
 
     def _top_level_hwnd(self):
-        """沿父链找到最外层窗口句柄（任务栏归属由它决定）。"""
-        if os.name != "nt":
-            return None
-        try:
-            user32 = ctypes.windll.user32
-            user32.GetParent.restype = ctypes.c_void_p
-            user32.GetParent.argtypes = [ctypes.c_void_p]
-            hwnd = self.win.winfo_id()
-            for _ in range(6):
-                parent = user32.GetParent(ctypes.c_void_p(hwnd))
-                if not parent:
-                    break
-                hwnd = parent
-            return hwnd
-        except Exception:
-            return None
+        """沿父链找到最外层窗口句柄，见 ``taskbar.top_level_hwnd``。"""
+        return taskbar.top_level_hwnd(self.win)
 
     def _follow_topmost(self):
         """跟随主面板的置顶状态：面板常驻最前时，工具窗口别被它压住。"""
@@ -546,41 +488,35 @@ class _ToolWindow:
 
     # ---------- 窗口控制 ----------
     def _minimize(self):
-        """最小化到任务栏。
+        """最小化到任务栏，**不翻转 overrideredirect、不重建 HWND**。
 
-        无边框窗口**不能直接 iconify**——实测抛
-        ``TclError: override-redirect flag is set``，必须先临时取消
-        ``overrideredirect``。
+        Tk 的 ``iconify()`` 对无边框窗口抛
+        ``TclError: override-redirect flag is set``。早先的绕法是临时
+        ``overrideredirect(False)`` → ``iconify()`` → 唤回时再翻回来，但这
+        **每次翻转都重建 HWND**（实测 ``0x3a2e1480`` → ``0x559a07c8`` →
+        ``0x1f40160c``），新窗口带着 Tk 重设的 ``WS_EX_TOOLWINDOW`` 回来，
+        explorer 于是撤掉任务栏按钮——用户看到的就是「显示后图标消失、
+        点击切换失效」。
 
-        **关键：最小化期间绝不能把边框装回去。** 早先的实现用
-        ``after(120, _restore_chrome)`` 在窗口还是 iconic 时就恢复无边框，
-        结果窗口被摘掉任务栏按钮、矩形从屏幕外的 ``-32000`` 变成贴在任务栏
-        上沿的 ``160x28`` 悬浮碎片——用户看到的就是「不在任务栏里，而在任务栏
-        上面」。实测对照：保持受管状态时矩形是 ``(-32000,-32000)``、任务栏
-        按钮仍在（15847px 变化）；恢复无边框后按钮消失（0px）。
-
-        所以这里只放开边框并 iconify，**恢复无边框的动作为推迟到窗口真正被
-        唤回**（``<Map>`` 里 ``_pending_chrome`` 为真时执行）。
+        现在改用 ``ShowWindow(SW_MINIMIZE)``：实测无边框窗口能正常最小化
+        （矩形移到 ``-32000``），且 EX/STYLE/HICON 全程不变。
         """
         if self._closed:
             return
+        self._min_geom = self.win.wm_geometry()
+        if taskbar.minimize_window(self.win):
+            return
         try:
-            if not self._pending_chrome:
-                self._min_geom = self.win.wm_geometry()
-            self._pending_chrome = True
-            self.win.overrideredirect(False)
-            self.win.iconify()
+            self.win.withdraw()
         except TclError:
-            self._pending_chrome = False
-            self.win.overrideredirect(True)
-            self._claim_taskbar()
+            pass
 
     def _restore_chrome(self):
-        """把无边框外壳装回去，并保证几何与任务栏归属都回到最小化前。
+        """从最小化还原（``SW_RESTORE``），不碰 ``overrideredirect``。
 
-        只在窗口已经回到 normal 之后调用（由 ``<Map>`` 触发，或测试里手动调用）。
-        此时 WM 曾给窗口套上边框和标题栏，尺寸会从 920x640 被撑成 936x679
-        （实测），**必须显式回写 geometry**，光恢复标志位不够。
+        保留这个名字是为了兼容既有调用点与测试；现在它只负责「还原 + 补一次
+        任务栏归属」，不再需要重装边框、也不再需要回写 geometry——HWND 从头
+        到尾没变过。
         """
         if self._chrome_id is not None:
             try:
@@ -588,24 +524,16 @@ class _ToolWindow:
             except TclError:
                 pass
         self._chrome_id = None
-        self._pending_chrome = False
         if self._closed:
             return
-        try:
-            if str(self.win.state()) == "iconic":
-                # 还没被唤回，什么都不做——此刻装边框会把窗口变成悬浮碎片。
-                # 留着 _pending_chrome，下次 <Map> 时再收尾。
-                self._pending_chrome = True
-                return
-            self.win.overrideredirect(True)
-            if self._min_geom:
-                self.win.geometry(self._min_geom)
-            # overrideredirect(True) 会重设扩展样式、把 WS_EX_TOOLWINDOW 加回来，
-            # 不重新声明就又会从任务栏消失。
-            self._claim_taskbar()
-            self.win.lift()
-        except TclError:
-            pass
+        if not taskbar.restore_window(self.win):
+            try:
+                self.win.deiconify()
+            except TclError:
+                pass
+        if self._min_geom:
+            self.win.geometry(self._min_geom)
+
 
     def _toggle_maximize(self):
         """最大化到工作区 / 还原。避开任务栏，不做全屏覆盖。"""
@@ -907,7 +835,6 @@ class _ToolWindow:
         self._after_id = None
         self._shell_job = None
         self._chrome_id = None
-        self._pending_chrome = False
         try:
             self.win.destroy()
         except TclError:

@@ -45,13 +45,47 @@ Windows 剪贴板管理器。常驻托盘，自动记录文本 / 图片 / 文件
 窗口四角由 `SetWindowRgn` 裁剪成圆角，顶边有一条冷光扫描线（纯装饰）。
 
 窗口**正常出现在任务栏与 Alt+Tab 里**。无边框会让 Tk 给窗口打上
-`WS_EX_TOOLWINDOW`（该标志的语义就是「不进任务栏」），因此工具窗口会自己换成
-`WS_EX_APPWINDOW`，并在每次 `<Map>` 时重新声明一次。
+`WS_EX_TOOLWINDOW`（该标志的语义就是「不进任务栏」），因此要换成
+`WS_EX_APPWINDOW`，并在每次 `<Map>` 时重新声明一次——构造期设置会被 Tk 在映射那
+一刻覆盖。工具窗口与主面板共用同一套实现，见 `lumina/taskbar.py`。
 
-**最小化期间不要急着把无边框装回去**：那会让窗口被摘掉任务栏按钮、矩形从屏幕外的
-`(-32000, -32000)` 变成贴在任务栏上沿的 `160x28` 悬浮碎片（也就是「窗口飘在任务栏
-上面」）。正确做法是最小化时只放开 `overrideredirect` 并 `iconify`，等窗口被唤回
-（`<Map>` 触发）时再恢复无边框并重新声明任务栏归属。
+**最小化绝对不能翻转 `overrideredirect`。** 这一条是本项目踩得最深的一个坑：
+
+Tk 的 `iconify()` 对无边框窗口直接抛 `TclError: override-redirect flag is set`，
+自然的绕法是「临时 `overrideredirect(False)` → `iconify()` → 唤回时再翻回来」。
+但**每次翻转都会重建 HWND**（实测 `0x3a2e1480` → `0x559a07c8` → `0x1f40160c`），
+新窗口带着 Tk 刚重设的 `WS_EX_TOOLWINDOW` 重新进任务栏，explorer 于是撤掉任务栏
+按钮，`WM_SETICON` 设过的图标也一并丢失。用户看到的就是**「窗口一显示，任务栏图标
+就没了，点按钮也不切换最小化」**。
+
+正确做法是走 Win32 `ShowWindow(SW_MINIMIZE)` / `SW_RESTORE`：无边框窗口能正常最小化
+（矩形移到 `-32000`），而 HWND、扩展样式、框位标志、图标句柄**全程不变**。显隐同理，
+用 `ShowWindow(SW_SHOW)` / `SW_HIDE` 而不是 `deiconify()` / `withdraw()`——后者会重新
+应用 `overrideredirect` 对应的扩展样式。
+
+主面板的最小化按钮原先调的是 `withdraw()`，那是**隐藏**而不是最小化，窗口会从任务栏
+彻底消失，用户再也找不回来。
+
+**任务栏按钮的「点一下最小化、再点一下还原」需要额外的样式标志。** 无边框窗口是
+纯 `WS_POPUP`，`WS_MINIMIZEBOX` / `WS_MAXIMIZEBOX` / `WS_SYSMENU` **全为 0**
+（实测 `STYLE=0x96000008`），缺了它们点任务栏按钮只会把窗口提到前台。这三个是
+**纯行为标志**，补上后 Windows 自己接管该交互，实测不会因此露出原生标题栏
+（`WS_CAPTION` 仍为 `0x0`）。注意这些标志在 `overrideredirect` 翻转时会被冲掉——
+这也是上面「不要翻转」的另一个理由。
+
+**任务栏图标必须按尺寸分槽设置，`iconphoto` 与 `iconbitmap` 都不可靠。**
+`iconphoto` 对无边框窗口完全无效（实测 `WM_GETICON` 三个槽位全返回 0）；
+`iconbitmap(<ico>)` 能设上，但**不区分尺寸**——实测把 ico 里 32x32 那张塞进本该放
+16x16 的 `ICON_SMALL` 槽位，三个槽位拿到同一个 HICON，`GetIconInfo` 读出来是
+`(32, 32)`。任务栏按钮取 `ICON_SMALL` 绘制，尺寸对不上就画不出图标。
+
+正确做法是 `LoadImageW` 按尺寸各加载一次，`WM_SETICON` 分别写进 `ICON_SMALL`(16px)
+与 `ICON_BIG`(32px)——实测分别得到 `(16, 16)` 与 `(32, 32)`，`ICON_SMALL2` 由系统
+自动跟随 SMALL。HICON 在进程内缓存，避免每次显示都新加载一个句柄造成泄漏。
+
+图标由 `lumina/app_icon.py` 在运行时绘制（深色玻璃底 + 蓝紫光晕 + 剪贴板剪影 +
+LUMINA 字样，与托盘图标同源），存成含 16/32/48/256 四种尺寸的 ico 后复用，因此
+仓库里不需要提交任何二进制资源。
 
 除图形界面外还带一组命令行子命令（`-c` 可指定配置文件）：
 
@@ -143,7 +177,7 @@ python -m unittest tests.test_storage_regressions
   的子目录，移除后整个测试集会被静默跳过。
 - 测试文件中通过 `Path(__file__).resolve().parent.parent` 定位项目根，新增测试
   文件时请沿用该写法。
-- 当前用例数：441 项通过、2 项跳过（跳过项依赖符号链接权限）。
+- 当前用例数：458 项通过、2 项跳过（跳过项依赖符号链接权限）。
 
 # Lumina Clipboard Manager - Database Documentation
 

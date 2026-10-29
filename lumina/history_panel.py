@@ -11,7 +11,7 @@ import traceback
 from datetime import datetime, timedelta
 from typing import ClassVar
 
-from . import clipboard_api
+from . import clipboard_api, taskbar
 
 
 class HistoryPanel:
@@ -132,6 +132,28 @@ class HistoryPanel:
     HTBOTTOMRIGHT = 17
     GWL_STYLE = -16
     WS_THICKFRAME = 0x00040000
+    # ---------- 任务栏归属（无边框窗口要靠它才能进任务栏） ----------
+    # overrideredirect(True) 会让 Tk 打上 WS_EX_TOOLWINDOW，语义就是
+    # 「不进任务栏、不进 Alt+Tab」。必须换成 WS_EX_APPWINDOW 才能像普通窗口一样
+    # 出现在任务栏，最小化后也才有入口唤回。与 tool_window.py 同一套做法。
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_APPWINDOW = 0x00040000
+    # ---------- 任务栏按钮的「点击切换」行为 ----------
+    # 无边框窗口是纯 ``WS_POPUP``，**三个框位标志全为 0**（实测 STYLE=0x96000008，
+    # MINIMIZEBOX/MAXIMIZEBOX/SYSMENU 均 False）。缺了它们，Windows 不把这个窗口
+    # 当成「可最小化的窗口」，点任务栏按钮只会把它提到前台，**不会**做
+    # 「点一下最小化、再点一下还原」。
+    # 补上这三个标志后 Windows 自己接管该交互；实测**不会**因此露出原生标题栏
+    # （CAPTION 仍是 0x0）。这是纯行为标志，不改变外观。
+    WS_MINIMIZEBOX = 0x00020000
+    WS_MAXIMIZEBOX = 0x00010000
+    WS_SYSMENU = 0x00080000
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    SWP_FRAMECHANGED = 0x0020
 
     def __init__(self, root, tk, ui):
         self.ui = ui
@@ -150,6 +172,9 @@ class HistoryPanel:
         self._drag_off = None
         self._maxed = False
         self._normal_geom = None
+        # 最小化前的几何。最小化现在走 Win32 ShowWindow，HWND 不重建，
+        # 所以只需要记住几何以便还原时回写窗口尺寸。
+        self._min_geom = None
         self._sel_id = None
         self._diff_base_id = None
         self._diff_base_summary = ""
@@ -178,6 +203,15 @@ class HistoryPanel:
         self.win = tk.Toplevel(root)
         self.win.title("Lumina 历史面板")
         self.win.protocol("WM_DELETE_WINDOW", self.hide)
+        # 任务栏图标与归属。构造期窗口尚未映射，Tk 会在映射那一刻才应用
+        # overrideredirect 对应的扩展样式，所以这里设的会被覆盖一次，
+        # 必须在 <Map> 之后重新声明。真正设图标走 app_icon 的分尺寸 WM_SETICON，
+        # 详见 lumina/taskbar.py 与 lumina/app_icon.py。
+        self._taskbar_icon = None
+        taskbar.claim_taskbar(self.win)
+        # 映射后再声明一次任务栏归属（Tk 此时才把 overrideredirect 的扩展样式
+        # 应用上去，构建期的设置会被覆盖）。
+        self.win.bind("<Map>", self._on_map_claim_taskbar, add="+")
         self._build_widgets()
         self.win.withdraw()
 
@@ -919,7 +953,10 @@ class HistoryPanel:
         self.apply_mode()  # 重设边框/尺寸/位置并刷新
         if topmost is not None:
             self.win.attributes("-topmost", bool(topmost))
-        self.win.deiconify()
+        # 走 Win32 ShowWindow 而不是 deiconify：Tk 的映射流程会重新应用
+        # overrideredirect 对应的扩展样式，可能把 WS_EX_TOOLWINDOW 打回来。
+        if not taskbar.show_window(self.win):
+            self.win.deiconify()
         self.win.lift()
         if position:
             self.win.geometry(f"+{position[0]}+{position[1]}")
@@ -935,9 +972,13 @@ class HistoryPanel:
             self._detail._close_menu()
         try:
             self.win.attributes("-topmost", False)
-            self.win.withdraw()
         except Exception:
             pass
+        if not taskbar.hide_window(self.win):
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
         self.ui.panel_visible = False
 
     # ---------- 顶栏下拉弹窗（截图 / 设置） ----------
@@ -2733,6 +2774,37 @@ class HistoryPanel:
             self._rounded_bg = self._make_rounded_bg(width, height)
             self._bg_canvas.itemconfigure(self._bg_item, image=self._rounded_bg)
 
+    # ---------- 任务栏归属与最小化 ----------
+    # 具体实现在 lumina/taskbar.py（与 tool_window 共用）。留这几个薄包装只是
+    # 为了让调用点读起来短，同时保留测试里替换单个方法的能力。
+    def _taskbar_hwnd(self):
+        """沿父链找到最外层窗口句柄，见 ``taskbar.top_level_hwnd``。"""
+        return taskbar.top_level_hwnd(self.win)
+
+    def _read_exstyle(self, hwnd):
+        return taskbar.read_style(hwnd, self.GWL_EXSTYLE)
+
+    def _read_style(self, hwnd):
+        return taskbar.read_style(hwnd, self.GWL_STYLE)
+
+    def _claim_taskbar(self):
+        """声明任务栏归属并补框位标志，见 ``taskbar.claim_taskbar``。"""
+        return taskbar.claim_taskbar(self.win)
+
+    def _on_map_claim_taskbar(self, event):
+        """窗口映射后重新声明任务栏归属。
+
+        构造期设的样式会被 Tk 在映射那一刻覆盖（实测读回来仍是
+        ``WS_EX_TOOLWINDOW``），所以必须等 ``<Map>`` 之后再改一次。
+
+        最小化已改为 Win32 ``ShowWindow(SW_MINIMIZE)``，不再翻转
+        ``overrideredirect``，因此这里**没有**「最小化后收尾还原」的分支了——
+        样式全程不需要修补。
+        """
+        if event.widget is not self.win:
+            return
+        self._claim_taskbar()
+
     def _install_native_resize(self):
         """Let Windows perform edge/corner resizing like a native window."""
         if os.name != "nt" or self._native_wndproc_ref is not None:
@@ -2904,7 +2976,45 @@ class HistoryPanel:
         return dt.strftime("%Y-%m-%d")
 
     def _minimize(self):
-        self.win.withdraw()
+        """最小化到任务栏，而不是隐藏窗口。
+
+        原来用的是 ``withdraw()``——那是**隐藏**，窗口从任务栏彻底消失，
+        用户再也找不回来（这正是「最小化后找不到」的根因）。
+
+        **不要用 Tk 的 ``iconify()``**：无边框窗口调用它会抛
+        ``TclError: override-redirect flag is set``。早先的绕法是临时
+        ``overrideredirect(False)`` → ``iconify()`` → 唤回时再翻回来，但那**每次
+        翻转都重建 HWND**（实测 ``0x3a2e1480`` → ``0x559a07c8`` →
+        ``0x1f40160c``），新窗口带着 Tk 重设的 ``WS_EX_TOOLWINDOW`` 回来，
+        explorer 于是撤掉任务栏按钮——这正是「显示后图标消失、点击切换失效」
+        的成因。
+
+        现在改用 Win32 ``ShowWindow(SW_MINIMIZE)``：无边框窗口能正常最小化
+        （矩形移到 ``-32000``），且 HWND、扩展样式、框位标志、图标句柄全程不变。
+        """
+        self._min_geom = self.win.wm_geometry()
+        if taskbar.minimize_window(self.win):
+            return
+        # Win32 不可用（非 Windows 或调用失败）就退回 Tk，至少窗口还能用
+        try:
+            self.win.withdraw()
+        except self.tk.TclError:
+            pass
+
+    def _restore_chrome(self):
+        """从最小化还原（``SW_RESTORE``），不碰 ``overrideredirect``。
+
+        保留这个名字是为了兼容既有调用点与测试；现在它只负责「还原 + 补一次
+        任务栏归属」，不再需要重装边框、也不再需要回写 geometry——因为 HWND
+        从头到尾没变过。
+        """
+        if not taskbar.restore_window(self.win):
+            try:
+                self.win.deiconify()
+            except self.tk.TclError:
+                pass
+        if self._min_geom:
+            self.win.geometry(self._min_geom)
 
     def _toggle_maximize(self):
         if self._maxed:
@@ -2933,7 +3043,15 @@ class HistoryPanel:
         return None
 
     def apply_mode(self):
-        self.win.overrideredirect(True)
+        try:
+            if self.win.overrideredirect() != 1:
+                self.win.overrideredirect(True)
+        except self.tk.TclError:
+            self.win.overrideredirect(True)
+        # overrideredirect(True) 会重设扩展样式、把 WS_EX_TOOLWINDOW 加回来，
+        # 不重新声明就会从任务栏消失（最小化后用户找不到窗口）。
+        # 窗口**已经映射**时调用 apply_mode 不会有 <Map> 事件兜底，必须在此显式声明。
+        self._claim_taskbar()
         self._install_native_resize()
         self.win.configure(bg=self._c("window_bg"))
         self.win.minsize(1, 1)
