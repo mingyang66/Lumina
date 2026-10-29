@@ -3058,6 +3058,9 @@ class DetailPane:
     IMG_MAX_BASE = (380, 430)
     FILE_MAX_ROWS = 20
     DEBOUNCE_MS = 120
+    # JSON 预览标题：键为 json_tools.transform_json 的模式名。
+    JSON_MODE_LABELS: ClassVar[dict] = {
+        "format": "已格式化", "compress": "已压缩", "expand": "已展开转义"}
     IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
                 ".ico", ".tif", ".tiff")
     URL_RE = re.compile(r"https?://[^\s<>\"'，。；、）】》」』]+")
@@ -3212,8 +3215,9 @@ class DetailPane:
         try:
             self._update_meta(full, kind)
             if self._json_text is not None:
-                self._meta_title.configure(text="JSON · " + (
-                    "已格式化" if self._json_mode == "format" else "已压缩"))
+                self._meta_title.configure(
+                    text="JSON · " + self.JSON_MODE_LABELS.get(
+                        self._json_mode, "已转换"))
             for w in self._host.winfo_children():
                 w.destroy()
             if kind == "image" and full["data"]:
@@ -3401,6 +3405,9 @@ class DetailPane:
             {"label": "压缩", "hint": "紧凑输出", "kind": "compress",
                  "command": lambda: self._transform_json("compress"),
                  "enabled": not self._json_busy, "selected": self._json_mode == "compress"},
+            {"label": "展开转义", "hint": "换行成行", "kind": "expand",
+                 "command": lambda: self._transform_json("expand"),
+                 "enabled": not self._json_busy, "selected": self._json_mode == "expand"},
             {"label": "恢复原文", "hint": "", "kind": "restore", "command": self._restore_json,
                  "enabled": self._json_text is not None or self._json_busy, "selected": False},
         ]
@@ -3456,8 +3463,11 @@ class DetailPane:
                 return
             self._json_text, self._json_mode = result.text, mode
             self._refresh_json_preview()
-            label = "格式化" if mode == "format" else "压缩"
+            label = {"format": "格式化", "compress": "压缩",
+                     "expand": "展开换行转义"}.get(mode, mode)
             message = f"已{label} JSON；复制/回贴/导出使用结果，原文未修改"
+            if mode == "expand":
+                message += "；展开结果非合法 JSON，换行已统一为 LF"
             if result.duplicate_keys:
                 message += f"；发现 {len(result.duplicate_keys)} 个重复键，已保留"
             self.panel.status_var.set(message)
@@ -3472,8 +3482,8 @@ class DetailPane:
             widget.destroy()
         self._build_text_body(self._host, self._effective_row(), self.tk)
         self._body.bind("<Button-3>", self._menu)
-        self._meta_title.configure(text="JSON · " + (
-            "已格式化" if self._json_mode == "format" else "已压缩"))
+        self._meta_title.configure(
+            text="JSON · " + self.JSON_MODE_LABELS.get(self._json_mode, "已转换"))
 
     def _restore_json(self):
         if self.row is None:
@@ -3603,7 +3613,13 @@ class DetailPane:
         self._body.bind("<MouseWheel>", self._on_wheel)
         # 详情区高度固定：Text 直接撑满可用空间，超长内容滚轮滚动
         self._body.pack(fill="both", expand=True, padx=2, pady=2)
-        if is_code:
+        if self._json_text is not None:
+            # JSON 展示态优先用 token 规则着色：内容本就是 JSON，token 才权威。
+            # 展开转义后字符串含真实换行，代码高亮正则（遇换行即断）会失配，
+            # 整段字符串失去着色、回落默认前景（深色主题下即白字），
+            # 还会把栈文本里的数字/单词误判成 num/kw。
+            self._highlight_json(content, console=console)
+        elif is_code:
             self._highlight_code(content, console=console)
         self._linkify(content, dark_bg=console)
 
@@ -3818,6 +3834,50 @@ class DetailPane:
             w.bind("<MouseWheel>", self._on_wheel)
 
     # ---------- 代码着色 / 链接 ----------
+    def _highlight_json(self, content, console=False):
+        """JSON 展示态着色：按 token 取跨度，字符串可跨真实换行。
+
+        代码高亮正则的字符串模式 ``"(?:\\.|[^"\\\n])*"`` 明确排除裸换行
+        （避免未闭合引号吞掉整篇代码），而 ``expand`` 输出的字符串体内正是
+        真实换行 —— 用它会整段失配：字符串失去 ``str`` 标签、回落到控件
+        默认前景（深色主题下即白字），还会把栈文本里的数字/单词误判成
+        ``num``/``kw``。这里改用 ``json_tools`` 的 token 规则，与转换逻辑
+        共用同一套边界定义。
+        """
+        body = self._body
+        try:
+            from .json_tools import json_syntax_spans
+            spans = json_syntax_spans(content)
+        except Exception:
+            traceback.print_exc()
+            return
+        if console:
+            colors = {'str': "#CE9178", 'num': "#B5CEA8", 'lit': "#569CD6"}
+        else:
+            colors = {'str': self.panel._sys("green"), 'num': self.panel._sys("orange"),
+                      'lit': self.T["accent"]}
+        for kind, color in colors.items():
+            body.tag_configure(kind, foreground=color)
+        st = [0, 1, 0]
+
+        def _idx(off):
+            seg = content[st[0]:off]
+            nl = seg.count("\n")
+            if nl:
+                st[1] += nl
+                st[2] = len(seg) - seg.rfind("\n") - 1
+            else:
+                st[2] += len(seg)
+            st[0] = off
+            return f"{st[1]}.{st[2]}"
+
+        try:
+            # 偏移相对原文单调递增，可复用同一个游标顺序换算行列。
+            for kind, start, end in spans:
+                body.tag_add(kind, _idx(start), _idx(end))
+        except Exception:
+            traceback.print_exc()
+
     def _highlight_code(self, content, console=False):
         body = self._body
         T = self.T

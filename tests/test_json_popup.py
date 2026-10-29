@@ -274,6 +274,19 @@ class JsonPopupTests(unittest.TestCase):
         menu.popup(self.anchor)
         self.assertEqual(menu._bounds, (0, 0, 180, 100))
 
+    def test_icon_draws_for_each_known_kind_and_ignores_unknown(self):
+        # 每个受支持的 kind 都必须画出至少一条线；未知 kind 静默不画。
+        for kind in ('format', 'compress', 'expand', 'restore'):
+            with self.subTest(kind=kind):
+                menu = self.make(items=[{'label': kind, 'kind': kind}])
+                lines = [o for k, _, o in menu.canvas.drawings if k == 'line']
+                self.assertGreaterEqual(len(lines), 2)
+                self.assertTrue(all(o['fill'] == THEME['label'] or
+                                    o['fill'] == THEME['accent'] for o in lines))
+                menu.close()
+        menu = self.make(items=[{'label': '未知', 'kind': 'no-such-kind'}])
+        self.assertEqual([o for k, _, o in menu.canvas.drawings if k == 'line'], [])
+
     def test_dpi_validation_and_scaling(self):
         for value, expected in [(None, 1), ('bad', 1), (float('nan'), 1),
                                 (float('inf'), 1), (-1, .5), (100, 3), (1.5, 1.5)]:
