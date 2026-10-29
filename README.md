@@ -55,7 +55,7 @@ python -m unittest tests.test_storage_regressions
   的子目录，移除后整个测试集会被静默跳过。
 - 测试文件中通过 `Path(__file__).resolve().parent.parent` 定位项目根，新增测试
   文件时请沿用该写法。
-- 当前用例数：356 项通过、2 项跳过（跳过项依赖符号链接权限）。
+- 当前用例数：328 项通过、2 项跳过（跳过项依赖符号链接权限）。
 
 # Lumina Clipboard Manager - Database Documentation
 
