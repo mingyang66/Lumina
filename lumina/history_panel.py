@@ -1039,7 +1039,41 @@ class HistoryPanel:
                 dr.line([(x, y), (x + dx * corner, y)], fill=c, width=w)
                 dr.line([(x, y), (x, y + dy * corner)], fill=c, width=w)
 
-        if kind == "shot":
+        if kind == "tools":
+            # 工具下拉：遍历注册表生成，新增工具只需改 tool_window.TOOLS。
+            from .tool_window import TOOLS
+            tool_icons = {"json": ("{}", "orange"), "jwt": ("JWT", "purple")}
+            first = True
+            for tool_key, label, _cls in TOOLS:
+                mark, color_name = tool_icons.get(tool_key, ("?", "gray"))
+
+                def draw_mark(dr, s, c, w, mark=mark):
+                    """方块里写字形，代替逐工具绘制专用图标。"""
+                    dr.rounded_rectangle(
+                        [s * 0.10, s * 0.10, s * 0.90, s * 0.90],
+                        radius=s * 0.16, outline=c, width=w)
+                    if mark:
+                        fs = int(s * (0.34 if len(mark) > 2 else 0.44))
+                        try:
+                            from PIL import ImageFont
+                            font = ImageFont.truetype(self._font_path(), fs * 2)
+                        except OSError:
+                            font = None
+                        if font is not None:
+                            dr.text((s * 0.5, s * 0.5), mark, font=font,
+                                    fill=c, anchor="mm")
+
+                photo = sm_icon(draw_mark, 18, color_hex=self._sys(color_name))
+                button = tk.Button(
+                    frame, text=label, image=photo, compound="right",
+                    command=lambda k=tool_key: self._popup_action(
+                        lambda: self._open_tool_window(k)),
+                    **btn_kw)
+                button.image = photo
+                button.pack(fill="x", padx=4,
+                            pady=(4, 1) if first else (1, 4))
+                first = False
+        elif kind == "shot":
             cut_photo = sm_icon(fullscreen_icon, 18, color_hex=self._sys("blue"))
             cut_button = tk.Button(
                 frame, text="全屏截图", image=cut_photo, compound="right",
@@ -1272,6 +1306,19 @@ class HistoryPanel:
     def _popup_action(self, fn):
         self._close_popup_menu()
         fn()
+
+    def _open_tool_window(self, key):
+        """打开顶栏工具窗口（JSON 参数 / JWT 解析）。
+
+        工具窗口是独立 Toplevel，不写剪贴板历史、不改数据库；关掉即释放。
+        """
+        from .tool_window import open_tool
+        try:
+            return open_tool(self, key)
+        except Exception:
+            traceback.print_exc()
+            self.status_var.set("工具打开失败，详情见控制台")
+            return None
 
     def _cleanup_now(self):
         try:
@@ -2013,6 +2060,13 @@ class HistoryPanel:
             title_bar, text="截图",
             command=lambda: self._toggle_popup_menu("shot", self._shot_btn),
             **menu_btn_kw)
+        # 工具下拉放在「截图」左侧、紧邻 Lumina 标题，成为标题栏第一组功能入口。
+        self._tools_btn = tk.Button(
+            title_bar, text="工具 ▾",
+            command=lambda: self._toggle_popup_menu("tools", self._tools_btn),
+            **menu_btn_kw)
+        # pack 顺序即从左到右：工具 ▾ → 截图 → 设置
+        self._tools_btn.pack(side="left", padx=(0, 2))
         self._shot_btn.pack(side="left", padx=(0, 2))
         self._settings_btn.pack(side="left", padx=(0, 2))
 
