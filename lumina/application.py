@@ -223,16 +223,21 @@ class LuminaApp:
         不一致）。
         """
         try:
-            # 注意：row 为 sqlite3.Row，无 .get()，不能改用 dict.get 写法。
-            data = row["data"] if "data" in row else None  # noqa: SIM401
-            file_path = row["file_path"] if "file_path" in row else ""  # noqa: SIM401
-            content = row["content"] if "content" in row else None  # noqa: SIM401
+            # 注意：row 可能是 sqlite3.Row，无 .get()；且 `"data" in row` 判断的
+            # 是**值**而非列名（Row 迭代产出各列的值），恒为 False——曾因此把
+            # data/file_path/content 全读成默认值。
+            # 这里必须用 keys()：sqlite3.Row 不是 dict，不加 keys() 就是上面那个
+            # 陷阱，故对 SIM118（"key in dict 即可"）逐行豁免——该规则只对真
+            # dict 成立。keys() 对 dict 输入同样正确，两种调用方都覆盖。
+            data = row["data"] if "data" in row.keys() else None  # noqa: SIM118
+            file_path = row["file_path"] if "file_path" in row.keys() else ""  # noqa: SIM118
+            content = row["content"] if "content" in row.keys() else None  # noqa: SIM118
             if data is None and row["id"]:
                 full_row = self.db.get(row["id"])
                 if full_row is not None:
                     row = full_row
                     data = row["data"]
-                    file_path = row["file_path"] if "file_path" in row else ""  # noqa: SIM401
+                    file_path = row["file_path"] if "file_path" in row.keys() else ""  # noqa: SIM118
                     if content is not None and content != row["content"]:
                         # 调用方给的是派生内容（如 JSON 格式化结果），以它为准。
                         row = dict(row)

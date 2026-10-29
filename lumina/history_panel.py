@@ -1578,8 +1578,11 @@ class HistoryPanel:
         from PIL import ImageTk
         dark = self._is_dark_mode()
         if cat in ("image", "code", "file", "text", "link"):
-            # r 为 sqlite3.Row，无 .get()，不能改用 dict.get 写法。
-            source = r["source"] if "source" in r else ""  # noqa: SIM401
+            # r 为 sqlite3.Row，无 .get()；且 `"source" in r` 判断的是**值**
+            # 而非列名（Row 迭代产出各列的值），恒为 False，会把来源读成空串、
+            # 整列表都显示「未知来源」。这里必须用 keys()：sqlite3.Row 不是 dict，
+            # 故豁免 SIM118（该规则只对真 dict 成立）；keys() 对 dict 输入同样正确。
+            source = r["source"] if "source" in r.keys() else ""  # noqa: SIM118
             source_key = (source or "").lower()
             key = f"tile:source:{source_key}:{size}:{dark}"
             hit = self._thumb_cache.get(key)
