@@ -216,17 +216,27 @@ class LuminaApp:
 
         图片记录写回为图片；归档文件如果实际是图片，也写回为图片，
         否则按文本写回文件路径。
+
+        补取 ``data``/``file_path`` 时会重新读整行，但**必须保留调用方传入的
+        ``content``**：详情区曾把 JSON 格式化结果放进临时 row 交进来，若被库中
+        原文覆盖，复制到的就是未格式化的旧数据（用户看到的框内文本与剪贴板
+        不一致）。
         """
         try:
             # 注意：row 为 sqlite3.Row，无 .get()，不能改用 dict.get 写法。
             data = row["data"] if "data" in row else None  # noqa: SIM401
             file_path = row["file_path"] if "file_path" in row else ""  # noqa: SIM401
+            content = row["content"] if "content" in row else None  # noqa: SIM401
             if data is None and row["id"]:
                 full_row = self.db.get(row["id"])
                 if full_row is not None:
                     row = full_row
                     data = row["data"]
                     file_path = row["file_path"] if "file_path" in row else ""  # noqa: SIM401
+                    if content is not None and content != row["content"]:
+                        # 调用方给的是派生内容（如 JSON 格式化结果），以它为准。
+                        row = dict(row)
+                        row["content"] = content
 
             if file_path and data is None:
                 archived = self.db.get_file_data(row['id'])
