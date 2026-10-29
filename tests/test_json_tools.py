@@ -146,6 +146,50 @@ class JsonToolsTests(unittest.TestCase):
                     first = transform_json(raw, mode)
                     self.assertEqual(transform_json(first.text, mode), first)
 
+    def test_json_syntax_spans_cover_strings_across_real_newlines(self):
+        # expand 输出的字符串体含真实换行，跨度必须完整覆盖而非在换行处断裂。
+        raw = r'{"m":"a\nb\nc","n":[1,true,null],"s":"尾部"}'
+        expanded = transform_json(raw, 'expand').text
+        spans = json_tools.json_syntax_spans(expanded)
+        strings = [(s, e) for k, s, e in spans if k == 'str']
+        # 3 个对象键（m/n/s）+ 2 个字符串值 = 5 段
+        self.assertEqual(len(strings), 5)
+        texts = [expanded[s:e] for s, e in strings]
+        # 含裸换行的那个字符串值必须被完整覆盖，而不是断在换行处。
+        self.assertIn('"a\nb\nc"', texts)
+        self.assertIn('"尾部"', texts)
+        self.assertTrue(all(expanded[s] == '"' and expanded[e - 1] == '"'
+                            for s, e in strings))
+        # 数字与字面量各自归类
+        kinds = {}
+        for kind, start, end in spans:
+            kinds.setdefault(kind, []).append(expanded[start:end])
+        self.assertEqual(kinds.get('num'), ['1'])
+        self.assertEqual(kinds.get('lit'), ['true', 'null'])
+
+    def test_json_syntax_spans_are_monotonic_and_ignore_structure(self):
+        raw = '{"a": [1, {"b": "x"}], "c": false}'
+        spans = json_tools.json_syntax_spans(raw)
+        offsets = [start for _, start, _ in spans]
+        # 偏移单调递增，UI 才能用单游标顺序换算行列。
+        self.assertEqual(offsets, sorted(offsets))
+        # 结构字符（括号、逗号、冒号）不入 span，非字符串 token 只剩数字/字面量
+        self.assertNotIn(':', [raw[s:e] for _, s, e in spans])
+        self.assertEqual({k for k, _, _ in spans}, {'str', 'num', 'lit'})
+
+    def test_json_syntax_spans_do_not_break_on_newline_like_code_regex(self):
+        # 代码高亮正则遇裸换行即断，这里必须不受影响（回归护栏）。
+        import re
+        code_string_re = re.compile(r'"(?:\\.|[^"\\\n])*"')
+        expanded = transform_json(r'{"m":"第一行\n第二行"}', 'expand').text
+        code_hits = code_string_re.findall(expanded)
+        json_hits = [(s, e) for k, s, e in json_tools.json_syntax_spans(expanded)
+                     if k == 'str']
+        # 代码正则只能匹配到残缺的短段，token 规则仍覆盖完整字符串。
+        self.assertLess(max(len(h) for h in code_hits), 8)
+        self.assertIn('"第一行\n第二行"',
+                      [expanded[s:e] for s, e in json_hits])
+
     def test_invalid_mode_and_type(self):
         for mode in ('restore', 'unknown', '', None):
             with self.subTest(mode=mode):
@@ -155,6 +199,81 @@ class JsonToolsTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 with self.assertRaisesRegex(TypeError, '字符串'):
                     transform_json(raw)
+
+    def test_expand_turns_newline_escapes_into_real_lines(self):
+        raw = r'{"msg":"第一行\n第二行\n第三行","n":1}'
+        expected = '{\n  "msg": "第一行\n第二行\n第三行",\n  "n": 1\n}'
+        self.assertEqual(transform_json(raw, 'expand').text, expected)
+        # 结构与 format 一致，只有字符串体多出裸换行。
+        self.assertEqual(transform_json(raw, 'expand').text,
+                         transform_json(raw, 'format').text.replace('\\n', '\n'))
+        # 压缩模式不动字符串体。
+        self.assertEqual(transform_json(raw, 'compress').text,
+                         r'{"msg":"第一行\n第二行\n第三行","n":1}')
+
+    def test_expand_normalizes_crlf_cr_and_u000a_to_lf(self):
+        # \r\n、\r、\u000a 与 \n 在 JSON 里都表示换行，统一收敛为 LF。
+        for escape in (r'\n', r'\r', r'\r\n', r'\u000a', r'\u000A'):
+            with self.subTest(escape=escape):
+                raw = '{"m":"a' + escape + 'b"}'
+                self.assertEqual(transform_json(raw, 'expand').text,
+                                 '{\n  "m": "a\nb"\n}')
+
+    def test_expand_keeps_other_escapes_and_literal_backslash_n(self):
+        # 字面量 \\n（反斜杠 + n）不得被当作换行展开。
+        raw = r'{"lit":"a\\nb","tab":"x\ty","quote":"p\"q","slash":"r\/s"}'
+        self.assertEqual(
+            transform_json(raw, 'expand').text,
+            '{\n  "lit": "a\\\\nb",\n  "tab": "x\\ty",\n'
+            '  "quote": "p\\"q",\n  "slash": "r\\/s"\n}')
+
+    def test_expand_does_not_expand_object_keys(self):
+        raw = r'{"a\nb":1,"k":"v\nw"}'
+        self.assertEqual(transform_json(raw, 'expand').text,
+                         '{\n  "a\\nb": 1,\n  "k": "v\nw"\n}')
+
+    def test_expand_non_string_and_no_escape_inputs_match_format(self):
+        for raw in ('{}', '[]', '[1,2,3]', '{"a":[1,{"b":null}]}', 'true', '123',
+                    '"单个字符串"', '{"m":"没有换行"}', '{"m":"\\ud800"}'):
+            with self.subTest(raw=raw):
+                self.assertEqual(transform_json(raw, 'expand').text,
+                                 transform_json(raw, 'format').text)
+
+    def test_expand_output_is_not_parseable_json(self):
+        # expand 是展示态：字符串内出现裸换行后不再是合法 JSON。
+        expanded = transform_json(r'{"m":"a\nb"}', 'expand').text
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(expanded)
+        # 原始输入仍是合法 JSON，恢复原文不依赖反向解析。
+        json.loads(r'{"m":"a\nb"}')
+
+    def test_expand_still_validates_input_and_limits(self):
+        with self.assertRaises(json.JSONDecodeError):
+            transform_json('{"a": @}', 'expand')
+        with self.assertRaisesRegex(ValueError, '嵌套过深'):
+            transform_json('[' * 129 + '0' + ']' * 129, 'expand')
+        with self.assertRaisesRegex(ValueError, '输入过大'):
+            transform_json('"' + 'a' * json_tools.MAX_INPUT_BYTES + '"', 'expand')
+
+    def test_expand_respects_output_limit(self):
+        # 展开只减字节，故用极大输入验证输出上限仍生效。
+        raw = '{"m":"' + 'a' * 400 + '"}'
+        formatted = transform_json(raw, 'format').text
+        with patch.object(json_tools, 'MAX_OUTPUT_BYTES',
+                          len(formatted.encode('utf-8'))):
+            self.assertEqual(transform_json(raw, 'expand').text, formatted)
+        with patch.object(json_tools, 'MAX_OUTPUT_BYTES', 3):
+            with self.assertRaisesRegex(ValueError, '输出过大'):
+                transform_json(raw, 'expand')
+
+    def test_expand_reproduces_from_format_for_plain_newlines(self):
+        # 输入只含 \n 时，expand 结果等于把 format 结果里的 \n 转义换成真实换行。
+        raw = r'{"a":"x\ny\nz","b":["p\nq"],"c":{"d":"\n"}}'
+        formatted = transform_json(raw, 'format').text
+        expanded = transform_json(raw, 'expand').text
+        self.assertEqual(expanded, formatted.replace('\\n', '\n'))
+        # 因为不额外加缩进，行数差正好等于字符串体内的 \n 个数（4 个）。
+        self.assertEqual(expanded.count('\n'), formatted.count('\n') + 4)
 
 
 if __name__ == '__main__':

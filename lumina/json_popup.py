@@ -284,6 +284,10 @@ class JsonPopup:
         elif kind == 'compress':
             line(-7, -5, -2, 0, -7, 5)
             line(7, -5, 2, 0, 7, 5)
+        elif kind == 'expand':
+            # 上下两条横线夹一个折向下行的箭头，示意「一行拆成多行」。
+            line(-7, -5, 3, -5, -7, 4)
+            line(-7, 5, 7, 5)
         elif kind == 'restore':
             line(-5, -1, -5, -6, 0, -6)
             line(-5, -5, 0, -6, 5, -3, 6, 2, 3, 6, -2, 6)
