@@ -20,6 +20,11 @@ class RegionSelector:
 
     HINT = "拖拽框选区域 · 松手后 ✓保存(Enter) / 📌钉图 / ✕取消(Esc)"
 
+    # 标注线宽三档：(标签, 像素)。默认取第一档「小」，即最细。
+    DRAW_WIDTHS = (("小", 2), ("中", 6), ("大", 12))
+    DRAW_DEFAULT_WIDTH = DRAW_WIDTHS[0][1]
+    DRAW_DEFAULT_COLOR = "#ff3b30"
+
     def __init__(self, ui, frozen_png, on_done):
         from PIL import Image, ImageEnhance, ImageTk
         self._ImageTk = ImageTk
@@ -67,11 +72,11 @@ class RegionSelector:
         self._tb_bg_photo = None  # 圆角背景 PhotoImage（防 GC）
         self._tb_icons = {}       # 图标 PhotoImage 引用（防 GC）
         self._tool = None
-        self._drawing_styles = {tool: [6, "#ff3b30"]
+        self._drawing_styles = {tool: [self.DRAW_DEFAULT_WIDTH, self.DRAW_DEFAULT_COLOR]
                                 for tool in ("rect", "oval", "arrow", "brush")}
         self._drawing_style_popup = None
         self._drawing_tool_anchors = {}
-        self._draw_style = (6, "#ff3b30")
+        self._draw_style = (self.DRAW_DEFAULT_WIDTH, self.DRAW_DEFAULT_COLOR)
         self._draw_start = None
         self._draw_preview = None
         self._draw_preview_items = []
@@ -755,7 +760,8 @@ class RegionSelector:
             return max(1, int(round(value * ui_scale)))
         frame.pack(padx=px(8), pady=(px(10), px(8)))
         block_size = px(28)
-        sizes = (("小", 2), ("中", 6), ("大", 12)) if drawing_tool else (("小", 14), ("中", 18), ("大", 26))
+        sizes = (self.DRAW_WIDTHS if drawing_tool
+                 else (("小", 14), ("中", 18), ("大", 26)))
         popup._style_dots = []
         for index, (label, size) in enumerate(sizes):
             selected = size == (self._drawing_styles[drawing_tool][0] if drawing_tool else self._text_font_size)

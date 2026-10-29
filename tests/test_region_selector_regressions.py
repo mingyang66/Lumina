@@ -162,8 +162,8 @@ def make_selector():
         "_text_color": "#ff3b30", "_draw_start": None, "_draw_points": [],
         "_draw_preview": None, "_draw_preview_items": [], "_preview_point_index": 0,
         "_annotation_draw_time": 0.0, "_tool": "text", "_mosaic_radius": 12,
-        "_draw_mosaic_radius": 12, "_draw_style": (6, "#ff3b30"),
-        "_drawing_styles": {tool: [6, "#ff3b30"]
+        "_draw_mosaic_radius": 12, "_draw_style": (2, "#ff3b30"),
+        "_drawing_styles": {tool: [2, "#ff3b30"]
                          for tool in ("rect", "oval", "arrow", "brush")},
         "_sel_box": (0, 0, 100, 100), "sx": 1, "sy": 1, "sw": 100, "sh": 100,
     }
@@ -340,6 +340,39 @@ class RegionSelectorRegressionTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         getattr(selector, method)()
         self.assertNotIn("len(item)", SOURCE)
+
+    def test_drawing_width_defaults_to_thinnest_option(self):
+        # 矩形/圆形/箭头/画笔的默认线宽必须是最细一档（DRAW_WIDTHS[0]）。
+        self.assertEqual(RegionSelector.DRAW_DEFAULT_WIDTH,
+                         RegionSelector.DRAW_WIDTHS[0][1])
+        self.assertEqual(RegionSelector.DRAW_DEFAULT_WIDTH, 2)
+        # 三档预设保持递增，且弹窗下标与 _thickness_dot_image 的圆点表对齐。
+        widths = [width for _, width in RegionSelector.DRAW_WIDTHS]
+        self.assertEqual(widths, sorted(widths))
+        self.assertEqual(len(widths), 3)
+
+    def test_all_drawing_tools_share_thin_default(self):
+        # 四个绘制工具都必须从最细档起步，不能有工具漏改。
+        from lumina.region_selector import RegionSelector as RS
+        styles = {tool: [RS.DRAW_DEFAULT_WIDTH, RS.DRAW_DEFAULT_COLOR]
+                  for tool in ("rect", "oval", "arrow", "brush")}
+        for tool in ("rect", "oval", "arrow", "brush"):
+            with self.subTest(tool=tool):
+                self.assertEqual(styles[tool][0], RS.DRAW_WIDTHS[0][1])
+
+    def test_mouse_down_uses_thin_default_style(self):
+        # 按下开始绘制时，_draw_style 应取自该工具的最细默认值。
+        for tool in ("rect", "oval", "arrow", "brush"):
+            with self.subTest(tool=tool):
+                selector = make_selector()
+                selector._tool = tool
+                selector._drawing_styles = {
+                    name: [RegionSelector.DRAW_DEFAULT_WIDTH,
+                           RegionSelector.DRAW_DEFAULT_COLOR]
+                    for name in ("rect", "oval", "arrow", "brush")}
+                selector._on_press(SimpleNamespace(x=10, y=10))
+                self.assertEqual(selector._draw_style[0],
+                                 RegionSelector.DRAW_WIDTHS[0][1])
 
     def test_no_global_bindings_shutil_and_palette(self):
         self.assertNotIn("bind_all(", SOURCE)
