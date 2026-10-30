@@ -228,11 +228,26 @@ class HistoryPanel:
         self._popup_outside_binding = None
         self._menu_anchor = None
         self._menu_kind = None
+        # 悬停展开：进菜单项后要等鼠标真正离开「按钮 + 弹窗」整体才收起。
+        # 只判按钮 <Leave> 是不够的——鼠标往下划进弹窗时必然先离开按钮，
+        # 立刻收起会让弹窗根本点不到。故用轮询统一看两块的屏幕矩形。
+        self._popup_hover_job = None
+        # 悬停展开的延迟任务：面板被唤出时光标常正压在按钮上，Tk 补发的
+        # <Enter> 会立刻把菜单弹出来。延迟一档，指针没停留就不开。
+        self._hover_open_job = None
+        # 悬停展开要先**解锁**：用户要求「只有第一次点击上面菜单某一项后
+        # 才触发鼠标放到某一个菜单上自动弹出下拉框」。初始 False，点过任一
+        # 顶栏菜单按钮后置 True；面板隐藏/最小化时复位——否则下次用热键
+        # 唤出面板时（光标常正好压在按钮上）又会自己蹦出菜单。
+        self._hover_armed = False
         self._search_active = False
         self._search_focus_check = None
 
         self.win.bind("<F5>", lambda e: self.refresh())
         self.win.bind("<Escape>", lambda e: self.escape())
+        # 点击「其他地方」取消悬停激活：窗口级 + 捕获阶段之前的普通绑定即可，
+        # 绑在 win 上能收到所有子控件的冒泡（bind_all 会波及别的 Toplevel）。
+        self.win.bind("<ButtonPress-1>", self._hover_outside_click, add="+")
         self.win.bind("<Delete>", lambda e: (self.delete_selected(), "break")[1])
         self.win.bind("<Control-p>", lambda e: (self.toggle_pin(), "break")[1])
         self.win.bind("<Control-P>", lambda e: (self.toggle_pin(), "break")[1])
@@ -983,6 +998,9 @@ class HistoryPanel:
 
     def hide(self):
         self._close_popup_menu()
+        # 面板离场即锁回悬停：下次（可能几小时后）用热键唤出时，光标如果
+        # 正压在某颗按钮上，Tk 补发的 <Enter> 会让菜单自己蹦出来。
+        self._reset_hover_armed()
         self._deactivate_search(refocus=False)
         if self._detail is not None:
             self._detail._close_menu()
@@ -1002,6 +1020,10 @@ class HistoryPanel:
     # 在其 Unmap 回调里重新 post 会让 UI 线程死锁，且无法自动化验证。
     # 自绘 overrideredirect 弹窗行为完全可控：勾选项点击不收起，Esc/失焦收起。
     def _toggle_popup_menu(self, kind, anchor):
+        # **点击即解锁悬停**：这是用户要求的「第一次点击后才触发悬停自动弹出」
+        # 里的那一次点击。放在最前面，保证「点开」和「点收起」都算解锁过——
+        # 用户点一下发现是收起，接着把鼠标移走再移回来，理应能悬停展开。
+        self._hover_armed = True
         if self._popup_open and self._menu_kind == kind:
             self._close_popup_menu()
             return
@@ -1009,6 +1031,194 @@ class HistoryPanel:
         self._menu_kind = kind
         self._menu_anchor = anchor
         self._open_popup_menu(kind)
+
+    # ---------- 顶栏按钮：悬停自动展开 ----------
+    # 悬停多久才展开（毫秒）。太短会把「热键唤出面板时光标恰好压住按钮」
+    # 误判成一次有意悬停；太长则手感发滞。180ms 介于系统双击间隔与
+    # 一般悬停提示延迟之间。
+    HOVER_OPEN_DELAY = 180
+
+    # 用户要求「去掉下拉箭头，鼠标放上去自动弹出」。三个按钮原本靠文字里的
+    # "▾" 提示可点，现在去掉箭头后**点击也得保留**（键鼠习惯不同，且触控板
+    # 用户没有悬停），所以两条路径都通，只是不再依赖箭头作为可发现性线索。
+    def _bind_hover_menu(self, kind, btn):
+        """给顶栏按钮绑悬停展开。
+
+        **只在悬停已解锁后生效**（``_hover_armed``）：用户要求「只有第一次
+        点击上面菜单某一项后才触发鼠标放到某一个菜单上自动弹出下拉框」。
+        未解锁时 ``<Enter>`` 什么都不做，按钮仍是纯点击控件。
+
+        解锁后 ``<Enter>`` 也是**延迟一小段再展开**，不是立刻开：面板被
+        热键唤出时光标常正好压在按钮上，Tk 会补发一个 ``<Enter>``，立刻
+        展开等于「叫出剪贴板就自动蹦出菜单」（实测复现）。延迟期间若指针
+        已经离开（或移到了别的菜单按钮），这次就不开。
+        展开后靠 ``_poll_popup_hover`` 收尾，**按钮上的 ``<Leave>`` 不绑
+        收起**——鼠标往下划进弹窗必然先离开按钮，在那里收起等于弹窗
+        永远点不到。
+        """
+        btn.bind("<Enter>", lambda _e=None: self._hover_enter(kind, btn),
+                 add="+")
+
+    def _hover_enter(self, kind, btn):
+        """悬停进入按钮：未解锁则什么都不做，解锁后延迟排队展开。
+
+        抽成独立方法（而不是塞在 ``_bind_hover_menu`` 的闭包里）是为了**能被
+        直接测到**：闭包拿不到，只能靠 eval Tk 绑定脚本，既脆弱又测不出
+        这道门到底拦没拦住。
+        """
+        if not self._hover_armed:
+            return
+        # 已经是这个菜单开着就不再重复开（避免每次划过都重建 Toplevel）
+        if self._popup_open and self._menu_kind == kind:
+            return
+        self._cancel_hover_open()
+        try:
+            self._hover_open_job = self.win.after(
+                self.HOVER_OPEN_DELAY,
+                lambda: self._hover_open(kind, btn))
+        except Exception:
+            self._hover_open_job = None
+
+    def _cancel_hover_open(self):
+        """取消尚未到期的悬停展开（指针已离开 / 已切到别的按钮）。"""
+        job = getattr(self, '_hover_open_job', None)
+        if job is None:
+            return
+        try:
+            self.win.after_cancel(job)
+        except Exception:
+            pass
+        self._hover_open_job = None
+
+    def _reset_hover_armed(self):
+        """锁回悬停展开，并取消排队中的展开任务。
+
+        面板隐藏 / 最小化时调用。**不能只清标志而不取消 after 任务**：
+        那笔延迟任务到期后仍会执行，虽然 ``_hover_open`` 里有二次校验会拦下，
+        但取消掉更干净，也让「面板离场后绝对不会有弹窗」这件事不依赖下游兜底。
+        """
+        self._hover_armed = False
+        self._cancel_hover_open()
+
+    def _hover_outside_click(self, event):
+        """点击菜单按钮与弹窗以外的地方 → **取消悬停激活**。
+
+        用户要求「点击激活后 如果点击其他地方取消激活」。所以激活只管这一轮
+        操作：点过顶部菜单、用完随手点到列表 / 详情 / 别处，就回到「纯点击」
+        状态，避免悬停展开一直生效、鼠标偶然扫过顶栏就弹出菜单。
+
+        三类点击**不算「其他地方」**，必须放行：
+        ``_tools_btn`` / ``_shot_btn`` / ``_settings_btn`` 是激活本身；
+        弹窗内部是菜单自己的交互（选项、勾选、分隔线）。
+        否则点一下菜单项就会顺手把激活打掉，下次还得再点一次才恢复悬停。
+        """
+        if not self._hover_armed:
+            return
+        try:
+            w = event.widget
+            if w in (getattr(self, '_tools_btn', None),
+                     getattr(self, '_shot_btn', None),
+                     getattr(self, '_settings_btn', None)):
+                return
+            # 点在弹窗内部：属于菜单自身交互，不算「其他地方」
+            # （winfo_toplevel 对非 widget 会抛，故整段包 try）
+            if self._popup_menu is not None \
+                    and w.winfo_toplevel() is self._popup_menu:
+                return
+        except Exception:
+            pass
+        self._reset_hover_armed()
+
+    def _hover_open(self, kind, btn):
+        """悬停延迟到期：确认指针仍在该按钮上，才真正展开。"""
+        self._hover_open_job = None
+        # 延迟这几百毫秒内面板可能已被隐藏/最小化（复位了 _hover_armed），
+        # 此时不该再弹菜单。
+        if not self._hover_armed:
+            return
+        if self._popup_open and self._menu_kind == kind:
+            return
+        try:
+            px, py = self.win.winfo_pointerxy()
+            x0 = btn.winfo_rootx()
+            y0 = btn.winfo_rooty()
+            if not (x0 <= px <= x0 + btn.winfo_width()
+                    and y0 <= py <= y0 + btn.winfo_height()):
+                return
+        except Exception:
+            return
+        # **必须先收起旧的**：划过「工具→截图→设置」时每个按钮都会
+        # 收到 Enter，不关闭就把三个 Toplevel 全留在屏幕上（实测残影 3 个）。
+        self._close_popup_menu()
+        self._menu_kind = kind
+        self._menu_anchor = btn
+        self._open_popup_menu(kind)
+
+    def _popup_hover_contains(self, px, py):
+        """指针是否还在「顶栏菜单区 + 弹窗」这个整体区域内。
+
+        两块之间有一道 4px 的缝（弹窗定位在按钮下沿 +4），鼠标穿缝而过时
+        会短暂落在两者之外。所以判定时把按钮底边往下延伸到弹窗底边、
+        弹窗顶边往上延伸到按钮顶边，拼成一个连续矩形，避免穿缝误收起。
+
+        **判定区必须横向覆盖全部三个菜单按钮，而不是只覆盖当前锚点那一个。**
+        只算锚点会出「方向性 bug」：打开*设置*时合并区是 ``x[586,764]``，
+        滑到左边*截图*（``x[535,584]``）就落在判定区之外 → 轮询判定「已离开」
+        → ``_close_popup_menu()`` 顺带取消了截图那边排队中的 180ms 展开任务，
+        于是**从右往左划不弹**；而打开*工具*时合并区 ``x[484,660]`` 恰好盖住
+        截图，往右划就正常。用户实测报的就是这个不对称。
+        按整条顶栏算之后，按钮之间横向移动永远不会被判离开。
+        """
+        try:
+            zones = []
+            # 全部菜单按钮所在的横向范围（只取「工具/截图/设置」这三颗，
+            # 不含右侧的最小化/关闭，否则鼠标划到窗口控制区也不会收起）
+            menu_btns = [btn for btn in (
+                getattr(self, '_tools_btn', None),
+                getattr(self, '_shot_btn', None),
+                getattr(self, '_settings_btn', None)) if btn is not None]
+            for b in menu_btns:
+                zones.append((b.winfo_rootx(), b.winfo_rooty(),
+                              b.winfo_rootx() + b.winfo_width(),
+                              b.winfo_rooty() + b.winfo_height()))
+            if self._popup_menu is not None:
+                p = self._popup_menu
+                zones.append((p.winfo_rootx(), p.winfo_rooty(),
+                              p.winfo_rootx() + p.winfo_width(),
+                              p.winfo_rooty() + p.winfo_height()))
+        except Exception:
+            return False
+        if not zones:
+            return False
+        x0 = min(z[0] for z in zones)
+        x1 = max(z[2] for z in zones)
+        y0 = min(z[1] for z in zones)
+        y1 = max(z[3] for z in zones)
+        # 横向留 6px、纵向留 10px 容差，吸收手抖与 DPI 取整误差
+        return (x0 - 6 <= px <= x1 + 6) and (y0 - 10 <= py <= y1 + 10)
+
+    def _poll_popup_hover(self):
+        """展开期间轮询指针，离开「按钮 + 弹窗」整体即收起。
+
+        不用 ``<Leave>`` 事件：弹窗是独立 Toplevel，鼠标在两块之间移动时
+        事件序列既不可靠也不连续；轮询两个窗口的屏幕矩形是唯一稳的做法
+        （``FlatMenu`` 的 ``_check_outside_click`` 同理）。
+        """
+        self._popup_hover_job = None
+        if not self._popup_open:
+            return
+        try:
+            px, py = self.win.winfo_pointerxy()
+            inside = self._popup_hover_contains(px, py)
+        except Exception:
+            inside = True
+        if not inside:
+            self._close_popup_menu()
+            return
+        try:
+            self._popup_hover_job = self.win.after(120, self._poll_popup_hover)
+        except Exception:
+            self._popup_hover_job = None
 
     def _open_popup_menu(self, kind):
         tk = self.tk
@@ -1197,6 +1407,13 @@ class HistoryPanel:
         self._popup_open = True
         self._popup_outside_binding = self.win.bind_all(
             "<Button-1>", self._popup_outside_click, add="+")
+        # 悬停展开后靠轮询收起；点击展开也走同一条，行为一致
+        if self._popup_hover_job is None:
+            try:
+                self._popup_hover_job = self.win.after(
+                    120, self._poll_popup_hover)
+            except Exception:
+                self._popup_hover_job = None
 
     def _round_popup_background(self, pop, frame, theme):
         """Paint a rounded popup shell behind the menu controls."""
@@ -1391,6 +1608,13 @@ class HistoryPanel:
 
     def _close_popup_menu(self):
         self._popup_open = False
+        self._cancel_hover_open()
+        if self._popup_hover_job is not None:
+            try:
+                self.win.after_cancel(self._popup_hover_job)
+            except Exception:
+                pass
+            self._popup_hover_job = None
         if self._popup_outside_binding is not None:
             try:
                 self.win.unbind_all("<Button-1>", self._popup_outside_binding)
@@ -2127,13 +2351,17 @@ class HistoryPanel:
             **menu_btn_kw)
         # 工具下拉放在「截图」左侧、紧邻 Lumina 标题，成为标题栏第一组功能入口。
         self._tools_btn = tk.Button(
-            title_bar, text="工具 ▾",
+            title_bar, text="工具",
             command=lambda: self._toggle_popup_menu("tools", self._tools_btn),
             **menu_btn_kw)
-        # pack 顺序即从左到右：工具 ▾ → 截图 → 设置
+        # pack 顺序即从左到右：工具 → 截图 → 设置
         self._tools_btn.pack(side="left", padx=(0, 2))
         self._shot_btn.pack(side="left", padx=(0, 2))
         self._settings_btn.pack(side="left", padx=(0, 2))
+        for _kind, _btn in (("tools", self._tools_btn),
+                            ("shot", self._shot_btn),
+                            ("settings", self._settings_btn)):
+            self._bind_hover_menu(_kind, _btn)
 
         # 控制按钮图标跟着顶栏一起缩：图标与画布都是 26 的整数倍逻辑尺寸，
         # 顶栏只有 26 高时 32 的画布会被 pack fill="y" 裁掉上下各 3px，图标缺角。
@@ -3039,6 +3267,9 @@ class HistoryPanel:
         （矩形移到 ``-32000``），且 HWND、扩展样式、框位标志、图标句柄全程不变。
         """
         self._min_geom = self.win.wm_geometry()
+        # 与 hide() 同理：最小化后悬停锁回，避免从任务栏点回来时光标恰好
+        # 压在按钮上就自动弹菜单。
+        self._reset_hover_armed()
         if taskbar.minimize_window(self.win):
             # 最小化后窗口已不可见（实测 ``winfo_viewable()`` 由 1 变 0），
             # 可见性提示必须同步更新：否则截图前「隐藏面板」那一步会以为面板
