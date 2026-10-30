@@ -552,8 +552,13 @@ class HistoryPanel:
         try:
             canvas_x = canvas.canvasx(event.x)
             favorite_zone = self._card_w - max(44, int(round(30 * self._dpi)))
+            # 横向基准必须跟着 `_card_margin()` 走：这里原先写死 `12 * dpi`，
+            # 与 `_refresh_cards` 传给 `_render_list` 的 margin 是**两份独立
+            # 字面量**，只是当时都等于 12 才碰巧对上。margin 一改（现在为 0），
+            # 不对齐就会让收藏热区整体偏右 12px，点星标变成点空白。
+            margin = int(round(self._card_margin() * self._dpi))
             if (clip_id is not None and
-                    canvas_x >= int(round(12 * self._dpi)) + favorite_zone):
+                    canvas_x >= margin + favorite_zone):
                 self._favorite_click(clip_id)
                 return "break"
         except (TypeError, ValueError):
@@ -1757,6 +1762,26 @@ class HistoryPanel:
             return self.cards_canvas
         return None
 
+    def _card_margin(self):
+        """卡片相对左栏边框的水平缩进（逻辑像素，会乘 DPI）。
+
+        **唯一来源**：卡片的绘制起点、卡片宽度、分组标题的起点、以及
+        ``_on_canvas_click`` 里收藏热区的横向基准，全部必须走这里。
+        早先这四处各自写死 ``12 * dpi``，其中收藏热区那份还是「偶然对上」
+        的——它乘的是 12 而不是 margin 变量，改 margin 就会悄悄错位。
+
+        **取 0 是为了和顶部的搜索胶囊严格对齐**：搜索框是 ``pack(fill="x")``
+        满铺左栏，左右边界就是左栏的 0 和 492；卡片原来缩进 12（加上圆角
+        描边的 2px 抗锯齿，实测约 14），于是列表比搜索框窄一圈，看着像
+        「下面那列小一号」。改为 0 后两者左右边界完全一致（实测均 0/492）。
+
+        代价是卡片圆角直接贴着左栏边缘与中缝。这是**刻意的**：搜索胶囊是
+        ``radius=h//2`` 的全圆头，贴边本来就是它的正常形态；卡片跟着贴边，
+        两者视觉语言才统一。若以后觉得卡片贴边太硬，把这里改回 12 即可，
+        另外三处会自动跟随——不要再回去写散落的字面量。
+        """
+        return 0
+
     def _refresh_cards(self, rows):
         canvas = self._active_canvas()
         if not canvas:
@@ -1768,7 +1793,8 @@ class HistoryPanel:
         self._card_photos = []
         d = self._dpi
         self._render_list(canvas, rows, now, row_h=int(round(66 * d)),
-                          tile_size=int(round(46 * d)), margin=int(round(12 * d)),
+                          tile_size=int(round(46 * d)),
+                          margin=int(round(self._card_margin() * d)),
                           title_size=11, meta_size=9)
 
     def _render_list(self, canvas, rows, now, row_h, tile_size, margin,
@@ -1803,7 +1829,13 @@ class HistoryPanel:
             if group != prev_group:
                 count = sum(1 for x in rows if self._group_of(
                     self._parse_ts(x["created_at"]), now) == group)
-                canvas.create_text(margin + 2, y + int(round(11 * self._dpi)),
+                # 分组标题与**卡片内的首列内容**左对齐（= margin + 12），
+                # 而不是 ``margin + 2``。margin 还是 12 时写 +2 恰好落在 14，
+                # 与图标（12）差不多齐；margin 改成 0 之后 +2 就只剩 2，
+                # 标题会跑到卡片图标左边一截，看着像悬在卡片外。
+                # 这里直接对到图标列，两者就恒等。
+                canvas.create_text(margin + int(round(12 * self._dpi)),
+                                   y + int(round(11 * self._dpi)),
                                    anchor="w", text=f"{group} · {count} 条",
                                    fill=T["label2"], font=self._font(10, "bold"))
                 y += int(round(28 * self._dpi))
