@@ -2537,13 +2537,24 @@ class HistoryPanel:
         self.cards_canvas.bind("<Configure>", self._on_canvas_configure)
 
         # ---------- 底部：细状态行（行级动作由详情区动作栏承担） ----------
+        # footer 的 bg 与窗口同为 window_bg，它下方的留白在视觉上和文字行
+        # 连成一片——「4px 间距」实际看到的是 22(文字) + 12(内缩 8 + 间距 4)
+        # 共 34px 的一整块浅灰。
+        #
+        # 两处收紧（都**不缩小字号**，提示文案原样保留）：
+        # ① `pady` 4→2，省 2px；
+        # ② label 显式 `bd=0, pady=0`。Tk 的 Label **默认 bd=2**（上下各 2px
+        #    立体边框）+ 默认 pady=1，8 号 YaHei 的 16px 文字行被撑到 22px。
+        #    这两项是纯粹的隐形撑高，去掉后行高回到 16px。
         footer = tk.Frame(self._cmp_root, bg=win_bg)
-        footer.pack(fill="x", padx=12, pady=(0, 4))
-        tk.Label(footer, bg=win_bg, fg=T["label3"], font=self._font(8),
-                 text="Enter 回贴 · Ctrl+C 复制 · Ctrl+P 收藏 · Del 删除 · Ctrl+1-9 快速"
-                 ).pack(side="left")
+        footer.pack(fill="x", padx=12, pady=(0, 2))
+        _footer_lb = {"bg": win_bg, "font": self._font(8), "bd": 0,
+                      "highlightthickness": 0, "pady": 0}
+        tk.Label(footer, fg=T["label3"],
+                 text="Enter 回贴 · Ctrl+C 复制 · Ctrl+P 收藏 · Del 删除 · Ctrl+1-9 快速",
+                 **_footer_lb).pack(side="left")
         self._cmp_status = tk.Label(footer, textvariable=self.status_var,
-                                    bg=win_bg, fg=T["label2"], font=self._font(8))
+                                    fg=T["label2"], **_footer_lb)
         self._cmp_status.pack(side="right")
         self._create_resize_grips(win_bg)
 
@@ -3591,6 +3602,16 @@ class DetailPane:
     IMG_MAX_BASE = (380, 430)
     FILE_MAX_ROWS = 20
     DEBOUNCE_MS = 120
+    # 详情栏上下两条固定条的高度（逻辑像素，**不乘 DPI**——与原先写死的
+    # 58 / 42 保持同一口径，避免高 DPI 下改变既有布局）。
+    #
+    # 收紧缩减明细（实测内容需求）：
+    # - META_H：顶部元信息条。「预览」19 + 元信息 16 + 上下 pady 各 6 = 47，
+    #   原 58 留了 11px 冗余；取 50 既贴紧又留 3px 余量。
+    # - ACTION_H：底部动作栏。按钮固定 30 高，pack 在交叉轴居中，
+    #   原 42 让上下各空 6px；取 38 → 上下各 4px，仍不贴边。
+    META_H = 50
+    ACTION_H = 38
     # JSON 预览标题 / 状态文案用的模式名。**唯一来源是 ``json_modes.MODE_LABELS``**，
     # 这里只做再导出（``DetailPane.JSON_MODE_LABELS`` 是既有引用点）。
     #
@@ -3650,29 +3671,33 @@ class DetailPane:
         self.frame.pack(side="left", fill="y")
         self.frame.pack_propagate(False)
         # 三段式详情：顶部元信息、中部预览、底部固定操作栏。
-        self._meta_wrap = tk.Frame(self.frame, bg=T["field"], height=58)
+        self._meta_wrap = tk.Frame(self.frame, bg=T["field"], height=self.META_H)
         self._meta_wrap.pack(fill="x", padx=0, pady=0)
         self._meta_wrap.pack_propagate(False)
         self._meta_icon = tk.Label(self._meta_wrap, bg=T["field"],
                                    bd=0, highlightthickness=0)
         self._meta_icon.pack(side="left", padx=0)
         meta_text = tk.Frame(self._meta_wrap, bg=T["field"])
-        meta_text.pack(side="left", fill="both", expand=True, padx=8, pady=6)
+        # pady 6→4：两行需求高 35 + 上下各 4 = 43，落在 META_H=50 内且余量合适
+        meta_text.pack(side="left", fill="both", expand=True, padx=8, pady=4)
         self._meta_title = tk.Label(meta_text, text="预览", bg=T["field"],
                                     fg=T["label"],
                                     font=("Microsoft YaHei UI", 10, "bold"),
-                                    anchor="w")
+                                    anchor="w", bd=0, highlightthickness=0,
+                                    pady=0)
         self._meta_title.pack(fill="x")
         self._meta = tk.Label(meta_text, text="", bg=T["field"],
                               fg=T["label2"], font=("Microsoft YaHei UI", 8),
-                              anchor="w")
+                              anchor="w", bd=0, highlightthickness=0, pady=0)
         self._meta.pack(fill="x")
         self._host = tk.Frame(self.frame, bg=self.BG)
         self._host.pack(fill="both", expand=True, padx=8, pady=(6, 4))
         self._action_separator = tk.Frame(self.frame, bg=T["hairline"], height=1)
         self._action_separator.pack(fill="x", padx=8)
-        self._actions = tk.Frame(self.frame, bg=self.BG, height=42)
-        self._actions.pack(fill="x", padx=8, pady=(4, 6))
+        self._actions = tk.Frame(self.frame, bg=self.BG, height=self.ACTION_H)
+        # 下间距 6→4：动作栏按钮本身已固定 30 高、在 ACTION_H 里居中，
+        # 底下再叠 6px 会与整窗 footer 那段留白连成一条更厚的空白。
+        self._actions.pack(fill="x", padx=8, pady=(4, 4))
         self._actions.pack_propagate(False)
         for w in (self.frame, self._meta_wrap, self._meta, self._host, self._actions):
             w.bind("<MouseWheel>", self._on_wheel)
