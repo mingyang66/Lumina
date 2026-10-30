@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import ClassVar
 
 from . import clipboard_api, taskbar
+from .json_modes import ACTION_LABELS, ESCAPE_JAVA_NOTICE, MODE_LABELS, build_menu_items
 
 
 class HistoryPanel:
@@ -3282,9 +3283,13 @@ class DetailPane:
     IMG_MAX_BASE = (380, 430)
     FILE_MAX_ROWS = 20
     DEBOUNCE_MS = 120
-    # JSON 预览标题：键为 json_tools.transform_json 的模式名。
-    JSON_MODE_LABELS: ClassVar[dict] = {
-        "format": "已格式化", "compress": "已压缩", "expand": "已展开转义"}
+    # JSON 预览标题 / 状态文案用的模式名。**唯一来源是 ``json_modes.MODE_LABELS``**，
+    # 这里只做再导出（``DetailPane.JSON_MODE_LABELS`` 是既有引用点）。
+    #
+    # 历史：这份文案曾在这里与 ``tool_window`` 各写一份，``_transform_json`` 里还有
+    # 第三份 ``{'format': '格式化', ...}``。用户要求两边同步后，统一收敛到
+    # ``json_modes``；菜单项也改由 ``json_modes.build_menu_items`` 生成。
+    JSON_MODE_LABELS: ClassVar[dict] = MODE_LABELS
     IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
                 ".ico", ".tif", ".tiff")
     URL_RE = re.compile(r"https?://[^\s<>\"'，。；、）】》」』]+")
@@ -3622,19 +3627,12 @@ class DetailPane:
             self._close_menu()
             return
         self._close_menu()
-        items = [
-            {"label": "格式化", "hint": "2 空格", "kind": "format",
-                 "command": lambda: self._transform_json("format"),
-                 "enabled": not self._json_busy, "selected": self._json_mode == "format"},
-            {"label": "压缩", "hint": "紧凑输出", "kind": "compress",
-                 "command": lambda: self._transform_json("compress"),
-                 "enabled": not self._json_busy, "selected": self._json_mode == "compress"},
-            {"label": "展开转义", "hint": "换行成行", "kind": "expand",
-                 "command": lambda: self._transform_json("expand"),
-                 "enabled": not self._json_busy, "selected": self._json_mode == "expand"},
-            {"label": "恢复原文", "hint": "", "kind": "restore", "command": self._restore_json,
-                 "enabled": self._json_text is not None or self._json_busy, "selected": False},
-        ]
+        # 菜单项由 ``json_modes.build_menu_items`` 生成——与工具弹框**同一份代码**。
+        # 两侧区别只在传进来的两个处理器与本地的忙碌/可恢复状态。
+        items = build_menu_items(
+            self._transform_json, self._restore_json, self._json_mode,
+            busy=self._json_busy,
+            can_restore=self._json_text is not None or self._json_busy)
         self._in_menu = True
         self._flat_menu = JsonPopup(self.tk, self.panel.win, items,
                                    self.panel._theme()[0], dpi=self.panel._dpi)
@@ -3687,9 +3685,15 @@ class DetailPane:
                 return
             self._json_text, self._json_mode = result.text, mode
             self._refresh_json_preview()
-            label = {"format": "格式化", "compress": "压缩",
-                     "expand": "展开换行转义"}.get(mode, mode)
-            message = f"已{label} JSON；复制/回贴/导出使用结果，原文未修改"
+            if mode == "escape_java":
+                # 产物是 Java 源码片段，不是 JSON——不能套「已{动作} JSON」的
+                # 模板，否则用户会以为右栏还是可解析的 JSON。
+                message = (f"已{ACTION_LABELS[mode]}为 Java 字符串字面量；"
+                           f"复制/回贴/导出使用结果，原文未修改；"
+                           f"{ESCAPE_JAVA_NOTICE}")
+            else:
+                message = (f"已{ACTION_LABELS[mode]} JSON；"
+                           f"复制/回贴/导出使用结果，原文未修改")
             if mode == "expand":
                 message += "；展开结果非合法 JSON，换行已统一为 LF"
             if result.duplicate_keys:
@@ -3842,7 +3846,14 @@ class DetailPane:
             # 展开转义后字符串含真实换行，代码高亮正则（遇换行即断）会失配，
             # 整段字符串失去着色、回落默认前景（深色主题下即白字），
             # 还会把栈文本里的数字/单词误判成 num/kw。
-            self._highlight_json(content, console=console)
+            #
+            # **但 ``escape_java`` 的产物不是 JSON**：字符串被转义成 ``\"...\"``
+            # 之后，``_TOKEN_RE`` 的字符串分支整段失配（引号前有反斜杠），
+            # 实测只有裸数字和 ``true`` 被错标成 num/lit，其余全部无跨度——
+            # 效果就是「大部分文字没有着色」。所以它走纯文本路径，不做任何
+            # token 着色。**不要为了「看起来一致」给它套 JSON 着色**。
+            if self._json_mode != "escape_java":
+                self._highlight_json(content, console=console)
         elif is_code:
             self._highlight_code(content, console=console)
         self._linkify(content, dark_bg=console)

@@ -14,11 +14,25 @@ from pathlib import Path
 from typing import ClassVar
 from unittest.mock import Mock, patch
 
-from lumina import json_tools
+from lumina import json_modes, json_tools
 
 # 测试位于 tests/ 子目录，上跳一层才是项目根（lumina/ 与 main.py 所在处）。
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / 'lumina' / 'history_panel.py'
+
+# ``DetailPane`` 的类体与它内部的方法**在运行期会查找这些模块级名字**
+# （``JSON_MODE_LABELS = MODE_LABELS``、``_json_menu`` 里的 ``build_menu_items``、
+# ``_transform_json`` 里的 ``ACTION_LABELS`` / ``ESCAPE_JAVA_NOTICE``）。
+# ``load_detail_pane()`` 只把类节点单独 exec，模块顶部的 ``from .json_modes
+# import ...`` 不会跟着进命名空间，所以必须在这里显式注入。
+#
+# **别把这几项删成「多余的注入」**：删掉后不是测试变简单，而是整个类在加载期
+# 就抛 ``NameError``，整个文件一条都跑不到。
+JSON_MODE_GLOBALS = {
+    name: getattr(json_modes, name)
+    for name in ('ACTION_LABELS', 'ESCAPE_JAVA_NOTICE', 'MODE_LABELS',
+                 'build_menu_items')
+}
 
 
 def load_detail_pane():
@@ -33,6 +47,7 @@ def load_detail_pane():
         # 不导入 history_panel 或真实 threading/剪贴板模块。
         'threading': types.SimpleNamespace(Thread=None),
         'FlatMenu': Mock(),
+        **JSON_MODE_GLOBALS,
     }
     exec(compile(ast.Module(body=[detail], type_ignores=[]), str(SOURCE), 'exec'),
          namespace)
@@ -385,6 +400,105 @@ class JsonDetailRegressionTests(unittest.TestCase):
         self.detail._restore_json()
         self.assertTrue(self.detail._highlight_code.called)
 
+    # ---------- Java 转义（escape_java）---------- #
+    #
+    # 详情栏与工具弹框共用 ``json_modes`` 的模式定义，但**转换流程各自独立**
+    # （后台线程 vs 同步）。这一段只覆盖详情栏这一侧的接入是否正确。
+
+    def test_escape_java_shows_java_string_body_and_keeps_original_row(self):
+        for category in ('text', 'code'):
+            with self.subTest(category=category):
+                row = self.set_row(r' { "名称" : "上海", "q" : "a\"b", "n" : 1 } ',
+                                   category=category)
+                snapshot = deepcopy(row)
+                self.transform('escape_java')
+                expected = json_tools.transform_json(row['content'],
+                                                     'escape_java').text
+                self.assertEqual(self.detail._json_text, expected)
+                self.assertEqual(self.detail._body.text, expected)
+                self.assertEqual(self.detail._json_mode, 'escape_java')
+                self.assertEqual(self.detail._meta_title.options['text'],
+                                 'JSON · 已转义')
+                # 产物是不含外层引号、内部引号已转义的 Java 字面量内容。
+                self.assertFalse(expected.startswith('"'))
+                self.assertFalse(expected.endswith('"'))
+                self.assertIn(r'\"名称\"', expected)
+                # 状态文案不能套「已{动作} JSON」模板——产物不是 JSON。
+                message = self.status()
+                self.assertIn('已转义为 Java 字符串字面量', message)
+                self.assertNotIn('已转义 JSON', message)
+                self.assertIn(json_modes.ESCAPE_JAVA_NOTICE, message)
+                self.assert_original(row, snapshot)
+
+    def test_escape_java_copy_and_paste_use_escaped_result(self):
+        row = self.set_row(r'{"a":"x"}')
+        snapshot = deepcopy(row)
+        self.transform('escape_java')
+        expected = self.detail._json_text
+        self.detail._copy()
+        copied = self.panel.ui.actions.copy_to_clipboard.call_args.args[0]
+        self.assertEqual(copied, dict(snapshot, content=expected))
+        self.detail._paste_this()
+        pasted, _hwnd = self.panel._do_paste_back.call_args.args
+        self.assertEqual(pasted, dict(snapshot, content=expected))
+        self.assert_original(row, snapshot)
+
+    def test_escape_java_output_is_not_token_colored(self):
+        """转义产物**不能**套 JSON 着色，否则大半文字失去颜色。
+
+        ``escape_java`` 输出里引号全被转义成 ``\\"``，``json_syntax_spans``
+        的字符串规则整段失配，只剩裸数字与 ``true`` 被误标成 num/lit——深色
+        主题下表现为「大部分是白字、个别词突然有色」。
+
+        **为什么用 ``wraps`` + ``assert_not_called`` 而不是 ``side_effect``
+        抛异常**：``_highlight_json`` 内部是 ``try: ... except Exception``，
+        抛 ``AssertionError`` 会被它自己吞掉再 ``traceback.print_exc()``，
+        测试照样通过——那样写等于没守。``wraps`` 保持真实行为，靠调用记录
+        判定，吞不掉。
+        """
+        self.set_row(r'{"n":1,"ok":true,"s":"x"}')
+        with patch.object(json_tools, 'json_syntax_spans',
+                          wraps=json_tools.json_syntax_spans) as spans:
+            self.transform('escape_java')
+            # 前提：产物确实是转义态（否则这条测试守的是别的东西）。
+            self.assertIn(r'\"n\"', self.detail._json_text)
+            spans.assert_not_called()
+        # 代码高亮分支也不能进：否则 category='code' 的 JSON 片段会被当代码扫。
+        self.detail._highlight_code.assert_not_called()
+        # 顺带确认控件上没有被误标的 num/lit 标签。
+        self.assertNotIn('num', self.detail._body.tags)
+        self.assertNotIn('lit', self.detail._body.tags)
+
+    def test_escape_java_menu_item_selects_itself(self):
+        """第五项在菜单里能被选中，且开关模式不会把其它模式的选中态漏过来。"""
+        self.transform('format')
+        self.detail._json_menu()
+        items = self.menu_factory.call_args.args[2]
+        index = json_modes.MODE_ORDER.index('escape_java')
+        self.assertEqual([item['selected'] for item in items],
+                         [m == 'format' for m in json_modes.MODE_ORDER] + [False])
+        items[index]['command']()
+        self.detail.frame.drain()
+        self.detail._close_menu()
+        self.detail._json_menu()
+        items = self.menu_factory.call_args.args[2]
+        self.assertEqual([item['selected'] for item in items],
+                         [m == 'escape_java' for m in json_modes.MODE_ORDER]
+                         + [False])
+        self.assertEqual(self.detail._meta_title.options['text'], 'JSON · 已转义')
+
+    def test_mode_labels_are_not_redefined_locally(self):
+        """``DetailPane.JSON_MODE_LABELS`` 必须是 ``json_modes`` 的**同一个对象**。
+
+        两侧曾各写一份文案、靠测试比对来防漂移；整合后是同一份对象，比对
+        变成同义反复，所以改成断言 identity——本地再抄一份就会立刻失败。
+        """
+        self.assertIs(DetailPane.JSON_MODE_LABELS, json_modes.MODE_LABELS)
+        # 状态文案用的动作名同理，第三份平行映射（详情栏曾内联的
+        # ``{'format': '格式化', ...}``）必须来自共用字典。
+        self.assertIn('expand', json_modes.ACTION_LABELS)
+        self.assertIs(DETAIL_GLOBALS['ACTION_LABELS'], json_modes.ACTION_LABELS)
+
     def test_copy_paste_export_use_full_result_not_truncated_preview(self):
         raw = json.dumps({'文本': '中' * (DetailPane.TEXT_MAX + 100), '尾部': '完整结尾'},
                          ensure_ascii=False)
@@ -560,36 +674,49 @@ class JsonDetailRegressionTests(unittest.TestCase):
                 self.assertIn('发现 2 个重复键，已保留', self.status())
                 self.assert_original(row, snapshot)
 
-    def test_json_menu_has_four_correctly_bound_actions(self):
+    def test_json_menu_lists_every_mode_then_restore(self):
+        """菜单项由 ``json_modes.build_menu_items`` 生成，与工具弹框同源。
+
+        断言一律按 ``MODE_ORDER`` **推导**，不写死四项/五项这类数字：模式清单
+        在 ``json_modes`` 里增删时，这里不该跟着改（原来写死 ``['格式化',
+        '压缩', '展开转义', '恢复原文']``，加 ``escape_java`` 时整片失败）。
+        """
+        order = json_modes.MODE_ORDER
         old_menu = Mock()
         self.detail._flat_menu = old_menu
-        self.detail._json_menu()
-        old_menu.close.assert_called_once()
-        self.menu_factory.assert_called_once()
-        args, kwargs = self.menu_factory.call_args
-        self.assertIs(args[0], FakeTk)
-        self.assertIs(args[1], self.panel.win)
-        items = args[2]
-        self.assertTrue(all(isinstance(item, dict) for item in items))
-        self.assertEqual([item['label'] for item in items],
-                         ['格式化', '压缩', '展开转义', '恢复原文'])
-        self.assertEqual([item['hint'] for item in items],
-                         ['2 空格', '紧凑输出', '换行成行', ''])
-        self.assertEqual([item['kind'] for item in items],
-                         ['format', 'compress', 'expand', 'restore'])
-        self.assertEqual(args[3], self.panel._theme()[0])
-        self.assertEqual(kwargs, {'dpi': self.panel._dpi})
-        menu = self.detail._flat_menu
-        self.assertTrue(self.detail._in_menu)
-        menu.popup.assert_called_once_with(self.detail._json_anchor,
-                                           on_close=self.detail._menu_closed)
+        # ``build_menu_items`` 把处理器绑成 **闭包参数**（``on_mode`` 在调用
+        # ``build_menu_items`` 时就求值），比原先内联的 ``lambda: self._x()``
+        # 绑定得更早。所以 patch 必须包住 ``_json_menu()`` 本身——先弹菜单再
+        # patch 的话，items 里的 command 仍指向原方法，断言会拿到空调用列表。
         with patch.object(self.detail, '_transform_json') as transform:
-            for item in items[:3]:
+            self.detail._json_menu()
+            old_menu.close.assert_called_once()
+            self.menu_factory.assert_called_once()
+            args, kwargs = self.menu_factory.call_args
+            self.assertIs(args[0], FakeTk)
+            self.assertIs(args[1], self.panel.win)
+            items = args[2]
+            self.assertTrue(all(isinstance(item, dict) for item in items))
+            self.assertEqual([item['label'] for item in items],
+                             [json_modes.MODE_ITEMS[m][0] for m in order]
+                             + [json_modes.RESTORE_LABEL])
+            self.assertEqual([item['hint'] for item in items],
+                             [json_modes.MODE_ITEMS[m][1] for m in order] + [''])
+            self.assertEqual([item['kind'] for item in items],
+                             [json_modes.MODE_ITEMS[m][2] for m in order]
+                             + ['restore'])
+            self.assertEqual(args[3], self.panel._theme()[0])
+            self.assertEqual(kwargs, {'dpi': self.panel._dpi})
+            menu = self.detail._flat_menu
+            self.assertTrue(self.detail._in_menu)
+            menu.popup.assert_called_once_with(self.detail._json_anchor,
+                                               on_close=self.detail._menu_closed)
+            for item in items[:len(order)]:
                 item['command']()
             self.assertEqual([call.args for call in transform.call_args_list],
-                             [('format',), ('compress',), ('expand',)])
+                             [(mode,) for mode in order])
         self.transform('format')
-        items[3]['command']()
+        items[-1]['command']()
         self.assertIsNone(self.detail._json_text)
         menu.popup.call_args.kwargs['on_close']()
         self.assertFalse(self.detail._in_menu)
@@ -613,29 +740,34 @@ class JsonDetailRegressionTests(unittest.TestCase):
     def test_json_menu_restore_initially_disabled(self):
         self.detail._json_menu()
         items = self.menu_factory.call_args.args[2]
-        self.assertEqual([item['enabled'] for item in items], [True, True, True, False])
-        self.assertEqual([item['selected'] for item in items], [False] * 4)
+        # 转换项全可用（未 busy），只有「恢复原文」因无结果而禁用。
+        self.assertEqual([item['enabled'] for item in items],
+                         [True] * len(json_modes.MODE_ORDER) + [False])
+        self.assertEqual([item['selected'] for item in items],
+                         [False] * len(items))
         self.threads.factory.assert_not_called()
 
     def test_json_menu_selects_current_mode_and_enables_restore(self):
-        for mode in ('format', 'compress', 'expand'):
+        for mode in json_modes.MODE_ORDER:
             with self.subTest(mode=mode):
                 self.detail._close_menu()
                 self.transform(mode)
                 self.detail._json_menu()
                 items = self.menu_factory.call_args.args[2]
-                self.assertEqual([item['enabled'] for item in items], [True] * 4)
+                self.assertEqual([item['enabled'] for item in items],
+                                 [True] * len(items))
                 self.assertEqual([item['selected'] for item in items],
-                                 [mode == 'format', mode == 'compress',
-                                  mode == 'expand', False])
-                items[3]['command']()
+                                 [m == mode for m in json_modes.MODE_ORDER]
+                                 + [False])
+                items[-1]['command']()
                 self.assertIsNone(self.detail._json_text)
                 self.assertIsNone(self.detail._json_mode)
                 self.assertEqual(self.detail._body.text, self.detail.row['content'])
                 self.assertEqual(self.status(), '已恢复原文')
 
     def test_json_menu_busy_disables_transforms_and_restore_cancels_pending_work(self):
-        for previous_mode in (None, 'format', 'compress', 'expand'):
+        order = json_modes.MODE_ORDER
+        for previous_mode in (None, *order):
             with self.subTest(previous_mode=previous_mode):
                 self.detail._close_menu()
                 self.threads.deferred = False
@@ -643,20 +775,18 @@ class JsonDetailRegressionTests(unittest.TestCase):
                 if previous_mode is not None:
                     self.transform(previous_mode)
                 self.threads.deferred = True
-                next_mode = {'format': 'compress', 'compress': 'expand',
-                             'expand': 'format'}.get(previous_mode, 'format')
+                next_mode = order[(order.index(previous_mode) + 1) % len(order)] \
+                    if previous_mode is not None else order[0]
                 self.detail._transform_json(next_mode)
                 request = self.detail._json_request
                 self.assertTrue(self.detail._json_busy)
                 self.detail._json_menu()
                 items = self.menu_factory.call_args.args[2]
                 self.assertEqual([item['enabled'] for item in items],
-                                 [False, False, False, True])
+                                 [False] * len(order) + [True])
                 self.assertEqual([item['selected'] for item in items],
-                                 [previous_mode == 'format',
-                                  previous_mode == 'compress',
-                                  previous_mode == 'expand', False])
-                items[3]['command']()
+                                 [m == previous_mode for m in order] + [False])
+                items[-1]['command']()
                 self.assertGreater(self.detail._json_request, request)
                 self.assertFalse(self.detail._json_busy)
                 self.assertIsNone(self.detail._json_text)

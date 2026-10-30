@@ -13,7 +13,16 @@ _WHITESPACE = ' \t\r\n'
 # 展开模式：把字符串值里的「换行类转义」换成真实换行。
 # 只处理换行，其余转义（\" \\ \/ \t 等）必须逐字节保留——先解码再重拼会把
 # \" 变成裸引号、破坏字符串边界，因此这里在 token 层面原地扫描。
-_EXPAND_MODES = ('format', 'compress', 'expand')
+_MODES = ('format', 'compress', 'expand', 'escape_java')
+
+# 公开的模式清单。名称、顺序、展示文案的**唯一来源**是 ``json_modes``（它从这里
+# 取），这里只做「哪些值可以通过校验」的判定。两者不一致会被
+# ``test_every_declared_mode_is_transformable`` 拦下。
+MODES = _MODES
+
+# 输出为「紧凑单行」的模式。``escape_java`` 先压成紧凑形式再整体转义，因为
+# Java 侧要的是**一个字符串**的值，多行缩进只会让常量定义变得难读。
+_COMPACT_MODES = ('compress', 'escape_java')
 
 
 def _expand_newline_escapes(body):
@@ -61,6 +70,58 @@ def _expand_newline_escapes(body):
         out.append(char)
         index += 1
     return ''.join(out), changed
+
+
+_JAVA_ESCAPES = {
+    '\\': '\\\\', '"': '\\"',
+    '\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f',
+}
+
+
+def java_string_body(text):
+    """把文本转成 Java 字符串字面量的**内容**（不含外层引号）。
+
+    逐字符替换，不做任何「先解码再重拼」：调用方传入的已经是紧凑 JSON 的
+    原文字节，转义只叠加一层，Java 侧 ``String`` 的值恰好等于那段紧凑 JSON。
+    这样用户把结果贴进 ``setPayload("...")`` 就能拿到同一份 JSON。
+
+    **各类字符为什么要转义，实测口径（不同理由，别一概说成「不转义就编译
+    不过」——曾这么写过，实测证明只有前两类成立）：**
+
+    - ``\\`` 与 ``"``：**必需**。不转义直接截断字符串 / 吞掉后一个字符。
+    - LF / CR：**必需**。裸写进源码 javac 报「未结束的字符串」，实测编译失败。
+    - 孤立代理字符：**必需**。``utf-8`` 根本编不出来，源文件都写不下去。
+    - TAB / BS / FF：**惯例**。实测裸写能编译（javac 21），但裸 TAB 会被编辑器
+      按自己的缩进设置重排、BS 与 FF 是隐形字符，源码里不该出现。
+    - 其余 C0 控制字符与 DEL：**可读性**。实测同样能编译，但源码里留不可打印
+      字符会让 diff、代码审查、复制粘贴都变得不可信。
+
+    注意经 ``transform_json`` 进来时，字符串体里**不会有裸 LF/CR/C0**——JSON
+    规范本就禁止（``json.loads`` 会先拒掉）。那几个分支是为「将来别处把任意
+    文本转成 Java 字面量」留的，也是本函数自称通用的必要条件；别因为「当前
+    路径走不到」就删掉。
+
+    **不需要特判 ``u`` 陷阱。** Java 有 unicode escape 预处理阶段（JLS 3.3），
+    反斜杠紧跟 ``u`` 会最先被处理；但判定按**前导反斜杠的奇偶**——逐字符转义
+    产出的 ``\\\\u0041``（源码里两个反斜杠）是安全的，实测 javac 编译通过且
+    值为字面 ``\\u0041``。只有人为写裸 ``\\u005c`` 反而会炸成「非法的 Unicode
+    转义」，那条路径本函数不会产生。
+
+    中文等非 ASCII 字符**原样保留**，不转成 ``\\uXXXX``：可读性远重要于
+    「纯 ASCII 源码」这种很少被真正要求的约束，且现代 Java 源码统一 UTF-8。
+    """
+    out = []
+    for char in text:
+        escape = _JAVA_ESCAPES.get(char)
+        if escape is not None:
+            out.append(escape)
+            continue
+        code = ord(char)
+        if code < 0x20 or code == 0x7f or 0xd800 <= code <= 0xdfff:
+            out.append(f'\\u{code:04x}')
+            continue
+        out.append(char)
+    return ''.join(out)
 
 
 def _is_object_key(raw, match):
@@ -118,16 +179,23 @@ def transform_json(raw: str, mode: str = 'format') -> JsonTransformResult:
     - ``compress``：去空白压成紧凑形式，字符串内转义原样保留。
     - ``expand``：结构同 ``format``，并把字符串**值**内的换行转义（``\\n`` 等）
       展开为真实换行，便于阅读被挤成一行的异常栈/多行文本。对象键不展开。
+    - ``escape_java``：先压成紧凑形式，再整体转成 Java 字符串字面量**内容**
+      （不含外层引号），可直接贴进 ``setXxx("...")``。转义规则见
+      ``java_string_body``。
 
     注意 ``expand`` 的输出**不再是合法 JSON**（JSON 不允许字符串内含裸换行），
     只能作为只读展示；还原需基于原始输入，不能反向解析。换行形式会**规范化
     为 LF**（``\\r``、``\\u000a`` 都收敛成 ``\\n``），且展开时**不添加续行
     缩进**，以免与数据里原有的行首空格混淆。
+
+    ``escape_java`` 的输出同样不是 JSON，而是 Java 源码片段。
     """
     if not isinstance(raw, str):
         raise TypeError('JSON 输入必须是字符串。')
-    if mode not in _EXPAND_MODES:
-        raise ValueError('不支持的 JSON 模式，请选择 format、compress 或 expand；restore 由 UI 处理。')
+    if mode not in _MODES:
+        raise ValueError(
+            '不支持的 JSON 模式，请选择 format、compress、expand 或 '
+            'escape_java；restore 由 UI 处理。')
     # surrogatepass 使标准库允许的孤立代理字符也能保真处理。
     if len(raw) > MAX_INPUT_BYTES or len(raw.encode('utf-8', 'surrogatepass')) > MAX_INPUT_BYTES:
         raise ValueError(f'JSON 输入过大，最多允许 {MAX_INPUT_BYTES} 字节（默认 2 MiB）。')
@@ -181,7 +249,10 @@ def transform_json(raw: str, mode: str = 'format') -> JsonTransformResult:
     previous = None
     for match in _tokens(raw):
         token = match.group()
-        if mode == 'compress':
+        # compress 与 escape_java 都要紧凑单行：token 原样输出即可，后者只是
+        # 在整个结果外面再叠一层 Java 转义（在循环结束后做，避免逐 token 转义
+        # 时把结构字符也当成内容处理）。
+        if mode in _COMPACT_MODES:
             emit(token)
             continue
         if token in ('}', ']'):
@@ -208,4 +279,12 @@ def transform_json(raw: str, mode: str = 'format') -> JsonTransformResult:
                 depth += 1
         previous = token
 
-    return JsonTransformResult(''.join(parts), tuple(duplicate_keys))
+    text = ''.join(parts)
+    if mode == 'escape_java':
+        # 输出长度会因转义而膨胀（反斜杠与引号翻倍），所以这里单独计一次上限。
+        text = java_string_body(text)
+        if len(text.encode('utf-8', 'surrogatepass')) > MAX_OUTPUT_BYTES:
+            raise ValueError(
+                f'JSON 输出过大，最多允许 {MAX_OUTPUT_BYTES} 字节'
+                '（默认 8 MiB）；可尝试压缩模式。')
+    return JsonTransformResult(text, tuple(duplicate_keys))

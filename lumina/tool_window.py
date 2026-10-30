@@ -14,10 +14,13 @@
   才落到剪贴板，避免把调试中间态污染进历史列表。
 - 输入框与结果框都用等宽字体：JSON/JWT 是结构化文本，等宽才能对齐看。
 - **失败不弹模态框**：解析错误直接显示在状态栏，用户改一个字符就能重试。
-- **JSON 窗口的四种转换（格式化 / 压缩 / 展开转义 / 恢复原文）从剪贴板详情栏
+- **JSON 窗口的转换菜单（格式化 / 压缩 / 展开转义 / 恢复原文）从剪贴板详情栏
   平移过来**，走同一个 ``json_popup.JsonPopup``、同一套文案与图标。用户原话
   「JSON格式化弹框将剪贴板中的JSON下拉框平移过去」——是「平移」不是「另做一套」，
   文案、顺序、图标都照抄 ``DetailPane._json_menu()``，不要另创措辞。
+  **「Java 转义」是这里独有的第五种**（用户原话「json弹框工具新增 JSON参数化
+  能力」，功能照做、展示名后来按官方术语改成了「Java 转义」），把 JSON 转成
+  Java 字符串字面量内容；详情栏那个下拉不加它。
 
 外壳实现要点（Windows）：
 - ``overrideredirect(True)`` 去掉原生标题栏；窗口只剩一条 34px 的操作条，
@@ -33,6 +36,7 @@ import os
 from tkinter import TclError
 
 from . import jwt_tools, taskbar
+from .json_modes import ESCAPE_JAVA_NOTICE, MODE_LABELS, build_menu_items
 from .json_tools import transform_json
 
 # 等宽字体：Windows 上 Consolas 覆盖 ASCII 与数字对齐；中文回退由 Tk 处理。
@@ -59,12 +63,13 @@ RESIZE_EDGE = 6
 # 结果里的段落标记。用等宽方块而不是「— xxx —」，更接近终端观感。
 SECTION_MARK = "▍"
 
-# JSON 转换模式的展示名。文案与 ``history_panel.DetailPane.JSON_MODE_LABELS``
-# **必须一致**（用户要求「平移」下拉框，不是另起一套说法）。两者分居两个模块是
-# 有意的：``tool_window`` 不该为了一个字典去 import 整个历史面板。漂移由
-# ``test_json_mode_labels_match_detail_pane`` 守住。
-JSON_MODE_LABELS = {
-    "format": "已格式化", "compress": "已压缩", "expand": "已展开转义"}
+# JSON 转换模式的展示名。**唯一来源是 ``json_modes.MODE_LABELS``**，这里只做
+# 再导出，便于 ``tool_window.JSON_MODE_LABELS`` 这个既有引用点继续可用。
+#
+# 历史：这段文案曾在 ``history_panel`` 与 ``tool_window`` 各写一份，靠
+# ``test_json_mode_labels_match_detail_pane`` 钉住不许漂移。那是用测试补架构缺口
+# ——用户要求两边同步后，改成从 ``json_modes`` 单一来源取。
+JSON_MODE_LABELS = MODE_LABELS
 
 # ---------- Win32 窗口扩展样式 ----------
 # 具体实现统一在 lumina/taskbar.py（与主面板共用），这里只做常量再导出，
@@ -1090,13 +1095,15 @@ class _ToolWindow:
 
 
 class JsonParamWindow(_ToolWindow):
-    """JSON 格式化工具：格式化 / 压缩 / 展开转义 / 恢复原文 + 重复键告警。
+    """JSON 格式化工具：格式化 / 压缩 / 展开转义 / Java 转义 / 恢复原文 + 重复键告警。
 
-    结果栏**只放转换后的 JSON 本身**，不附字段结构摘要（用户明确要求去掉）。
+    结果栏**只放转换后的结果本身**，不附字段结构摘要（用户明确要求去掉）。
 
-    下拉里的四种转换是从剪贴板详情栏**平移**过来的：同一个 ``JsonPopup``、同一套
-    文案与图标、同样的 ``selected`` 勾选语义。区别只在于结果写到本窗口右侧，
-    而不是详情栏的预览区。
+    下拉里的前三种转换是从剪贴板详情栏**平移**过来的：同一个 ``JsonPopup``、
+    同一套文案与图标、同样的 ``selected`` 勾选语义。区别只在于结果写到本窗口
+    右侧，而不是详情栏的预览区。**「Java 转义」是本窗口独有的第五种**（用户原话
+    「json弹框工具新增 JSON参数化 能力」，功能保留、展示名后来改成更标准的说法），
+    详情栏那边不动。
     """
 
     title = "JSON 格式化"
@@ -1136,7 +1143,10 @@ class JsonParamWindow(_ToolWindow):
         self._json_anchor = btn
 
     def _json_menu(self):
-        """弹出四项转换菜单。**再次点击同一按钮即收起**（与详情栏一致）。
+        """弹出转换菜单。**再次点击同一按钮即收起**。
+
+        items 由 ``json_modes.build_menu_items`` 生成——与剪贴板详情栏**同一份
+        代码**，两边菜单因此必然一致（用户要求「两边同步」）。
 
         用 ``json_popup.JsonPopup`` 而不是 Tk 原生 ``menu.post``：后者在 Windows
         下会进模态跟踪循环，把 UI 线程卡死（这条教训主面板已经付过代价）。
@@ -1147,21 +1157,10 @@ class JsonParamWindow(_ToolWindow):
             self._close_popup()
             return
         self._close_popup()
-        items = [
-            {"label": "格式化", "hint": "2 空格", "kind": "format",
-             "command": lambda: self._set_mode("format"),
-             "enabled": True, "selected": self._mode == "format"},
-            {"label": "压缩", "hint": "紧凑输出", "kind": "compress",
-             "command": lambda: self._set_mode("compress"),
-             "enabled": True, "selected": self._mode == "compress"},
-            {"label": "展开转义", "hint": "换行成行", "kind": "expand",
-             "command": lambda: self._set_mode("expand"),
-             "enabled": True, "selected": self._mode == "expand"},
-            {"label": "恢复原文", "hint": "", "kind": "restore",
-             "command": self._restore_original,
-             # 已经在原文态时按它等于什么都没做，禁掉更诚实。
-             "enabled": self._mode is not None, "selected": False},
-        ]
+        # busy 恒 False：本窗口同步执行，不存在「转换进行中」这个状态。
+        items = build_menu_items(
+            self._set_mode, self._restore_original, self._mode,
+            busy=False, can_restore=self._mode is not None)
         self._popup = JsonPopup(
             self.tk, self.win, items, self.T, dpi=self._dpi())
         self._popup.popup(self._json_anchor, on_close=self._popup_closed)
@@ -1199,13 +1198,19 @@ class JsonParamWindow(_ToolWindow):
             # 原文态：原样回显，不做任何结构改动。
             return raw, f"原文 · {len(raw)} 字符", "ok"
         result = transform_json(raw, self._mode)
-        # **结果栏只放转换后的 JSON 本身，不再附字段结构摘要。**
+        # **结果栏只放转换后的结果本身，不再附字段结构摘要。**
         # 用户原话：「JSON格式化右侧的字段结构就不要了去掉」。早先格式化视图会在
         # 末尾追加一段 ``▍ 字段结构`` 摊平清单（``a.b[0] : 字符串 = 'x'``），本意是
         # 帮用户快速看结构；但右侧本来就是完整且已缩进对齐的 JSON，再多一段摘要在
         # 长文档下反而把真正的结果推下去。**这是用户偏好，不要以「信息更全」为由
         # 加回来。**
         status = f"{JSON_MODE_LABELS[self._mode]} · {len(result.text)} 字符"
+        if self._mode == "escape_java":
+            # 转义产物是**字面量内容**，不含外层引号——不写明的话用户很可能
+            # 直接粘进 ``setPayload(xxx)`` 得到编译错误。这句提示是功能的一部分。
+            # 文案取自 ``json_modes.ESCAPE_JAVA_NOTICE``，与详情栏共用一份，
+            # 免得两侧说法漂移。
+            status += " · " + ESCAPE_JAVA_NOTICE
         if result.duplicate_keys:
             status += " · 重复键：" + "、".join(result.duplicate_keys)
             return result.text, status, "error"

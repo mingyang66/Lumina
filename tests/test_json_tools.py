@@ -1,5 +1,10 @@
 import json
+import pathlib
+import shutil
+import subprocess
+import tempfile
 import unittest
+import uuid
 from unittest.mock import patch
 
 from lumina import json_tools
@@ -274,6 +279,235 @@ class JsonToolsTests(unittest.TestCase):
         self.assertEqual(expanded, formatted.replace('\\n', '\n'))
         # 因为不额外加缩进，行数差正好等于字符串体内的 \n 个数（4 个）。
         self.assertEqual(expanded.count('\n'), formatted.count('\n') + 4)
+
+
+class JavaStringBodyTests(unittest.TestCase):
+    """``java_string_body``：把文本转成 Java 字符串字面量内容。
+
+    这层的每条规则都有 javac 实测背书（见 ``JavaCompileTests``），这里先用
+    纯字符串比较把边界钉死，跑得快、失败信息也直观。
+    """
+
+    def test_escapes_backslash_quote_and_control_chars(self):
+        cases = {
+            'a\\b': 'a\\\\b',
+            'a"b': 'a\\"b',
+            'a\nb': 'a\\nb',
+            'a\rb': 'a\\rb',
+            'a\tb': 'a\\tb',
+            'a\bb': 'a\\bb',
+            'a\fb': 'a\\fb',
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(json_tools.java_string_body(text), expected)
+
+    def test_other_control_and_del_become_unicode_escapes(self):
+        self.assertEqual(json_tools.java_string_body('a\x00b'),
+                         'a\\u0000b')
+        self.assertEqual(json_tools.java_string_body('a\x01b'),
+                         'a\\u0001b')
+        self.assertEqual(json_tools.java_string_body('a\x1fb'),
+                         'a\\u001fb')
+        self.assertEqual(json_tools.java_string_body('a\x7fb'),
+                         'a\\u007fb')
+
+    def test_lone_surrogates_become_unicode_escapes(self):
+        # surrogatepass 让孤立代理字符能进入处理流程；进 Java 源码前必须转义，
+        # 裸代理字符既写不进 UTF-8 源文件，Java 也不认。
+        for text in ('x\ud800y', '\udfff', '\ud800\udc00'):
+            with self.subTest(text=repr(text)):
+                out = json_tools.java_string_body(text)
+                out.encode('ascii')  # 必须能编成 ASCII，说明确实转义了
+                self.assertNotIn('\ud800', out)
+
+    def test_cjk_kept_verbatim(self):
+        # 中文不转 \uXXXX：可读性优先，现代 Java 源码统一 UTF-8。
+        self.assertEqual(json_tools.java_string_body('中文"x"'),
+                         '中文\\"x\\"')
+
+    def test_nested_escaping_is_single_layer(self):
+        # 输入已经含 \\ 与 \" 时，再转义一层后 Java 解析回来正好是原值。
+        self.assertEqual(json_tools.java_string_body(r'a\"b'), r'a\\\"b')
+        self.assertEqual(json_tools.java_string_body(r'a\\b'), r'a\\\\b')
+
+    def test_no_u_escape_triggered_by_literal_backslash_u(self):
+        # 字面 \u0041 必须变成 \\u0041（源码里两个反斜杠）。javac 按前导反斜杠
+        # 的奇偶判定，这个形态是安全的；只有裸 \u005c 才会炸。
+        self.assertEqual(json_tools.java_string_body(r'\u0041'), r'\\u0041')
+
+    def test_empty_string_stays_empty(self):
+        self.assertEqual(json_tools.java_string_body(''), '')
+
+
+class EscapeJavaTests(unittest.TestCase):
+    """``transform_json(raw, 'escape_java')``：紧凑 JSON 的 Java 字面量内容。"""
+
+    def test_output_is_escaped_compact_json(self):
+        raw = '{\n  "a": 1,\n  "b": [1, 2]\n}'
+        expected = r'{\"a\":1,\"b\":[1,2]}'
+        self.assertEqual(transform_json(raw, 'escape_java').text, expected)
+
+    def test_starts_from_compact_not_from_format(self):
+        raw = '{ "a" : [ 1 , 2 ] }'
+        result = transform_json(raw, 'escape_java').text
+        self.assertNotIn('\n', result)
+        self.assertNotIn('  ', result)
+        # 去掉转义层后必须恰好等于 compress 的结果——证明它确实是先压缩再转义。
+        self.assertEqual(result.replace('\\"', '"').replace('\\\\', '\\'),
+                         transform_json(raw, 'compress').text)
+
+    def test_keeps_duplicate_keys_and_validation(self):
+        self.assertEqual(
+            transform_json('{"a":1,"a":2}', 'escape_java').duplicate_keys,
+            ('a',))
+        with self.assertRaises(json.JSONDecodeError):
+            transform_json('{"a": @}', 'escape_java')
+        with self.assertRaisesRegex(ValueError, '嵌套过深'):
+            transform_json('[' * 129 + '0' + ']' * 129, 'escape_java')
+        with self.assertRaisesRegex(ValueError, '输入过大'):
+            transform_json('"' + 'a' * json_tools.MAX_INPUT_BYTES + '"',
+                           'escape_java')
+
+    def test_escaped_quote_and_backslash_survive(self):
+        # JSON 原文里的 \" 与 \\ 在字面量内容里各再多一层反斜杠。
+        raw = r'{"q":"he said \"hi\"","p":"C:\\tmp"}'
+        out = transform_json(raw, 'escape_java').text
+        self.assertIn(r'he said \\\"hi\\\"', out)
+        self.assertIn(r'C:\\\\tmp', out)
+
+    def test_literal_newline_escape_stays_two_char(self):
+        # JSON 里的 \n（反斜杠+n）在 Java 字面量里要写成 \\n，这样 Java 侧得到的
+        # String 里仍是「反斜杠 + n」两个字符，而不是真的换行。
+        raw = r'{"m":"a\nb"}'
+        out = transform_json(raw, 'escape_java').text
+        self.assertEqual(out, r'{\"m\":\"a\\nb\"}')
+        self.assertNotIn('\n', out)
+        # 从字面量反解回来应等于原 JSON 的字符串值。
+        self.assertEqual(out.replace('\\\\', '\\').replace('\\"', '"'),
+                         transform_json(raw, 'compress').text)
+
+    def test_output_limit_applies_after_escaping(self):
+        raw = '{"k":"' + '\\"' * 40 + '"}'
+        compact = transform_json(raw, 'compress').text
+        escaped = transform_json(raw, 'escape_java').text
+        # 转义确实让输出变长了，上限要按转义后的长度算。
+        self.assertGreater(len(escaped), len(compact))
+        with patch.object(json_tools, 'MAX_OUTPUT_BYTES',
+                          len(escaped.encode('utf-8'))):
+            self.assertEqual(transform_json(raw, 'escape_java').text, escaped)
+        with patch.object(json_tools, 'MAX_OUTPUT_BYTES',
+                          len(escaped.encode('utf-8')) - 1):
+            with self.assertRaisesRegex(ValueError, '输出过大'):
+                transform_json(raw, 'escape_java')
+
+    def test_mode_name_is_accepted_but_restore_is_not(self):
+        self.assertEqual(transform_json('{}', 'escape_java').text, '{}')
+        with self.assertRaisesRegex(ValueError, '模式'):
+            transform_json('{}', 'restore')
+
+
+JAVAC = shutil.which('javac')
+JAVA = shutil.which('java')
+
+
+@unittest.skipIf(JAVAC is None or JAVA is None,
+                 '本机没有 javac/java，跳过真实编译验证')
+class JavaCompileTests(unittest.TestCase):
+    """用**真实的 javac 编译 + 运行回读**验证转义正确性。
+
+    为什么值得让测试依赖外部 javac：转义规则的正确性只有「Java 真的把这段
+    字面量解析成什么」能证明。纯字符串断言只能证明「我按我理解的规则拼了字符
+    串」，而 JLS 3.3 的 unicode 预处理、`\\uXXXX` 的前导反斜杠奇偶规则这类
+    东西，光看代码是看不出对错的——本项目已为此专门做过三组实测。
+
+    没有 javac 时整体跳过（不是失败）：这条证据是「加强」，不是「必需」，
+    在没装 JDK 的机器上不该红。
+    """
+
+    def _run(self, literal_body, value):
+        """编译并运行 ``String s = "<literal_body>";``，返回 Java 侧的值。"""
+        work = pathlib.Path(tempfile.mkdtemp(prefix='lumjava_test_'))
+        self.addCleanup(shutil.rmtree, work, True)
+        cls = 'J' + uuid.uuid4().hex[:10]
+        source = work / f'{cls}.java'
+        # 用 Base64 传期望值不必要；直接把字面量嵌进源码，这才是要验证的东西。
+        source.write_text(
+            f'public class {cls} {{\n'
+            '  public static void main(String[] args) {\n'
+            f'    String s = "{literal_body}";\n'
+            '    System.out.print(s);\n'
+            '  }\n'
+            '}\n', encoding='utf-8')
+        compiled = subprocess.run(
+            [JAVAC, '-encoding', 'UTF-8', '-d', str(work), str(source)],
+            capture_output=True, text=True, encoding='utf-8', errors='replace')
+        self.assertEqual(compiled.returncode, 0,
+                         f'javac 编译失败：{compiled.stderr.strip()}')
+        run = subprocess.run(
+            # 中文必须显式指定 stdout 编码：JDK 18+ 默认取系统区域（本机 GBK），
+            # 拿 UTF-8 解会得到一堆替换字符——那是**测试读出方式**的问题，不是
+            # 字面量转义的问题，不修好会误判成转义错误。
+            [JAVA, '-Dstdout.encoding=UTF-8', '-cp', str(work), cls],
+            # **必须走二进制读**：``text=True`` 会用通用换行把 ``\r`` 归一成
+            # ``\n``，于是「CR 是否正确还原」这条永远测不出来（曾因此得到
+            # ``'a\nb\nc' != 'a\nb\rc'`` 的假失败）。
+            capture_output=True)
+        self.assertEqual(run.returncode, 0,
+                         f'java 运行失败：{run.stderr.decode("utf-8", "replace")}')
+        self.assertEqual(run.stdout.decode('utf-8', 'replace'), value)
+
+    def test_escaped_json_round_trips_through_javac(self):
+        """最能说明问题的一条：拼出的字面量在 Java 里解出的 String == 紧凑 JSON。"""
+        raw = ('{"name":"张三","quote":"he said \\"hi\\"","path":"C:\\\\tmp",'
+               '"esc":"\\u4e2d","lines":"a\\nb","n":1,"ok":true,"nil":null}')
+        body = transform_json(raw, 'escape_java').text
+        self._run(body, transform_json(raw, 'compress').text)
+
+    def test_literal_backslash_u_is_safe(self):
+        """逐字符转义产出的 ``\\\\u0041`` 不会触发 unicode 预处理。
+
+        JLS 3.3 按前导反斜杠的奇偶判定：两个反斜杠后跟 u 是「字面反斜杠 +
+        普通 u」，安全；裸 ``\\u005c`` 才会炸成「非法的 Unicode 转义」。
+        """
+        raw = r'{"p":"C:\\u0041"}'
+        body = transform_json(raw, 'escape_java').text
+        self.assertIn(r'\\\\u0041', body)
+        self._run(body, transform_json(raw, 'compress').text)
+
+    def test_control_characters_compile(self):
+        """含控制字符的来源也要能编译并原值回读。
+
+        **这条本身判别力有限，别高估它**：实测 javac 21 允许裸 TAB / BS / FF /
+        NUL / SOH / DEL 直接出现在字符串字面量里，所以「能编译」并不能证明那些
+        分支的必要性——真正必需的是 LF / CR（裸写 javac 报「未结束的字符串」）
+        和孤立代理字符（UTF-8 编不出来，源文件都写不下去）。那两条由
+        ``JavaStringBodyTests`` 直接断言。这里保留它只为守住「含这类字符的
+        输入不会让整条链路炸掉」。
+        """
+        # JSON 不允许 C0 裸字符，只能以 \u0001 转义形式进来。
+        raw = '{"c":"a\\u0001b","t":"a\\tb","d":"a\\u007fb"}'
+        body = transform_json(raw, 'escape_java').text
+        self._run(body, transform_json(raw, 'compress').text)
+
+    def test_real_lf_and_cr_escape_is_what_makes_compile_succeed(self):
+        """LF / CR 是**必需**转义的：裸写进字面量 javac 直接编译失败。
+
+        对照组：同一段文本，转义后编译通过；把 ``\\n`` 换回裸换行后编译失败。
+        没有对照组的话，「能编译」可能只是 javac 恰好容忍——曾据此类推把
+        TAB/BS/FF 也写成「必需」，实测才发现不对。
+        """
+        escaped = json_tools.java_string_body('a\nb\rc')
+        self.assertEqual(escaped, 'a\\nb\\rc')
+        self._run(escaped, 'a\nb\rc')
+        # 对照组：裸换行必须编译失败。
+        with self.assertRaises(AssertionError):
+            self._run('a\nb\rc', 'a\nb\rc')
+
+    def test_chinese_literal_compiles(self):
+        raw = '{"城市":"上海","区":"浦东新区"}'
+        body = transform_json(raw, 'escape_java').text
+        self._run(body, transform_json(raw, 'compress').text)
 
 
 if __name__ == '__main__':

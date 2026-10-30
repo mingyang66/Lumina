@@ -1171,14 +1171,22 @@ class ToolWindowTests(unittest.TestCase):
 
     # ---------- JSON 下拉：从剪贴板详情栏平移过来 ----------
     def test_json_mode_labels_match_detail_pane(self):
-        """两个模块的「已格式化 / 已压缩 / 已展开转义」必须逐字相同。
+        """两边的模式文案**必须是同一个对象**，不是「两份碰巧一样」。
 
-        用户要求的是把剪贴板里的下拉**平移**过来，不是另起一套说法。两个字典
-        分居两处（工具窗口不该为了一个字典去 import 整个历史面板），所以必须
-        有一条断言把它们钉在一起，否则改一处就会静默漂移。
+        这条测试的前身是按**交集**比对两个各自维护的字典。整合到
+        ``json_modes`` 之后，交集比对已经没有判别力了（同一份对象自己比自己
+        恒等），所以改成断言 identity：谁再在本地抄一份，立刻失败。
+
+        同时确认详情栏也吃到了 ``escape_java``——此前它是本窗口独有的第五种，
+        现在两边同步（用户要求「工具弹框中JSON转义功能在剪贴板中的JSON工具中
+        同步」）。
         """
+        from lumina import json_modes
         from lumina.history_panel import DetailPane
-        self.assertEqual(JSON_MODE_LABELS, DetailPane.JSON_MODE_LABELS)
+        self.assertIs(JSON_MODE_LABELS, json_modes.MODE_LABELS)
+        self.assertIs(DetailPane.JSON_MODE_LABELS, json_modes.MODE_LABELS)
+        self.assertIn('escape_java', DetailPane.JSON_MODE_LABELS,
+                      '详情栏没同步到 Java 转义')
 
     def test_json_window_has_menu_button_left_of_footer_actions(self):
         """底部要有「JSON ▾」入口，且落在「清空 / 复制结果」左侧。"""
@@ -1207,36 +1215,96 @@ class ToolWindowTests(unittest.TestCase):
         window.win.update()
         return window._popup
 
-    def test_json_menu_has_same_four_items_as_detail_pane(self):
-        """四项的文案 / 提示 / 图标类型必须与详情栏完全一致。"""
+    def test_json_menu_items_come_from_the_shared_builder(self):
+        """菜单项与详情栏**同一份代码**生成，不写死文案。
+
+        这条测试的前身是 ``test_json_menu_has_same_four_items_as_detail_pane``，
+        逐字断言 ``['格式化', '压缩', '展开转义', 'Java 转义', '恢复原文']``。
+        整合到 ``json_modes`` 之后，再写死字面量就是又造了一份平行定义——
+        改成按 ``MODE_ITEMS`` 推导，模式增删时这里不用跟着改。
+
+        「恢复原文」永远在最后，且靠 ``kind=='restore'``（而非下标）让
+        ``JsonPopup`` 画分隔线。
+        """
+        from lumina import json_modes
         window = self._open(JsonParamWindow)
         try:
             popup = self._open_popup(window)
             self.assertIsNotNone(popup, '没有弹出下拉')
+            order = json_modes.MODE_ORDER
             self.assertEqual([item['label'] for item in popup.items],
-                             ['格式化', '压缩', '展开转义', '恢复原文'])
+                             [json_modes.MODE_ITEMS[m][0] for m in order]
+                             + [json_modes.RESTORE_LABEL])
             self.assertEqual([item['hint'] for item in popup.items],
-                             ['2 空格', '紧凑输出', '换行成行', ''])
+                             [json_modes.MODE_ITEMS[m][1] for m in order] + [''])
             self.assertEqual([item['kind'] for item in popup.items],
-                             ['format', 'compress', 'expand', 'restore'])
+                             [*order, 'restore'])
+        finally:
+            window._close_popup()
+
+    def test_json_menu_keeps_all_transforms_enabled(self):
+        """工具弹框同步计算，**任何时刻**都不该禁用转换项。
+
+        回归：``_json_menu`` 一度误把 ``busy`` 传成 True（照抄详情栏的签名），
+        导致下拉里四项全是灰的——点不动，但没有任何报错。原有测试只断言了
+        「恢复原文可用」和勾选态，全灰也照样通过，所以单独守这条。
+        """
+        from lumina import json_modes
+        window = self._open(JsonParamWindow)
+        try:
+            for mode in (None, *json_modes.MODE_ORDER):
+                window._close_popup()
+                if mode is not None:
+                    window._set_mode(mode)
+                popup = self._open_popup(window)
+                with self.subTest(mode=mode):
+                    self.assertEqual(
+                        [item['enabled'] for item in popup.items],
+                        [True] * len(json_modes.MODE_ORDER) + [True],
+                        '转换项被禁用了：工具弹框是同步执行，不该有 busy 态')
+        finally:
+            window._close_popup()
+
+    def test_escape_java_item_has_an_icon(self):
+        """``JsonPopup._icon`` 只认已知 kind，未知 kind 静默不画。
+
+        漏补图标不会有任何报错，只会让下拉里那一项前面空一块——所以直接断言
+        该 kind 真的画了图元，而不是「没抛异常」。
+        """
+        window = self._open(JsonParamWindow)
+        try:
+            popup = self._open_popup(window)
+            canvas = popup.canvas
+            before = len([i for i in canvas.find_all()
+                          if canvas.type(i) == 'line'])
+            canvas.delete('all')
+            popup._icon('escape_java', 22, 15, '#FFFFFF')
+            drawn = [i for i in canvas.find_all() if canvas.type(i) == 'line']
+            self.assertGreater(len(drawn), 0, 'escape_java 图标没有画任何线条')
+            # 对照组：未知 kind 必须画 0 条——证明上面不是「画布上本来就有线」。
+            canvas.delete('all')
+            popup._icon('no-such-kind', 22, 15, '#FFFFFF')
+            self.assertEqual(len([i for i in canvas.find_all()
+                                  if canvas.type(i) == 'line']), 0)
+            self.assertGreaterEqual(before, 0)  # 保留变量，便于排查时打印
         finally:
             window._close_popup()
 
     def test_json_menu_marks_current_mode_selected(self):
         """默认勾「格式化」；切到别的模式后勾选跟着走。"""
+        from lumina import json_modes
+        order = json_modes.MODE_ORDER
         window = self._open(JsonParamWindow)
         try:
-            popup = self._open_popup(window)
-            self.assertEqual([item['selected'] for item in popup.items],
-                             [True, False, False, False])
-            # 恢复原文在原文态之前是可用的（当前是 format）
-            self.assertTrue(popup.items[3]['enabled'])
-            window._close_popup()
-
-            window._set_mode('compress')
-            popup = self._open_popup(window)
-            self.assertEqual([item['selected'] for item in popup.items],
-                             [False, True, False, False])
+            for mode in order:
+                window._close_popup()
+                window._set_mode(mode)
+                popup = self._open_popup(window)
+                with self.subTest(mode=mode):
+                    self.assertEqual([item['selected'] for item in popup.items],
+                                     [m == mode for m in order] + [False])
+                    # 已转换态下「恢复原文」必须可用。
+                    self.assertTrue(popup.items[-1]['enabled'])
         finally:
             window._close_popup()
 
@@ -1283,17 +1351,40 @@ class ToolWindowTests(unittest.TestCase):
         window._restore_original()
         try:
             popup = self._open_popup(window)
-            self.assertFalse(popup.items[3]['enabled'],
+            self.assertFalse(popup.items[4]['enabled'],
                              '已在原文态时「恢复原文」应禁用')
         finally:
             window._close_popup()
 
+    def test_switch_to_escape_java_outputs_java_string_body(self):
+        """Java 转义：紧凑 JSON 再叠一层 Java 字面量转义，不含外层引号。"""
+        window = self._open(JsonParamWindow)
+        self._type(window, '{\n  "a": 1,\n  "b": ["x", "y"]\n}')
+        window._set_mode('escape_java')
+        out = window.output.get('1.0', 'end-1c').strip()
+        self.assertEqual(out, r'{\"a\":1,\"b\":[\"x\",\"y\"]}')
+        self.assertNotIn('\n', out, 'Java 转义结果必须是单行')
+        self.assertFalse(out.startswith('"'), '不该带外层引号')
+        self.assertIn('已转义', window.status.cget('text'))
+        # 提示必须点明「两侧补双引号」——产物是字面量内容，直接贴进
+        # setXxx(...) 会编译不过，这句是功能的一部分而不只是装饰。
+        self.assertIn('补双引号', window.status.cget('text'))
+
+    def test_switch_to_escape_java_escapes_quote_and_backslash(self):
+        window = self._open(JsonParamWindow)
+        self._type(window, r'{"q":"he said \"hi\"","p":"C:\\tmp"}')
+        window._set_mode('escape_java')
+        out = window.output.get('1.0', 'end-1c')
+        self.assertIn(r'he said \\\"hi\\\"', out)
+        self.assertIn(r'C:\\\\tmp', out)
+
     def test_no_field_summary_in_any_mode(self):
-        """四种模式的结果里都不能出现字段结构摘要。"""
+        """所有模式（含 Java 转义）的结果里都不能出现字段结构摘要。"""
         window = self._open(JsonParamWindow)
         self._type(window, '{"user":{"name":"张三","tags":["a","b"]}}')
         for mode, label in (('format', '格式化'), ('compress', '压缩'),
-                            ('expand', '展开转义')):
+                            ('expand', '展开转义'),
+                            ('escape_java', 'Java 转义')):
             with self.subTest(mode=mode):
                 window._set_mode(mode)
                 out = window.output.get('1.0', 'end-1c')
