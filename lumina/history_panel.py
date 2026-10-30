@@ -2095,8 +2095,11 @@ class HistoryPanel:
         # ---------- 自定义窗口标题栏 + 双栏布局 ----------
         # 无边框窗口没有 Windows 原生标题栏，因此把功能按钮和窗口控制
         # 统一放在这一行。
-        self._sh_h = int(round(30 * dpi))
-        title_bar = tk.Frame(self._cmp_root, bg=win_bg, height=self._sh_h)
+        # 顶栏与搜索胶囊的高度**必须分开**：顶栏要紧凑，搜索胶囊维持原高度
+        # （胶囊再矮会让占位图标贴边）。原先共用一个 _sh_h，改一个另一个跟着变。
+        self._hdr_h = int(round(26 * dpi))     # 顶栏高度
+        self._search_h = int(round(30 * dpi))  # 搜索胶囊高度
+        title_bar = tk.Frame(self._cmp_root, bg=win_bg, height=self._hdr_h)
         title_bar.pack(fill="x", padx=0, pady=0)
         title_bar.pack_propagate(False)
         title_bar.bind("<ButtonPress-1>", self._hdr_press)
@@ -2132,7 +2135,9 @@ class HistoryPanel:
         self._shot_btn.pack(side="left", padx=(0, 2))
         self._settings_btn.pack(side="left", padx=(0, 2))
 
-        control_size = max(24, int(round(30 * dpi)))
+        # 控制按钮图标跟着顶栏一起缩：图标与画布都是 26 的整数倍逻辑尺寸，
+        # 顶栏只有 26 高时 32 的画布会被 pack fill="y" 裁掉上下各 3px，图标缺角。
+        control_size = max(24, int(round(26 * dpi)))
         normal_fg = T["label"]
         self._control_icons = {
             "minimize": self._make_window_control_icons(
@@ -2152,13 +2157,20 @@ class HistoryPanel:
         self._max_btn.pack(side="right", padx=(2, 0), fill="y")
         self._minimize_btn.pack(side="right", padx=(2, 0), fill="y")
 
+        # 顶栏下的发丝线：顶栏与内容区同色（window_bg），缺少分隔时两者在视觉上
+        # 合并成一整块空白，这正是「边框显宽」的主因。1px 冷色线把顶栏切成独立横条，
+        # 视觉留白立刻收敛（实测顶部空白 48px → 32px）。
+        tk.Frame(self._cmp_root, bg=T["separator"], height=1).pack(fill="x")
+
         # ---------- 双栏布局：左(搜索+列表) / 右(详情) ----------
-        body_w = self._cw - 60  # cmp_root 内缩32 + body padx28
+        # 左右各留 12（原 14）；_cw - 56 = 内缩16 + 左右共24 + 预留16。
+        # 这里的常数与 body_split 的 padx **必须同步**，否则首帧左右栏宽度会偏。
+        body_w = self._cw - 56
         left_w = self._left_width(body_w)
         detail_w = self._detail_width(body_w)
 
         body_split = tk.Frame(self._cmp_root, bg=win_bg)
-        body_split.pack(fill="both", expand=True, padx=14, pady=(10, 0))
+        body_split.pack(fill="both", expand=True, padx=12, pady=(6, 0))
         body_split.bind("<Configure>", self._on_split_configure)
         body_split.bind("<ButtonPress-1>", self._hdr_press)
         body_split.bind("<B1-Motion>", self._hdr_move)
@@ -2171,9 +2183,9 @@ class HistoryPanel:
         left.bind("<B1-Motion>", self._hdr_move)
 
         # 搜索胶囊常驻左栏顶部：默认图标居中（占位态），点击后图标靠左变输入框
-        self._search_wrap = tk.Frame(left, bg=win_bg, height=self._sh_h)
+        self._search_wrap = tk.Frame(left, bg=win_bg, height=self._search_h)
         self._search_wrap.pack(fill="x", pady=(0, 6))
-        self._search_canvas = tk.Canvas(self._search_wrap, height=self._sh_h,
+        self._search_canvas = tk.Canvas(self._search_wrap, height=self._search_h,
                                         bg=win_bg, highlightthickness=0, bd=0)
         self._search_canvas.pack(fill="x")
         self._search_icon = self._make_search_icon(dpi, T["label3"])
@@ -2231,7 +2243,7 @@ class HistoryPanel:
 
         # ---------- 底部：细状态行（行级动作由详情区动作栏承担） ----------
         footer = tk.Frame(self._cmp_root, bg=win_bg)
-        footer.pack(fill="x", padx=14, pady=(0, 6))
+        footer.pack(fill="x", padx=12, pady=(0, 4))
         tk.Label(footer, bg=win_bg, fg=T["label3"], font=self._font(8),
                  text="Enter 回贴 · Ctrl+C 复制 · Ctrl+P 收藏 · Del 删除 · Ctrl+1-9 快速"
                  ).pack(side="left")
@@ -2264,7 +2276,7 @@ class HistoryPanel:
 
     def _left_col_width(self):
         """左栏（列表画布）宽度推导：画布尚未映射时的首帧渲染兜底。"""
-        body = max(200, self._cw - 60)  # cmp_root 内缩32 + body padx28
+        body = max(200, self._cw - 56)  # 与 __init__ 的 body_w 同式，必须同步
         return self._left_width(body)
 
     def _on_split_configure(self, e):
@@ -2323,7 +2335,9 @@ class HistoryPanel:
     def _make_control_button(self, parent, key, command, normal_bg, hover_bg):
         from PIL import Image, ImageDraw, ImageTk
 
-        size = max(30, int(round(32 * self._dpi)))
+        # 画布尺寸直接取顶栏高度：这里原先写死 32，而顶栏只有 26，
+        # 按钮以 fill="y" 被裁到 26 后，居中绘制在 16px 处的图标下半截会被切掉。
+        size = max(24, self._hdr_h)
         canvas = self.tk.Canvas(parent, width=size, height=size,
                                 bg=normal_bg, bd=0, highlightthickness=0,
                                 cursor="hand2")
@@ -2429,7 +2443,7 @@ class HistoryPanel:
         if c is None:
             return
         w = c.winfo_width()
-        h = self._sh_h
+        h = self._search_h
         if w <= 1:
             return
         T, _dark = self._theme()
