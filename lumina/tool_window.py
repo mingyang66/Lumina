@@ -38,13 +38,19 @@ MONO_FAMILY = "Consolas"
 DEBOUNCE_MS = 180
 
 # ---------- 外壳尺寸 ----------
-SHELL_RADIUS = 12          # 外圆角半径（与 SetWindowRgn 共用）
+# 窗口四角是**尖角**，与剪贴板主面板一致（主面板 `_make_rounded_bg` 只画矩形，
+# 从不调 `SetWindowRgn` 做圆角）。曾是半径 12 的圆角，两个窗口并排看风格割裂，
+# 已统一成直角。**不要再加回圆角**：那会让描边沿弧线走、视觉比主面板软一档。
 SHELL_BORDER = 1           # 描边宽度
-CONTENT_INSET = 8          # 内容与外壳边缘的间距，让描边与圆角露出来
+CONTENT_INSET = 8          # 内容与外壳边缘的间距，让描边露出来
 RAIL_HEIGHT = 30           # 顶部操作条：只承载拖动与关闭
 FOOT_HEIGHT = 34           # 底部状态 + 操作按钮
 GAP = 10                   # 左右两栏之间的缝隙
 MIN_W, MIN_H = 660, 440    # 允许缩到的最小尺寸
+# 窗口四边 / 四角的可拖拽热区宽度。取 6px 而不是 Windows 常见的 8px，是因为
+# 内容区从 CONTENT_INSET(8) 起笔——热区必须完全落在这一圈「只有外壳」的
+# 缝隙里，否则会盖住正文响应区，用户点边框附近的文字时变成改尺寸。
+RESIZE_EDGE = 6
 
 # 结果里的段落标记。用等宽方块而不是「— xxx —」，更接近终端观感。
 SECTION_MARK = "▍"
@@ -188,6 +194,7 @@ class _ToolWindow:
         self._shell_image = None
         self._drag_off = None
         self._resize_from = None
+        self._resize_edges = {}
         self._maxed = False
         self._normal_geom = None
         self._min_geom = None
@@ -199,8 +206,8 @@ class _ToolWindow:
         self._build_shell()
         self._center()
         self._build()
-        # 无边框窗口收不到 WM_DELETE_WINDOW 的标题栏按钮，Esc 是唯一的键盘出口。
-        self.win.bind("<Escape>", lambda _e: self.close())
+        # ESC = 最小化到任务栏（用户要求，与主面板一致）。关闭仍走顶栏那个叉。
+        self.win.bind("<Escape>", lambda _e: self.escape())
         # 首次刷新也记进 _after_id：否则窗口在 30ms 内就被关掉时，这个定时器
         # 不在 close() 的取消范围内，Tk 会在销毁后报 invalid command name。
         self._after_id = self.win.after(30, self._refresh)
@@ -224,6 +231,9 @@ class _ToolWindow:
         self._paint_shell(self.width, self.height)
         self.shell.bind("<Configure>", self._on_shell_configure)
         self._build_rail()
+        # 缩放热区最后建：它要压在 rail 之上（顶边热区与 rail 顶沿重叠 1~2px），
+        # 否则顶边那一条永远拖不动。
+        self._make_resize_edges()
 
     def _on_map_claim_taskbar(self, event):
         """窗口真正显示后重新声明任务栏归属。
@@ -320,20 +330,29 @@ class _ToolWindow:
             60, lambda: self._paint_shell(width, height))
 
     def _apply_round_region(self, width, height):
-        """用 GDI 区域把窗口四角裁成圆角。非 Windows 退化为直角。"""
+        """把窗口裁剪成**直角矩形**，与剪贴板主面板保持一致。
+
+        早先这里用 ``CreateRoundRectRgn`` 裁成半径 ``SHELL_RADIUS`` 的圆角。
+        但主面板（剪贴板）是纯直角窗口（``_make_rounded_bg`` 只画矩形填充，
+        从不调 ``SetWindowRgn``），两个窗口并排看风格割裂，所以统一成尖角。
+
+        仍保留 ``SetWindowRgn`` 调用：它在这里不产生圆角，只负责把窗口区域
+        钉成精确的 ``width x height``，避免窗口尺寸与内容之间出现 1px 缝隙。
+        **不能直接删掉这层调用**——``_paint_shell`` 画的外壳是按客户区尺寸
+        绘制的，缺了区域裁剪时 DWM 会在边缘留一圈未绘制的黑边。
+        方法名沿用旧名，是为了不动既有的调用点与测试。
+        """
         if os.name != "nt":
             return
         try:
             gdi = ctypes.windll.gdi32
             user32 = ctypes.windll.user32
-            gdi.CreateRoundRectRgn.restype = ctypes.c_void_p
-            gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+            gdi.CreateRectRgn.restype = ctypes.c_void_p
+            gdi.CreateRectRgn.argtypes = [ctypes.c_int] * 4
             user32.SetWindowRgn.restype = ctypes.c_int
             user32.SetWindowRgn.argtypes = [
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
-            rgn = gdi.CreateRoundRectRgn(
-                0, 0, int(width) + 1, int(height) + 1,
-                SHELL_RADIUS * 2, SHELL_RADIUS * 2)
+            rgn = gdi.CreateRectRgn(0, 0, int(width) + 1, int(height) + 1)
             if rgn:
                 # 成功后区域所有权归系统，不能再 DeleteObject。
                 user32.SetWindowRgn(
@@ -342,7 +361,12 @@ class _ToolWindow:
             pass
 
     def _paint_shell(self, width, height):
-        """绘制外壳：圆角底 + 冷光描边 + 顶边强调扫描线。"""
+        """绘制外壳：直角底 + 冷光描边 + 顶边强调扫描线。
+
+        四角是**尖角**，与剪贴板主面板一致（主面板的 ``_make_rounded_bg``
+        从来只画矩形）。这里不用 ``rounded_rectangle`` 是为了让描边贴着
+        真正的窗口边界——圆角时描边要沿弧线走，视觉上比主面板「软」一档。
+        """
         self._shell_job = None
         if self._closed:
             return
@@ -351,21 +375,22 @@ class _ToolWindow:
             from PIL import Image, ImageDraw, ImageTk
         except Exception:  # 没有 Pillow 时退化为纯色窗口，功能不受影响
             return
-        # 2 倍超采样再缩放，圆角边缘才有抗锯齿；超大窗口降回 1 倍省内存。
+        # 2 倍超采样再缩放，描边边缘才有抗锯齿；超大窗口降回 1 倍省内存。
         scale = 2 if width * height <= 1_400_000 else 1
         image = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         fill = (*self._rgb(self.T["window_bg"]), 255)
-        draw.rounded_rectangle(
+        draw.rectangle(
             [0, 0, width * scale - 1, height * scale - 1],
-            radius=SHELL_RADIUS * scale, fill=fill,
-            outline=(*self._rgb(self._edge()), 255),
+            fill=fill, outline=(*self._rgb(self._edge()), 255),
             width=SHELL_BORDER * scale)
-        # 顶边扫描线：从圆角直边段（x >= radius）起笔，避免溢出到被裁掉的角落。
+        # 顶边扫描线：直角窗口没有「被裁掉的角落」，所以从最左边起笔，
+        # 与外壳左上角严格对齐。圆角版本要从 x >= radius 起笔避免溢出到
+        # 弧外，现在不需要了。
         accent = self._rgb(self._accent())
         top = SHELL_BORDER * scale
-        start = SHELL_RADIUS * scale
-        span = max(1, int((width * scale - start) * 0.5))
+        start = 0
+        span = max(1, int(width * scale * 0.5))
         steps = max(1, min(180, span))
         for index in range(steps):
             x = start + int(index * span / steps)
@@ -413,6 +438,10 @@ class _ToolWindow:
         for widget in (rail, mark, self.title_label):
             widget.bind("<ButtonPress-1>", self._drag_press)
             widget.bind("<B1-Motion>", self._drag_move)
+            widget.bind("<Double-Button-1>", self._rail_double)
+            # 双击顶栏切换最大化/还原，与 Windows 原生行为一致。
+            # 三个控件各自要绑：Double 事件只会送到「收到第一次 press」的那个
+            # 控件，绑在 rail 上无法覆盖 mark / title_label 这两块。
 
         # pack 顺序即左右：先 pack 的在最左，所以按 关闭 → 最大化 → 最小化
         # 反向 pack，最终视觉顺序是 最小化 / 最大化 / 关闭（Windows 习惯）。
@@ -511,6 +540,45 @@ class _ToolWindow:
         except TclError:
             pass
 
+    def is_minimized(self):
+        """窗口当前是否最小化在任务栏里（不是隐藏、也不是关闭）。"""
+        if self._closed:
+            return False
+        return taskbar.is_minimized(self.win)
+
+    def escape(self):
+        """ESC：最小化到任务栏（不再是关闭）。
+
+        用户原话：「现在按 ESC 键剪贴板和弹框都是直接关闭了，改成最小化到
+        任务栏」。与顶栏最小化按钮完全一致，所以复用 ``_minimize``。
+
+        **关闭仍然是 ``close()``**（顶栏那个叉），销毁 Tk 窗口、释放定时器。
+        两者不要混：最小化的窗口还挂在任务栏上，用户点一下就能回来。
+        """
+        self._minimize()
+        return "break"
+
+    def summon(self):
+        """把最小化的窗口唤回屏幕（``SW_RESTORE``）。
+
+        ``SW_SHOW`` 对最小化窗口无效——实测调完 ``IsIconic`` 仍为 True，
+        窗口挂在任务栏上永远回不来。所以走 ``restore_window``，它内部是
+        ``SW_RESTORE``，同时会保住最小化前的几何（含最大化状态）。
+        """
+        if self._closed:
+            return False
+        if not taskbar.restore_window(self.win):
+            try:
+                self.win.deiconify()
+            except TclError:
+                return False
+        try:
+            self.win.lift()
+            self.win.focus_force()
+        except TclError:
+            pass
+        return True
+
     def _restore_chrome(self):
         """从最小化还原（``SW_RESTORE``），不碰 ``overrideredirect``。
 
@@ -537,6 +605,9 @@ class _ToolWindow:
 
     def _toggle_maximize(self):
         """最大化到工作区 / 还原。避开任务栏，不做全屏覆盖。"""
+        # 最大化/还原会整体换掉几何，残留的缩放起点必须作废——否则接下来
+        # 一晃鼠标（哪怕没按）都会按旧起点重算尺寸。
+        self._resize_from = None
         if self._maxed:
             self._maxed = False
             if self._normal_geom:
@@ -577,13 +648,152 @@ class _ToolWindow:
         self._drag_off = (event.x_root - self.win.winfo_x(),
                           event.y_root - self.win.winfo_y())
 
+    def _rail_double(self, _event=None):
+        """双击顶栏切换最大化/还原（Windows 原生习惯）。
+
+        先清掉拖动锚点：最大化之后窗口贴满工作区，残留的锚点会让接下来的
+        ``<B1-Motion>`` 把窗口按旧偏移拖走。
+        """
+        self._drag_off = None
+        self._toggle_maximize()
+        return "break"
+
     def _drag_move(self, event):
         if self._drag_off:
             self.win.geometry(
                 f"+{event.x_root - self._drag_off[0]}+{event.y_root - self._drag_off[1]}")
 
+    def _make_resize_edges(self):
+        """在窗口四边铺一圈透明的缩放热区，实现八向拖拽改尺寸。
+
+        **为什么不用 Win32 那套（``WS_THICKFRAME`` + ``WM_NCHITTEST``）**：
+        主面板用的是它，但工具弹框的自绘外壳扛不住 —— 实测给 ``winfo_id()``
+        那个 TkChild 加上 ``WS_THICKFRAME`` 后：
+
+        1. 客户区从 920x640 被压成 **906x626**（14px 非客户区）；
+        2. ``PrintWindow`` 抓到的最外圈像素由干净的圆角强调色变成
+           ``(227,227,227)`` / ``(255,255,255)`` —— 系统灰边露了出来，
+           与自绘的 ``SetWindowRgn`` 圆角打架。
+
+        本窗口是「整块 Canvas 自绘 + 圆角裁剪」的形态，露系统边框就毁了观感，
+        所以改用纯 Tk 的热区：不动任何窗口样式，尺寸与外观零变化。
+
+        热区必须压在**内容区之外**那一圈（``CONTENT_INSET = 8``）：正文、
+        顶栏、底栏都是从这个内边距往里排的，所以 6px 宽的热区不会盖住它们。
+        角上的热区用 ``RESIZE_EDGE * 2`` 见方，比单边更宽——角落本来就该
+        更好抓。
+        """
+        tk = self.tk
+        width = RESIZE_EDGE
+        corner = RESIZE_EDGE * 2
+        # 角热区从**真正的角**起算（place 在 0,0 / 右上等位置）。四角是尖角，
+        # 整块 12x12 方框都是真实存在的像素，不像圆角时那样有个被裁掉的扇形。
+        edges = (
+            ("n", {"x": corner, "y": 0, "relwidth": 1.0, "width": -corner * 2,
+                   "height": width}, "sb_v_double_arrow"),
+            ("s", {"x": corner, "rely": 1.0, "y": -width, "relwidth": 1.0,
+                   "width": -corner * 2, "height": width}, "sb_v_double_arrow"),
+            ("w", {"x": 0, "y": corner, "width": width, "relheight": 1.0,
+                   "height": -corner * 2}, "sb_h_double_arrow"),
+            ("e", {"relx": 1.0, "x": -width, "y": corner, "width": width,
+                   "relheight": 1.0, "height": -corner * 2},
+             "sb_h_double_arrow"),
+            ("nw", {"x": 0, "y": 0, "width": corner, "height": corner},
+             "size_nw_se"),
+            ("ne", {"relx": 1.0, "x": -corner, "y": 0, "width": corner,
+                    "height": corner}, "size_ne_sw"),
+            ("sw", {"x": 0, "rely": 1.0, "y": -corner, "width": corner,
+                    "height": corner}, "size_ne_sw"),
+            ("se", {"relx": 1.0, "x": -corner, "rely": 1.0, "y": -corner,
+                    "width": corner, "height": corner}, "size_nw_se"),
+        )
+        self._resize_edges = {}
+        for name, geometry, cursor in edges:
+            zone = tk.Frame(self.shell, bg=self.T["window_bg"], cursor=cursor,
+                            highlightthickness=0, bd=0)
+            zone.place(**geometry)
+            zone.bind("<Enter>", lambda _e, n=name: self._edge_enter(n))
+            zone.bind("<Leave>", lambda _e, n=name: self._edge_leave(n))
+            zone.bind("<ButtonPress-1>", lambda e, n=name: self._edge_press(e, n))
+            zone.bind("<B1-Motion>", self._edge_move)
+            zone.bind("<ButtonRelease-1>", self._edge_release)
+            self._resize_edges[name] = zone
+        return self._resize_edges
+
+    def _edge_enter(self, name):
+        """鼠标进入边缘时给一道极淡的高亮，暗示「这里能拖」。
+
+        不做常驻描边：无边框窗口的边界本来就靠外壳的冷光描边表达，再加一层
+        会显得毛糙。只在悬停时轻微提亮，符合「可发现但不喧哗」。
+        """
+        if self._closed:
+            return
+        zone = self._resize_edges.get(name)
+        if zone is not None:
+            zone.configure(bg=self.T["fill_hover"])
+
+    def _edge_leave(self, name):
+        zone = self._resize_edges.get(name)
+        if zone is not None:
+            zone.configure(bg=self.T["window_bg"])
+
+    def _edge_press(self, event, name):
+        """记下起点：窗口几何 + 鼠标屏幕坐标 + 拖的是哪条边/哪个角。"""
+        # 先无条件清掉旧状态。最大化时不能缩放，但如果只是 return 而不清空，
+        # 上一次拖拽遗留的 ``_resize_from`` 会被紧接着的 ``<B1-Motion>``
+        # 拿来用——实测最大化窗口一拖就缩成 MIN_W。
+        self._resize_from = None
+        if self._maxed:
+            return "break"      # 最大化时不允许改尺寸，与原生窗口一致
+        self._resize_from = {
+            "edge": name,
+            "x": event.x_root,
+            "y": event.y_root,
+            "geom": (self.win.winfo_width(), self.win.winfo_height(),
+                     self.win.winfo_x(), self.win.winfo_y()),
+        }
+        return "break"
+
+    def _edge_move(self, event):
+        """按边名决定要改宽/高、还是同时改宽高与原点。
+
+        左侧和上侧缩放必须**同时移动原点**，否则看起来是「窗口在飞」而不是
+        「边在动」。移动量先算出来再夹紧，保证最小尺寸时原点也停在正确位置。
+        """
+        state = self._resize_from
+        if not state or self._closed or self._maxed:
+            return
+        name = state["edge"]
+        w0, h0, x0, y0 = state["geom"]
+        dx = event.x_root - state["x"]
+        dy = event.y_root - state["y"]
+
+        w, h, x, y = w0, h0, x0, y0
+        if "e" in name:
+            w = max(MIN_W, w0 + dx)
+        if "w" in name:
+            w = max(MIN_W, w0 - dx)
+            # 夹紧后原点要跟着「实际改掉的宽度」走，不能直接用 dx，
+            # 否则缩到下限后继续往右拖，窗口会开始往左漂。
+            x = x0 + (w0 - w)
+        if "s" in name:
+            h = max(MIN_H, h0 + dy)
+        if "n" in name:
+            h = max(MIN_H, h0 - dy)
+            y = y0 + (h0 - h)
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _edge_release(self, _event=None):
+        self._resize_from = None
+
     def _make_grip(self, parent):
-        """右下角缩放抓手：三道斜线，按住可改窗口尺寸。"""
+        """右下角缩放抓手：三道斜线，纯视觉提示（真正的拖拽由边缘热区接管）。
+
+        早先它是唯一的缩放入口，但它被 pack 在底部状态栏里，实测位置偏到
+        「右边界内 8px、下边界内 18px」，离真正的窗口角有明显空档，用户
+        根本抓不到。现在八向热区铺满四边，这个抓手退回纯装饰：告诉用户
+        「这个角可以拉」，不再承担事件。
+        """
         tk, T = self.tk, self.T
         size = 14
         canvas = tk.Canvas(parent, width=size, height=size, bg=T["window_bg"],
@@ -593,21 +803,11 @@ class _ToolWindow:
             canvas.create_line(size - 3 - index * 4, size - 2,
                                size - 2, size - 3 - index * 4,
                                fill=color, width=1)
-        canvas.bind("<ButtonPress-1>", self._grip_press)
-        canvas.bind("<B1-Motion>", self._grip_move)
+        # 抓手本身也接一下事件，免得手指正好落在这 14px 上时反而不能拖。
+        canvas.bind("<ButtonPress-1>", lambda e: self._edge_press(e, "se"))
+        canvas.bind("<B1-Motion>", self._edge_move)
+        canvas.bind("<ButtonRelease-1>", self._edge_release)
         return canvas
-
-    def _grip_press(self, event):
-        self._resize_from = (event.x_root, event.y_root,
-                             self.win.winfo_width(), self.win.winfo_height())
-
-    def _grip_move(self, event):
-        if not self._resize_from:
-            return
-        x0, y0, w0, h0 = self._resize_from
-        w = max(MIN_W, w0 + event.x_root - x0)
-        h = max(MIN_H, h0 + event.y_root - y0)
-        self.win.geometry(f"{w}x{h}")
 
     # ---------- 布局 ----------
     def _mono(self, size, weight="normal"):
@@ -826,6 +1026,13 @@ class _ToolWindow:
         if self._closed:
             return
         self._closed = True
+        # 从 panel 的实例表里摘掉自己：否则下次 open_tool 会拿到一个已销毁的
+        # 实例（虽然那里也会判 winfo_exists 兜底，但留着是内存泄漏）。
+        registry = getattr(self.panel, "_tool_windows", None)
+        if isinstance(registry, dict):
+            for key, window in list(registry.items()):
+                if window is self:
+                    registry.pop(key, None)
         for job in (self._after_id, self._shell_job, self._chrome_id):
             if job is not None:
                 try:
@@ -959,10 +1166,36 @@ TOOLS = (
 
 
 def open_tool(panel, key):
-    """按 key 打开对应工具窗口，返回实例；未知 key 抛 ValueError。"""
+    """按 key 打开对应工具窗口，返回实例；未知 key 抛 ValueError。
+
+    **同一工具只保留一个窗口实例。** ESC 改成「最小化」之后这条变重要了：
+    最小化的窗口仍在任务栏上，若再从工具菜单点一次就新建第二个，用户会看到
+    两个同名窗口、且各自保存着不同的输入内容。所以先查 ``panel._tool_windows``
+    里有没有还活着的实例——有就只唤回它（最小化状态走 ``SW_RESTORE``），
+    不新建。
+    """
+    registry = getattr(panel, "_tool_windows", None)
+    if registry is None:
+        registry = {}
+        panel._tool_windows = registry
+
+    existing = registry.get(key)
+    if existing is not None:
+        # 窗口被用户点叉关掉后 Tk 控件已销毁，实例不能再用，直接清掉重建。
+        try:
+            alive = not existing._closed and bool(existing.win.winfo_exists())
+        except Exception:
+            alive = False
+        if alive:
+            existing.summon()
+            return existing
+        registry.pop(key, None)
+
     for tool_key, _label, cls in TOOLS:
         if tool_key == key:
-            return cls(panel)
+            window = cls(panel)
+            registry[key] = window
+            return window
     raise ValueError(f"未知工具：{key}")
 
 

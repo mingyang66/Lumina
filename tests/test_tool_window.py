@@ -13,8 +13,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from lumina import taskbar  # noqa: E402
 from lumina.history_panel import HistoryPanel  # noqa: E402
 from lumina.tool_window import (  # noqa: E402
+    MIN_H,
+    MIN_W,
     TOOLS,
     WS_EX_APPWINDOW,
     WS_EX_TOOLWINDOW,
@@ -106,6 +109,15 @@ class ToolWindowTests(unittest.TestCase):
 
     def _open(self, cls):
         window = cls(self.panel)
+        # 构造后登记进实例表：``open_tool`` 靠它做单实例复用，直接构造会绕过
+        # 注册，导致同一测试里「直接建」和「open_tool 建」的窗口不一致。
+        key = next((k for k, _l, c in TOOLS if c is cls), None)
+        if key is not None:
+            registry = getattr(self.panel, '_tool_windows', None)
+            if registry is None:
+                registry = {}
+                self.panel._tool_windows = registry
+            registry[key] = window
         self.created.append(window)
         # 无边框窗口的几何与控件坐标要跑一轮事件循环才被 Tk 算出来，
         # 否则 winfo_x()/wm_geometry() 全是 0，断言会得到误导性结果。
@@ -262,6 +274,242 @@ class ToolWindowTests(unittest.TestCase):
             window.win.update()
         except tk.TclError:
             pass
+
+    def test_double_click_rail_toggles_maximize(self):
+        """双击顶栏必须切换最大化/还原（Windows 原生习惯）。
+
+        顶栏由三块拼成：``rail`` 容器、左侧信号条 ``mark``、标题 ``title_label``。
+        ``<Double-Button-1>`` 只会送到「收到第一次 press」的那个控件，所以三块
+        都得绑——只绑容器的话，点在标题文字上不会触发。
+
+        这里分两段验证，避免依赖 Tk 的连击计时（阈值 500ms，测试里靠 sleep
+        对齐既慢又不稳）：
+        ① 三块控件都必须真的绑上处理函数，且调用它就切换状态；
+        ② 还原方向单独测，确认第二次调用能回到未最大化。
+        """
+        window = self._open(JsonParamWindow)
+        rail = window.title_label.master
+        marks = [w for w in rail.winfo_children() if w.winfo_class() == 'Canvas']
+        widgets = [rail, window.title_label, *marks[:1]]
+        self.assertEqual(len(widgets), 3, '顶栏控件结构变了，请同步更新本用例')
+
+        for widget in widgets:
+            self.assertTrue(widget.bind('<Double-Button-1>'),
+                            f'{widget.winfo_class()} 没有绑定双击')
+
+        # 双击处理本身：一次最大化、再一次还原
+        window._maxed = False
+        window._normal_geom = '300x200+80+80'
+        self.assertEqual(window._rail_double(), 'break')
+        self.assertTrue(window._maxed, '第一次双击没有最大化')
+        window._rail_double()
+        self.assertFalse(window._maxed, '第二次双击没有还原')
+
+    # ---------- 拖拽缩放 ----------
+    def test_eight_resize_zones_exist_around_the_window(self):
+        """四边 + 四角共 8 个热区必须都在，且光标形状按边/角区分。"""
+        window = self._open(JsonParamWindow)
+        zones = window._resize_edges
+        self.assertEqual(sorted(zones), ['e', 'n', 'ne', 'nw', 's', 'se', 'sw', 'w'])
+
+        for name in ('n', 's'):
+            self.assertEqual(zones[name].cget('cursor'), 'sb_v_double_arrow',
+                             f'{name} 边光标不是上下箭头')
+        for name in ('w', 'e'):
+            self.assertEqual(zones[name].cget('cursor'), 'sb_h_double_arrow',
+                             f'{name} 边光标不是左右箭头')
+        for name in ('nw', 'se'):
+            self.assertEqual(zones[name].cget('cursor'), 'size_nw_se')
+        for name in ('ne', 'sw'):
+            self.assertEqual(zones[name].cget('cursor'), 'size_ne_sw')
+
+    def test_resize_zones_cover_window_edges(self):
+        """热区必须真的贴在窗口边缘——位置偏了用户就抓不到。
+
+        这是回归守卫：早先只有一个 pack 在底部状态栏里的 14px 抓手，
+        实测位置偏到「右边界内 8px、下边界内 18px」，用户完全抓不着。
+        """
+        window = self._open(JsonParamWindow)
+        window.win.geometry('920x640+420+180')
+        window.win.update()
+
+        w = window.win.winfo_width()
+        h = window.win.winfo_height()
+        zones = window._resize_edges
+
+        self.assertEqual(zones['n'].winfo_y(), 0, '上边热区没有贴住顶沿')
+        self.assertEqual(zones['w'].winfo_x(), 0, '左边热区没有贴住左沿')
+        self.assertEqual(zones['s'].winfo_y() + zones['s'].winfo_height(), h,
+                         '下边热区没有贴住底沿')
+        self.assertEqual(zones['e'].winfo_x() + zones['e'].winfo_width(), w,
+                         '右边热区没有贴住右沿')
+        self.assertEqual((zones['nw'].winfo_x(), zones['nw'].winfo_y()), (0, 0))
+        self.assertEqual((zones['se'].winfo_x() + zones['se'].winfo_width(),
+                          zones['se'].winfo_y() + zones['se'].winfo_height()),
+                         (w, h))
+
+    def test_edge_pixels_actually_hit_the_zone_not_the_shell(self):
+        """边缘像素必须真的落到热区上，不能被外壳 Canvas 抢走。
+
+        **这是不可省的一条**：``shell`` 是 ``pack(fill=both, expand=True)``
+        铺满整窗的 Canvas，热区虽然 place 在它上面，实测未 ``lift()`` 时
+        ``winfo_containing`` 在角上会判成 ``!canvas``（事件落到外壳，热区收
+        不到）——而 ``winfo_x()/winfo_width()`` 那些几何断言全都照常通过，
+        拦不住。必须按「命中归属」判。
+
+        取样点里四角特意取**最靠角的 (1,1) / (w-2,1) / (1,h-2) / (w-2,h-2)**：
+        窗口现在是尖角（``_apply_round_region`` 用 ``CreateRectRgn``），这几个
+        点都有真实像素。若有人把区域裁剪改回 ``CreateRoundRectRgn``，半径 12
+        的扇形会把 (1,1) 一带直接裁掉，``winfo_containing`` 返回 None，
+        这条断言立刻 FAIL —— 它就是「尖角 vs 圆角」的回归守卫。
+        """
+        window = self._open(JsonParamWindow)
+        window.win.geometry('920x640+420+180')
+        window.win.update()
+        window.win.update_idletasks()
+
+        w = window.win.winfo_width()
+        h = window.win.winfo_height()
+        if w < 200 or h < 200:      # 无图形环境下几何没结算，跳过
+            self.skipTest('窗口几何未就绪')
+
+        root_x = window.win.winfo_rootx()
+        root_y = window.win.winfo_rooty()
+        zone_of = {str(z): name for name, z in window._resize_edges.items()}
+
+        def hit_name(x, y):
+            widget = window.win.winfo_containing(root_x + x, root_y + y)
+            return zone_of.get(str(widget)) if widget is not None else None
+
+        probes = {
+            'n': (w // 2, 2),
+            's': (w // 2, h - 3),
+            'w': (2, h // 2),
+            'e': (w - 3, h // 2),
+            # 四角是尖角，整块 12x12 都是真实像素，取**最角上的 (1,1)** 也能命中。
+            # 这一条正是「尖角 vs 圆角」的回归守卫：圆角版本下 (1,1) 落在被
+            # SetWindowRgn 裁掉的扇形外，winfo_containing 返回 None，会直接 FAIL。
+            'nw': (1, 1),
+            'ne': (w - 2, 1),
+            'sw': (1, h - 2),
+            'se': (w - 2, h - 2),
+        }
+        for name, (x, y) in probes.items():
+            with self.subTest(zone=name):
+                self.assertEqual(hit_name(x, y), name,
+                                 f'({x},{y}) 没有落到 {name} 热区')
+
+        # 正文区不能被热区覆盖——否则用户点边框附近的文字会变成改尺寸
+        self.assertIsNone(hit_name(w // 2, h // 2), '窗口中心被热区盖住了')
+        self.assertIsNone(hit_name(w // 2, 20), '顶栏被热区盖住了')
+
+    def _drag_edge(self, window, name, dx, dy):
+        """模拟从某条边/角拖拽，返回窗口几何的实际变化量。"""
+        class _Ev:
+            def __init__(self, x, y):
+                self.x_root, self.y_root = x, y
+
+        before = (window.win.winfo_width(), window.win.winfo_height(),
+                  window.win.winfo_x(), window.win.winfo_y())
+        window._edge_press(_Ev(1000, 600), name)
+        window._edge_move(_Ev(1000 + dx, 600 + dy))
+        window.win.update()
+        after = (window.win.winfo_width(), window.win.winfo_height(),
+                 window.win.winfo_x(), window.win.winfo_y())
+        return tuple(a - b for a, b in zip(after, before))
+
+    def test_each_edge_resizes_along_its_axis(self):
+        """每条边只改它自己那个方向；左/上边还要同步移动原点。
+
+        只改尺寸不改原点是「窗口在飞」而不是「边在动」，所以左边与上边
+        必须让原点反向补偿同样的量（下面期望值里的 -dx）。
+        """
+        cases = (
+            ('e', (100, 0), (100, 0, 0, 0)),
+            ('w', (100, 0), (-100, 0, 100, 0)),
+            ('s', (0, 80), (0, 80, 0, 0)),
+            ('n', (0, 80), (0, -80, 0, 80)),
+            ('se', (60, 40), (60, 40, 0, 0)),
+            ('nw', (-60, -40), (60, 40, -60, -40)),
+            ('ne', (60, -40), (60, 40, 0, -40)),
+            ('sw', (-60, 40), (60, 40, -60, 0)),
+        )
+        for name, (dx, dy), expect in cases:
+            with self.subTest(edge=name):
+                window = self._open(JsonParamWindow)
+                window.win.geometry('920x640+420+180')
+                window.win.update()
+                got = self._drag_edge(window, name, dx, dy)
+                self.assertEqual(got, expect, f'{name} 边缩放方向/原点不对')
+                window.close()
+                self.created.remove(window)
+
+    def test_resize_clamps_to_minimum_without_drifting(self):
+        """缩到下限后继续拖，窗口不能再变小，也不能飘走。
+
+        夹紧时若原点仍按原始 dx 位移（而不是按「实际改掉的宽度」），
+        窗口右边界会跟着左移——用户看到的是窗口一边缩一边飘。
+        """
+        window = self._open(JsonParamWindow)
+        window.win.geometry('920x640+420+180')
+        window.win.update()
+
+        right_before = window.win.winfo_x() + window.win.winfo_width()
+        self._drag_edge(window, 'w', 5000, 0)
+        self.assertEqual(window.win.winfo_width(), MIN_W, '没有夹在最小宽度')
+        self.assertEqual(window.win.winfo_x() + window.win.winfo_width(),
+                         right_before, '夹紧后右边界飘走了')
+
+        self._drag_edge(window, 'n', 0, 5000)
+        self.assertEqual(window.win.winfo_height(), MIN_H, '没有夹在最小高度')
+
+    def test_resize_zones_refuse_while_maximized(self):
+        """最大化时不许改尺寸，且不能拿上一次遗留的起点继续算。
+
+        回归守卫：早先 ``_edge_press`` 在最大化时直接 return 却不清
+        ``_resize_from``，上一次拖拽残留的起点会被随后的 ``<B1-Motion>``
+        当成有效状态，实测最大化窗口一拖就缩成 MIN_W。
+
+        这里**直接置 ``_maxed`` 而不走 ``_toggle_maximize``**——后者自己也会
+        清状态，会把 ``_edge_press`` 里的清理完全掩盖掉（注释掉它测试仍全绿，
+        已实测）。两道防线要能分别守住。
+        """
+        window = self._open(JsonParamWindow)
+        window.win.geometry('920x640+420+180')
+        window.win.update()
+
+        class _Ev:
+            def __init__(self, x, y):
+                self.x_root, self.y_root = x, y
+
+        # ① 按下时必须清掉上次残留的状态
+        window._resize_from = {'edge': 'e', 'x': 0, 'y': 0,
+                               'geom': (920, 640, 420, 180)}
+        window._maxed = True
+        window._edge_press(_Ev(100, 100), 'e')
+        self.assertIsNone(window._resize_from,
+                          '最大化时按下边缘没有清掉缩放状态')
+
+        # ② 即使状态还在，_edge_move 也不能动尺寸（第二道防线）
+        window._resize_from = {'edge': 'e', 'x': 1000, 'y': 600,
+                               'geom': (920, 640, 420, 180)}
+        maxed_w = window.win.winfo_width()
+        window._edge_move(_Ev(2000, 600))
+        window.win.update()
+        self.assertEqual(window.win.winfo_width(), maxed_w,
+                         '最大化窗口被拖动了尺寸')
+        window._maxed = False
+
+    def test_grip_is_decorative_not_the_only_entry(self):
+        """右下角抓手仍在（视觉提示），但八向热区才是真正的缩放入口。"""
+        window = self._open(JsonParamWindow)
+        canvases = [w for w in self._descendants(window.win)
+                    if isinstance(w, tk.Canvas) and w.cget('cursor') == 'size_nw_se']
+        self.assertTrue(canvases, '右下角缩放抓手不见了')
+        # 抓手自身也接了事件，保证手指正好落在那 14px 上时仍可拖
+        grip = [c for c in canvases if c.master is not window._resize_edges['se']]
+        self.assertTrue(grip, '抓手没有挂在状态栏上')
+        self.assertTrue(grip[0].bind('<B1-Motion>'), '抓手没有绑定拖拽')
 
     def test_restoring_from_minimize_keeps_geometry_and_chrome(self):
         """还原后尺寸不能变、无边框必须回来——取消边框期间 WM 会把窗口撑大。"""
@@ -566,6 +814,134 @@ class ToolWindowTests(unittest.TestCase):
         self.created += [json_window, jwt_window]
         self.assertIsInstance(json_window, JsonParamWindow)
         self.assertIsInstance(jwt_window, JwtWindow)
+
+    # ---------- ESC = 最小化到任务栏 ----------
+    def test_escape_minimizes_instead_of_closing(self):
+        """工具弹框的 ESC 必须是**最小化**，不是关闭。
+
+        用户原话：「现在按 ESC 键剪贴板和弹框都是直接关闭了，改成最小化到
+        任务栏」。关闭仍走顶栏那个叉（``close()``）。
+
+        **判据不能用 ``winfo_viewable()``**：最小化后它也会变成 0，与隐藏
+        分不开，必须用 ``IsIconic``。
+        """
+        window = self._open(JsonParamWindow)
+        self.assertFalse(window.is_minimized())
+
+        # **必须真的按键**，不能直接调 ``window.escape()``——那样只测到方法体，
+        # 测不到绑定有没有改对。反向验证时把绑定改回 ``close()``，只调方法的
+        # 写法依然全绿，等于没守住。
+        window.win.focus_force()
+        window.win.update()
+        window.win.event_generate('<Escape>')
+        window.win.update()
+        time.sleep(0.35)
+        window.win.update()
+
+        self.assertFalse(window._closed, 'ESC 把窗口销毁了，应该是最小化')
+        self.assertTrue(window.win.winfo_exists(), 'ESC 后窗口被销毁')
+        self.assertTrue(window.is_minimized(),
+                        'ESC 后没有最小化到任务栏')
+
+    def test_escape_binding_targets_escape_not_close(self):
+        """绑定本身必须指向 ``escape``，不能退回 ``close``。
+
+        与上一条互补：上一条测行为（真按键），这条直接查绑定表，即使某天
+        事件投递在无焦点环境下失效，也不会让「ESC 又变回关闭」悄悄回归。
+        """
+        window = self._open(JsonParamWindow)
+        bound = window.win.bind('<Escape>')
+        self.assertTrue(bound, 'ESC 没有绑定任何处理链')
+        # 绑定串里出现的是被调方法的 Tcl 命令名，形如
+        # ``... if {"[<bound method ...>]" == "break"} break``。
+        # 直接触发一次，验证它确实走到最小化而非销毁。
+        before_exists = bool(window.win.winfo_exists())
+        window.win.event_generate('<Escape>')
+        window.win.update()
+        time.sleep(0.3)
+        window.win.update()
+        self.assertTrue(before_exists)
+        self.assertFalse(window._closed, 'ESC 绑定走到了 close，应该是最小化')
+
+    def test_escape_keeps_taskbar_flags_and_icon(self):
+        """最小化期间任务栏归属不能丢，否则用户点不回来。"""
+        window = self._open(JsonParamWindow)
+        window.win.update()
+        hwnd_before = taskbar.top_level_hwnd(window.win)
+        ex_before = taskbar.read_style(hwnd_before, taskbar.GWL_EXSTYLE)
+        icons_before = _icon_slots(hwnd_before)
+
+        window.escape()
+        window.win.update()
+        time.sleep(0.35)
+        window.win.update()
+
+        self.assertEqual(taskbar.top_level_hwnd(window.win), hwnd_before,
+                         'ESC 最小化后 HWND 变了 → 任务栏按钮与图标会丢')
+        self.assertEqual(
+            taskbar.read_style(hwnd_before, taskbar.GWL_EXSTYLE), ex_before,
+            'ESC 最小化后扩展样式变了')
+        self.assertEqual(_icon_slots(hwnd_before), icons_before,
+                         'ESC 最小化后任务栏图标丢了')
+
+    def test_summon_restores_minimized_tool_window(self):
+        """``summon`` 能把最小化窗口唤回；``SW_SHOW`` 对最小化是无效的。"""
+        window = self._open(JsonParamWindow)
+        window.escape()
+        window.win.update()
+        time.sleep(0.35)
+        window.win.update()
+        self.assertTrue(window.is_minimized())
+
+        self.assertTrue(window.summon())
+        window.win.update()
+        time.sleep(0.4)
+        window.win.update()
+
+        self.assertFalse(window.is_minimized(), 'summon 没把窗口唤回来')
+        self.assertTrue(window.win.winfo_viewable(), '唤回后仍不可见')
+
+    # ---------- 单实例：ESC 最小化之后最容易踩的坑 ----------
+    def test_open_tool_reuses_minimized_window_instead_of_duplicating(self):
+        """同一工具只能有一个窗口实例。
+
+        ESC 改成最小化之后这条变关键了：最小化的窗口仍挂在任务栏上，若再从
+        工具菜单点一次就新建第二个，用户会看到两个同名窗口、各存着一份输入。
+        正确行为是**唤回原实例**。
+        """
+        first = self._open(JsonParamWindow)
+        first.input.insert('1.0', '{"a":1}')
+        first.escape()
+        first.win.update()
+        time.sleep(0.3)
+        first.win.update()
+        self.assertTrue(first.is_minimized())
+
+        second = open_tool(self.panel, 'json')
+        self.created.append(second)
+        second.win.update()
+        time.sleep(0.35)
+        second.win.update()
+
+        self.assertIs(second, first, '重复打开了第二个 JSON 窗口')
+        self.assertFalse(second.is_minimized(), '复用时应把原窗口唤回')
+        self.assertIn('{"a":1}', second.input.get('1.0', 'end'),
+                      '唤回后原有输入内容丢了')
+
+    def test_open_tool_creates_fresh_window_after_close(self):
+        """点叉关掉之后必须能重新开一个——不能复用已销毁的实例。"""
+        first = self._open(JsonParamWindow)
+        key = 'json'
+        self.assertIn(key, getattr(self.panel, '_tool_windows', {}))
+        first.close()
+        first.win.update()
+        self.assertNotIn(key, getattr(self.panel, '_tool_windows', {}),
+                         'close() 后没从实例表里摘掉，会留下悬空引用')
+
+        second = open_tool(self.panel, 'json')
+        self.created.append(second)
+        self.assertIsNot(second, first, '关闭后重开拿到了已销毁的旧实例')
+        self.assertTrue(second.win.winfo_exists())
 
     def test_text_widgets_use_light_foreground_on_dark_background(self):
         """深色主题下前景必须为浅色，否则文字不可见。"""

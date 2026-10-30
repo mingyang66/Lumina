@@ -231,7 +231,7 @@ class HistoryPanel:
         self._search_focus_check = None
 
         self.win.bind("<F5>", lambda e: self.refresh())
-        self.win.bind("<Escape>", lambda e: self.hide())
+        self.win.bind("<Escape>", lambda e: self.escape())
         self.win.bind("<Delete>", lambda e: (self.delete_selected(), "break")[1])
         self.win.bind("<Control-p>", lambda e: (self.toggle_pin(), "break")[1])
         self.win.bind("<Control-P>", lambda e: (self.toggle_pin(), "break")[1])
@@ -947,14 +947,29 @@ class HistoryPanel:
         except Exception:
             return False
 
+    def is_minimized(self):
+        """窗口当前是否最小化在任务栏里（不是隐藏、也不是关闭）。
+
+        最小化后 ``winfo_viewable()`` 会变成 0，所以 ``is_visible()`` 判不出
+        「用户还能从任务栏点回来」这件事，必须有独立的判定。
+        """
+        return taskbar.is_minimized(self.win)
+
     def show(self, prev_hwnd=None, position=None, topmost=None):
         self._sync_theme()
         self._prev_hwnd = prev_hwnd
-        self.apply_mode()  # 重设边框/尺寸/位置并刷新
+        # 从最小化还原时**不能走 apply_mode 的重新居中**：那会按屏幕尺寸重算
+        # 几何，把用户上次摆的位置（以及最大化状态）冲掉。SW_RESTORE 本身就会
+        # 回到最小化前的几何，直接显示即可。
+        restoring = self.is_minimized()
+        if not restoring:
+            self.apply_mode()  # 重设边框/尺寸/位置并刷新
         if topmost is not None:
             self.win.attributes("-topmost", bool(topmost))
         # 走 Win32 ShowWindow 而不是 deiconify：Tk 的映射流程会重新应用
         # overrideredirect 对应的扩展样式，可能把 WS_EX_TOOLWINDOW 打回来。
+        # show_window 内部会判 IsIconic，最小化时自动改用 SW_RESTORE——
+        # 实测 SW_SHOW 对最小化窗口完全无效，窗口会留在任务栏回不来。
         if not taskbar.show_window(self.win):
             self.win.deiconify()
         self.win.lift()
@@ -2085,6 +2100,11 @@ class HistoryPanel:
         title_bar.pack_propagate(False)
         title_bar.bind("<ButtonPress-1>", self._hdr_press)
         title_bar.bind("<B1-Motion>", self._hdr_move)
+        title_bar.bind("<Double-Button-1>", self._hdr_double)
+        # 双击标题栏切换最大化/还原，与 Windows 原生行为一致。
+        # **必须绑在标题栏容器上**：Tk 的 Double 事件是「同一点短时间内两次
+        # press」，只有真正收到第一次 press 的控件才会转发第二次；标题栏里的
+        # 空白区域由容器自己接收，所以绑容器就能覆盖整条顶栏的空隙。
         tk.Label(title_bar, text="Lumina", bg=win_bg, fg=T["accent"],
                  font=("Segoe UI", max(13, int(round(14 * dpi))), "bold"),
                  anchor="w").pack(side="left", padx=(10, 14))
@@ -2609,6 +2629,17 @@ class HistoryPanel:
         self._drag_off = (e.x_root - self.win.winfo_x(),
                           e.y_root - self.win.winfo_y())
 
+    def _hdr_double(self, _event=None):
+        """双击标题栏切换最大化/还原（Windows 原生习惯）。
+
+        最大化之后不能再拖动——原生窗口最大化时拖动标题栏是「取消最大化并跟随
+        鼠标」，实现成本高且容易抖动，这里直接清掉拖动锚点，避免二次最大化的
+        窗口被误拖走。
+        """
+        self._drag_off = None
+        self._toggle_maximize()
+        return "break"
+
     def _resize_edges(self, e):
         """Return the window edges under the pointer (n/s/e/w)."""
         if self._maxed:
@@ -2994,12 +3025,30 @@ class HistoryPanel:
         """
         self._min_geom = self.win.wm_geometry()
         if taskbar.minimize_window(self.win):
+            # 最小化后窗口已不可见（实测 ``winfo_viewable()`` 由 1 变 0），
+            # 可见性提示必须同步更新：否则截图前「隐藏面板」那一步会以为面板
+            # 还开着，托盘勾选状态也会骗人。
+            self.ui.panel_visible = False
             return
         # Win32 不可用（非 Windows 或调用失败）就退回 Tk，至少窗口还能用
         try:
             self.win.withdraw()
         except self.tk.TclError:
             pass
+        self.ui.panel_visible = False
+
+    def escape(self):
+        """ESC：最小化到任务栏（不再是关闭/隐藏）。
+
+        用户原话：「现在按 ESC 键剪贴板和弹框都是直接关闭了，改成最小化到
+        任务栏」。举止与顶栏那个最小化按钮完全一致，所以直接复用
+        ``_minimize``，不另写一套。
+
+        约定：*关闭* 仍是 ``close()``（进程退出），*隐藏* 仍是 ``hide()``
+        （供截图前临时让位、热键切换），三者语义不要混。
+        """
+        self._minimize()
+        return "break"
 
     def _restore_chrome(self):
         """从最小化还原（``SW_RESTORE``），不碰 ``overrideredirect``。

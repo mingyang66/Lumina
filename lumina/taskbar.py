@@ -155,6 +155,21 @@ def show_window(window, activate=True):
     Tk 的 ``deiconify()`` 会重新应用 ``overrideredirect`` 对应的扩展样式，把
     ``WS_EX_TOOLWINDOW`` 打回去；``ShowWindow`` 不碰样式，故窗口的样式与图标
     在显隐之间保持不变。
+
+    **窗口处于最小化状态时必须用 ``SW_RESTORE`` 而不是 ``SW_SHOW``。**
+    实测（无边框 Toplevel，``ShowWindow(SW_MINIMIZE)`` 之后）：
+
+    ====================  ==================  ================
+    调用的 API             ``IsIconic``        ``winfo_viewable``
+    ====================  ==================  ================
+    （最小化后）           True                0
+    ``SW_SHOW``/``SW_SHOWNA``  **True（无效）**  0
+    ``SW_RESTORE``         False               1
+    ====================  ==================  ================
+
+    也就是说 ``SW_SHOW`` 对最小化窗口**完全唤不回来**——窗口还挂在任务栏上
+    但永远不会回到屏幕。ESC 改成「最小化」之后这条路径就成了主入口，必须走
+    ``SW_RESTORE``。
     """
     hwnd = top_level_hwnd(window)
     if not hwnd:
@@ -163,8 +178,14 @@ def show_window(window, activate=True):
         user32 = ctypes.windll.user32
         user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
         user32.ShowWindow.restype = ctypes.c_bool
-        ok = user32.ShowWindow(ctypes.c_void_p(hwnd),
-                               SW_SHOW if activate else 8)  # 8 = SW_SHOWNA
+        # 先判最小化：IsIconic 为真时 SW_SHOW 无效，必须 SW_RESTORE。
+        user32.IsIconic.argtypes = [ctypes.c_void_p]
+        user32.IsIconic.restype = ctypes.c_bool
+        if user32.IsIconic(ctypes.c_void_p(hwnd)):
+            ok = user32.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
+        else:
+            ok = user32.ShowWindow(ctypes.c_void_p(hwnd),
+                                   SW_SHOW if activate else 8)  # 8 = SW_SHOWNA
         # 显示后补一次归属：万一别处翻转过 overrideredirect，这里能兜住
         claim_taskbar(window)
         return bool(ok)

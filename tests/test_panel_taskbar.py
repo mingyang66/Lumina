@@ -224,6 +224,36 @@ class PanelTaskbarTests(unittest.TestCase):
         self.assertNotEqual(self._hicon(), 0,
                             '任务栏没有图标（WM_GETICON 为 0）')
 
+    # ---------- 双击顶栏最大化 ----------
+    def test_double_click_title_bar_toggles_maximize(self):
+        """双击标题栏必须切换最大化/还原（Windows 原生习惯）。
+
+        标题栏里除了几个按钮还有大片空白，点空白时 ``<ButtonPress-1>`` 由容器
+        ``title_bar`` 自己接收，所以 ``<Double-Button-1>`` 绑在容器上即可。
+
+        验证方式分两段，不依赖 Tk 的连击计时（阈值 500ms，靠 sleep 对齐既慢
+        又不稳）：先确认容器真的绑了处理函数，再直接调用它验证方向正确。
+        """
+        # 从标题栏按钮反查容器，避免依赖内部属性名
+        title_bar = self.panel._settings_btn.master
+        self.assertTrue(title_bar.bind('<Double-Button-1>'),
+                        '标题栏没有绑定双击')
+
+        self.panel._maxed = False
+        self.panel._normal_geom = '800x600+60+60'
+        self.assertEqual(self.panel._hdr_double(), 'break')
+        self.assertTrue(self.panel._maxed, '第一次双击没有最大化')
+        self.panel._hdr_double()
+        self.assertFalse(self.panel._maxed, '第二次双击没有还原')
+
+    def test_double_click_clears_drag_anchor(self):
+        """双击后必须清掉拖动锚点，否则最大化窗口会被后续拖动带偏。"""
+        self.panel._drag_off = (123, 456)
+        self.panel._hdr_double()
+        self.assertIsNone(self.panel._drag_off,
+                          '双击后拖动锚点还在，最大化窗口会被拖走')
+        self.panel._maxed = False
+
     # ---------- 任务栏归属 ----------
     def test_panel_claims_taskbar_instead_of_toolwindow(self):
         """无边框窗口必须带 WS_EX_APPWINDOW，否则不进任务栏。
@@ -377,6 +407,114 @@ class PanelTaskbarTests(unittest.TestCase):
                          '唤回后任务栏标志变了，再次最小化就找不回来')
         self.assertEqual(_icon_slots(hwnd_before), icons_before,
                          '唤回后图标变了')
+
+    # ---------- ESC = 最小化到任务栏 ----------
+    def test_escape_minimizes_instead_of_hiding(self):
+        """ESC 必须是**最小化**，不是隐藏，也不是关闭。
+
+        用户原话：「现在按 ESC 键剪贴板和弹框都是直接关闭了，改成最小化到
+        任务栏」。三条语义要分清：
+
+        * 最小化 → 窗口留在任务栏，能点回来（ESC 走这条）
+        * 隐藏 → 从任务栏彻底消失（``hide``，截图前让位用）
+        * 关闭 → 销毁窗口（``close``）
+
+        判据是 ``IsIconic`` 为真，而**不能**用 ``winfo_viewable()``——
+        最小化后它也会变成 0，和隐藏分不开。
+
+        用例走**真实按键**而非直接调 ``self.panel.escape()``：后者只测方法体，
+        绑定改回 ``hide()`` 也照样全绿（反向验证时确认过）。
+        """
+        self.assertTrue(self.panel.is_visible())
+        self.assertFalse(self.panel.is_minimized())
+
+        self.panel.win.focus_force()
+        self._pump(0.1)
+        self.panel.win.event_generate('<Escape>')
+        self._pump(0.35)
+
+        self.assertTrue(self.panel.is_minimized(),
+                        'ESC 后窗口没有最小化到任务栏')
+        self.assertEqual(str(self.panel.win.state()), 'iconic',
+                         'ESC 后不是 iconic —— 可能走成了 hide/withdraw')
+        self.assertFalse(self.panel.is_visible(),
+                         'ESC 后 winfo_viewable 仍为真，与最小化的实测行为不符')
+
+    def test_escape_keeps_window_alive_and_in_taskbar(self):
+        """最小化不能丢任务栏归属：HWND、扩展样式、图标都要原样。"""
+        hwnd_before = self.panel._taskbar_hwnd()
+        ex_before = self._exstyle()
+        icons_before = _icon_slots(hwnd_before)
+
+        self.panel.escape()
+        self._pump(0.35)
+
+        self.assertEqual(self.panel._taskbar_hwnd(), hwnd_before,
+                         'ESC 最小化后 HWND 变了 → 任务栏按钮会消失')
+        self.assertEqual(self._exstyle(), ex_before,
+                         'ESC 最小化后扩展样式变了')
+        self.assertEqual(_icon_slots(hwnd_before), icons_before,
+                         'ESC 最小化后任务栏图标丢了')
+
+    def test_escape_updates_panel_visible_flag(self):
+        """``ui.panel_visible`` 必须跟着变 False。
+
+        最小化后窗口真的看不见了（``winfo_viewable`` 为 0）。若这个跨线程
+        标志还停在 True，截图前的「隐藏面板」会以为面板开着、托盘勾选状态
+        也会骗人。
+        """
+        # setUp 里只 deiconify 了，没走 show()，panel_visible 仍是初始 False。
+        # 要测「最小化把它翻回 False」，得先让它为 True。
+        self.panel.show(None)
+        self._pump(0.2)
+        self.assertTrue(self.panel.ui.panel_visible, '前置条件：show() 后应为 True')
+        self.panel.escape()
+        self._pump(0.3)
+        self.assertFalse(self.panel.ui.panel_visible,
+                         'ESC 最小化后 panel_visible 仍为 True')
+
+    def test_show_restores_minimized_window_via_restore_not_show(self):
+        """唤回最小化窗口必须用 ``SW_RESTORE``，``SW_SHOW`` 是无效的。
+
+        实测（无边框 Toplevel）：``SW_MINIMIZE`` 之后调 ``SW_SHOW``，``IsIconic``
+        仍为 True、``winfo_viewable`` 仍为 0——窗口挂在任务栏上永远回不来。
+        这条是 ESC 改成最小化之后**最容易踩**的坑：只改 ESC 不修 ``show_window``
+        的话，按一下 ESC 就再也唤不回来了。
+        """
+        self.panel.escape()
+        self._pump(0.35)
+        self.assertTrue(self.panel.is_minimized())
+
+        self.panel.show(None)
+        self._pump(0.4)
+
+        self.assertFalse(self.panel.is_minimized(),
+                         'show() 没能把最小化窗口唤回 —— SW_SHOW 对最小化无效，'
+                         '必须走 SW_RESTORE')
+        self.assertTrue(self.panel.is_visible(), '唤回后窗口仍不可见')
+        self.assertTrue(self.panel.ui.panel_visible,
+                        '唤回后 panel_visible 没恢复成 True')
+
+    def test_show_after_minimize_keeps_maximized_geometry(self):
+        """「最大化 → ESC → 唤回」必须回来还是最大化，不能被重新居中。
+
+        ``show()`` 原本无条件调 ``apply_mode()``，它会按屏幕尺寸重算几何并把
+        窗口摆回正中。最小化还原时这属于多余动作，实测把 ``1920x1032`` 冲成
+        ``1160x720``。所以 ``show()`` 里要先判 ``is_minimized()`` 再决定是否
+        ``apply_mode()``。
+        """
+        self.panel._toggle_maximize()
+        self._pump(0.3)
+        maxed = self.panel.win.wm_geometry()
+        self.assertTrue(maxed.startswith('1920'), f'没进入最大化：{maxed}')
+
+        self.panel.escape()
+        self._pump(0.35)
+        self.panel.show(None)
+        self._pump(0.4)
+
+        self.assertEqual(self.panel.win.wm_geometry(), maxed,
+                         'ESC 往返后最大化几何被 apply_mode 冲掉了')
 
 
 if __name__ == '__main__':
