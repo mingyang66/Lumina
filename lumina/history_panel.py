@@ -16,8 +16,19 @@ from .json_modes import ACTION_LABELS, ESCAPE_JAVA_NOTICE, MODE_LABELS, build_me
 
 
 class HistoryPanel:
-    COMPACT_W = 1160
-    COMPACT_H = 720
+    # 默认窗口尺寸（逻辑像素，实际会乘 DPI 缩放）。
+    # 1160x720 → 1360x840：占 1920x1032 工作区从 60%x70% 提到 71%x81%，
+    # 左右栏各宽约 76px，列表不必那么挤，详情区读长文本也不用频繁滚动。
+    # **上限由 apply_mode 按工作区（不是整屏）兜底**，见那里的注释。
+    COMPACT_W = 1360
+    COMPACT_H = 840
+    # 允许 config.json 覆盖（键名见 _resolve_window_size）。
+    # 留空/缺省即用上面的默认值；非法值一律回落，不让配置错误把窗口撑爆。
+    SIZE_CFG_KEYS = ("panel_width", "panel_height")
+    # 配置可覆盖尺寸的硬下限：双栏要放得下左栏 400 + 详情 380 + 分隔与内边距。
+    # 低于这个值布局会被挤扁（左栏撑不住标题、详情区横向滚动条常驻）。
+    MIN_PANEL_W = 880
+    MIN_PANEL_H = 520
     TRANS_COLOR = "#010203"
     FILTERS: ClassVar[tuple] = (
         ("all", "全部"), ("text", "文本"), ("code", "代码"),
@@ -2285,6 +2296,62 @@ class HistoryPanel:
             pass
 
     # ---------- 面板 UI 构建（Ditto 风格卡片拾取器） ----------
+    def _window_size_limits(self):
+        """返回 (可用宽, 可用高, 工作区 x, 工作区 y)，单位为物理像素。
+
+        **高度必须按「工作区」而不是「整屏」算**：整屏高含任务栏，按它兜底
+        会把窗口底边塞到任务栏底下（1366x768 上工作区约 720，整屏 768）。
+        用户实测环境 1920x1080 的任务栏占 48px。
+        """
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        area = self._work_area()
+        if area:
+            ax, ay, aw, ah = area
+        else:
+            ax, ay, aw, ah = 0, 0, sw, sh
+        # 工作区偶尔会报出 0 或负数（远程桌面/多屏未就绪），退整屏
+        if aw <= 0 or ah <= 0:
+            ax, ay, aw, ah = 0, 0, sw, sh
+        return aw, ah, ax, ay
+
+    def _resolve_window_size(self, dpi):
+        """算出窗口的初始宽高：配置覆盖 → 默认值 → 按工作区夹紧。
+
+        配置里的键是 ``panel_width`` / ``panel_height``（逻辑像素，
+        与默认值同单位，会再乘 DPI）。**非法值静默回落默认**，不抛错：
+        配置文件是用户手改的，一个拼错的键不该让面板打不开。
+        """
+        cfg = getattr(self.ui, 'config', None) or {}
+        base_w, base_h = self.COMPACT_W, self.COMPACT_H
+        for idx, key in enumerate(self.SIZE_CFG_KEYS):
+            try:
+                raw = cfg.get(key)
+            except Exception:
+                continue
+            if raw in (None, ''):
+                continue
+            try:
+                val = int(float(raw))
+            except (TypeError, ValueError):
+                continue
+            # **太小的值会把双栏布局压塌**：左栏最小 LEFT_MIN=400、详情最小
+            # DETAIL_MIN=380，加上分隔与内边距要 850 才不挤。所以下限取
+            # 「默认值的一半」只能挡住一部分，还必须再跟这个硬下限取大。
+            # 上限取默认值两倍，避免一个手滑的 0 把窗口撑到离谱。
+            if idx == 0:
+                lo = max(self.MIN_PANEL_W, self.COMPACT_W // 2)
+                base_w = max(lo, min(val, self.COMPACT_W * 2))
+            else:
+                lo = max(self.MIN_PANEL_H, self.COMPACT_H // 2)
+                base_h = max(lo, min(val, self.COMPACT_H * 2))
+
+        aw, ah, _ax, _ay = self._window_size_limits()
+        w = int(round(base_w * dpi))
+        h = int(round(base_h * dpi))
+        # 夹到工作区：留 0 余量即可，因为居中是按工作区算的，贴边不会越过任务栏
+        return min(w, aw), min(h, ah)
+
     def _build_compact(self):
         tk = self.tk
         try:
@@ -2292,8 +2359,8 @@ class HistoryPanel:
         except Exception:
             dpi = 1.0
         self._dpi = dpi
-        self._cw = int(round(self.COMPACT_W * dpi))
-        self._ch = int(round(self.COMPACT_H * dpi))
+        bound_w, bound_h = self._resolve_window_size(dpi)
+        self._cw, self._ch = bound_w, bound_h
 
         # 圆角由 Windows 原生窗口区域裁剪，Canvas 只负责绘制背景和边框。
         self._bg_canvas = tk.Canvas(self.win, bg=self._c("window_bg"),
@@ -3353,15 +3420,11 @@ class HistoryPanel:
         self._bg_canvas.pack(fill="both", expand=True)
         self._cmp_root.place(x=8, y=8, relwidth=1.0, relheight=1.0,
                              width=-16, height=-16)
-        sw = self.win.winfo_screenwidth()
-        sh = self.win.winfo_screenheight()
-        w = min(self._cw, sw)
-        h = min(self._ch, sh)
-        work_area = self._work_area()
-        if work_area:
-            area_x, area_y, area_w, area_h = work_area
-        else:
-            area_x, area_y, area_w, area_h = 0, 0, sw, sh
+        # 居中与夹紧都用**工作区**，不用整屏：整屏高含任务栏，按它算会让窗口
+        # 底边落到任务栏底下（1366x768 上尤其明显）。
+        area_w, area_h, area_x, area_y = self._window_size_limits()
+        w = min(self._cw, area_w)
+        h = min(self._ch, area_h)
         x = area_x + max(0, (area_w - w) // 2)
         y = area_y + max(0, (area_h - h) // 2)
         self.win.geometry(f"{w}x{h}+{x}+{y}")
