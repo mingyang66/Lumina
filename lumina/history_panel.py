@@ -1364,7 +1364,7 @@ class HistoryPanel:
         fn()
 
     def _open_tool_window(self, key):
-        """打开顶栏工具窗口（JSON 参数 / JWT 解析）。
+        """打开顶栏工具窗口（JSON 格式化 / JWT 解密）。
 
         工具窗口是独立 Toplevel，不写剪贴板历史、不改数据库；关掉即释放。
         """

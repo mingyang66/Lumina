@@ -19,7 +19,6 @@ from lumina.jwt_tools import (  # noqa: E402
     strip_wrapping,
     summarize_claims,
 )
-from lumina.tool_window import _field_summary  # noqa: E402
 
 
 def b64(obj):
@@ -151,39 +150,26 @@ class EpochFormatTests(unittest.TestCase):
 
 
 class FieldSummaryTests(unittest.TestCase):
-    """JSON 参数工具的字段结构摘要。"""
+    """字段结构摘要已被移除，不得再出现在结果里。
 
-    def _pretty(self, obj):
-        return json.dumps(obj, ensure_ascii=False, indent=2)
+    原先 ``tool_window._field_summary`` 会把 JSON 摊平成
+    ``a.b[0] : 字符串 = 'x'`` 这样的清单追加在格式化结果末尾。用户要求去掉
+    （「JSON格式化右侧的字段结构就不要了去掉」），实现与函数一并删除。
 
-    def test_nested_paths_are_flattened(self):
-        summary = _field_summary(self._pretty(
-            {'user': {'name': '张三', 'age': 30}}))
-        self.assertIn('user.name : 字符串', summary)
-        self.assertIn('user.age : 数字', summary)
+    这里**保留为源码级守卫**而不是整类删掉：纯行为断言（「输出里不含『字段
+    结构』」）拦不住有人把函数重新加回来但暂未接上调用点，下次顺手接上就回退了。
+    """
 
-    def test_array_shows_first_element_and_count(self):
-        summary = _field_summary(self._pretty({'ids': [1, 2, 3]}))
-        self.assertIn('ids[0] : 数字', summary)
-        self.assertIn('ids : 共 3 项', summary)
+    SOURCE = Path(__file__).resolve().parent.parent / 'lumina' / 'tool_window.py'
 
-    def test_single_element_array_omits_count(self):
-        summary = _field_summary(self._pretty({'ids': [1]}))
-        self.assertIn('ids[0] : 数字', summary)
-        self.assertNotIn('共 1 项', summary)
+    def test_field_summary_helper_is_gone(self):
+        self.assertNotIn('_field_summary', self.SOURCE.read_text(encoding='utf-8'),
+                         '字段结构摘要的辅助函数被加回来了')
 
-    def test_null_and_bool_types(self):
-        summary = _field_summary(self._pretty({'a': None, 'b': True}))
-        self.assertIn('a : null', summary)
-        self.assertIn('b : bool', summary)
-
-    def test_empty_containers(self):
-        summary = _field_summary(self._pretty({'o': {}, 'a': []}))
-        self.assertIn('o : 空对象', summary)
-        self.assertIn('a : 空数组', summary)
-
-    def test_root_scalar(self):
-        self.assertIn('字符串', _field_summary(self._pretty('hi')))
+    def test_field_summary_no_longer_importable(self):
+        import lumina.tool_window as tool_window
+        self.assertFalse(hasattr(tool_window, '_field_summary'),
+                         'tool_window 仍导出 _field_summary')
 
 
 if __name__ == '__main__':

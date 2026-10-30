@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 from lumina import taskbar  # noqa: E402
 from lumina.history_panel import HistoryPanel  # noqa: E402
 from lumina.tool_window import (  # noqa: E402
+    JSON_MODE_LABELS,
     MIN_H,
     MIN_W,
     TOOLS,
@@ -740,19 +741,26 @@ class ToolWindowTests(unittest.TestCase):
         natives = [w for w in collect(window.win)
                    if isinstance(w, tk.Scrollbar)]
         self.assertEqual(natives, [])
-        # 输入框折行后横向永不溢出，只留纵向自绘细条；结果框不折行，两条都在。
+        # 两侧都折行、横向永不溢出，所以两侧都只留纵向一条自绘细条。
         self.assertEqual(len(window.input._mini_scrolls), 1)
-        self.assertEqual(len(window.output._mini_scrolls), 2)
+        self.assertEqual(len(window.output._mini_scrolls), 1)
 
-    def test_input_wraps_at_width_so_no_horizontal_scroll(self):
-        """左侧输入必须占满宽度就换行，长行不能横向溢出。
+    def test_both_panes_wrap_long_lines(self):
+        """左右两侧都必须超宽自动换行，且**行为一致**。
 
-        原来 ``wrap="none"``，一整行压缩 JSON 会远远超出框宽，用户只能左右拖
-        才能看到行尾。左侧是**输入区**，看得全比列对齐重要，改成按字符折行。
+        用户原话：「工具弹框右侧和左侧如果超过当前长度自动换行，右侧和左侧保持
+        一致」。早先右栏是 ``wrap="none"`` + 横向滚动条（理由是保护缩进列对齐），
+        用户明确要求放弃那个取舍。
         """
         window = self._open(JsonParamWindow)
         self.assertEqual(str(window.input.cget('wrap')), 'char',
                          '左侧输入框没有开启折行')
+        self.assertEqual(str(window.output.cget('wrap')), 'char',
+                         '右侧结果框没有开启折行，与左侧不一致')
+
+    def test_input_wraps_at_width_so_no_horizontal_scroll(self):
+        """左侧输入必须占满宽度就换行，长行不能横向溢出。"""
+        window = self._open(JsonParamWindow)
 
         long_json = '{"' + 'a' * 400 + '": 1}'
         self._type(window, long_json)
@@ -772,10 +780,77 @@ class ToolWindowTests(unittest.TestCase):
         self.assertEqual(window.input.get('1.0', 'end-1c'), long_json,
                          '折行把换行符写进了实际内容')
 
-    def test_output_keeps_lines_unwrapped(self):
-        """右侧结果不折行：结构化输出强行折行会毁掉缩进层级与列对齐。"""
+    def test_output_wraps_long_lines_without_horizontal_overflow(self):
+        """右侧同样不横向溢出——不能靠拖横向滚动条才能看到行尾。
+
+        断言用 ``xview`` 到达 1.0 而不是只看 ``wrap`` 配置：只断言配置的话，
+        将来有人把 ``wrap`` 改回 ``none`` 但保留 ``xscrollcommand``，配置断言
+        会废话式通过/失败，而真正要守的是「行尾看得见」。
+        """
         window = self._open(JsonParamWindow)
-        self.assertEqual(str(window.output.cget('wrap')), 'none')
+        long_value = '{"stack":"' + 'x' * 400 + '"}'
+        self._type(window, long_value)
+        window.win.update()
+
+        first, last = window.output.xview()
+        self.assertAlmostEqual(first, 0.0, places=3)
+        self.assertAlmostEqual(last, 1.0, places=3,
+                               msg='右侧结果仍横向溢出，行尾看不见')
+
+        display_lines = window.output.count('1.0', 'end', 'displaylines')
+        self.assertTrue(display_lines)
+        self.assertGreater(int(display_lines[0]), 1, '右侧超长行没有折行')
+
+    def test_both_panes_have_identical_width(self):
+        """两栏正文宽度必须**完全相等**，否则同样文本在两栏折在不同位置。
+
+        原先右栏用 ``padx=(GAP, 0)`` 让缝隙，导致右栏窄 10px（实测 440 vs 430）。
+        实测 60 个字符的字符串：左栏 1 屏行、右栏 2 屏行——正是用户说的「不一致」。
+        改成两栏各让一半缝隙后 435/435。
+        """
+        window = self._open(JsonParamWindow)
+        window.win.update()
+        self.assertEqual(window.input.winfo_width(), window.output.winfo_width(),
+                         f'两栏宽度不等：左 {window.input.winfo_width()} '
+                         f'/ 右 {window.output.winfo_width()}')
+
+    def test_both_panes_wrap_at_the_same_column(self):
+        """同一段文本在两栏必须折在**同一处**——逐长度扫描，不允许任何一处分歧。
+
+        只比对一次 ``displaylines`` 不够：宽度差 10px 时，多数长度看起来一致，
+        只有恰好跨过那 10px 的少数长度会分歧（实测 n=60 时左 1 行、右 2 行）。
+        所以这里连续扫描一串长度，任何一处不同都算失败。
+        """
+        window = self._open(JsonParamWindow)
+        window.win.update()
+        for n in range(40, 121, 4):
+            with self.subTest(length=n):
+                window.input.delete('1.0', 'end')
+                window.input.insert('1.0', 'x' * n)
+                window._restore_original()
+                window.win.update()   # displaylines 要跑一轮事件循环才算得准
+                in_lines = int(window.input.count(
+                    '1.0', 'end', 'displaylines')[0])
+                out_lines = int(window.output.count(
+                    '1.0', 'end', 'displaylines')[0])
+                self.assertEqual(
+                    in_lines, out_lines,
+                    f'{n} 个字符时两侧折行不一致：左 {in_lines} 屏行 / 右 {out_lines} 屏行')
+
+    def test_both_panes_share_width_and_height(self):
+        """两侧内容区尺寸必须一致，且不能因为「第 2 行没有横向条」白留 10px。
+
+        原先无条件 ``rowconfigure(2, minsize=_MiniScroll.LANE)``，折行后第 2 行
+        没有任何控件，仍被撑出 10px（实测容器 551 高、Text 只有 540）。
+        """
+        window = self._open(JsonParamWindow)
+        window.win.update()
+        self.assertEqual(window.input.winfo_height(), window.output.winfo_height(),
+                         '两侧正文高度不一致')
+        for pane in (window.input, window.output):
+            container = pane.master
+            self.assertEqual(container.winfo_height(), pane.winfo_height() + 1,
+                             '容器底部多留了空白（横向条那一行没清掉）')
 
     def test_self_drawn_scrollbar_thumb_follows_overflow(self):
         """无溢出时不画滑块，纵向溢出才出现；两者都不能抛异常。"""
@@ -803,6 +878,30 @@ class ToolWindowTests(unittest.TestCase):
     def test_tool_registry_has_two_tools(self):
         keys = [key for key, _label, _cls in TOOLS]
         self.assertEqual(keys, ['json', 'jwt'])
+
+    def test_registry_label_matches_window_title(self):
+        """注册表里的下拉文案必须与窗口标题一致。
+
+        同一个工具的名字在**三处**出现：`TOOLS` 里的下拉显示名、`cls.title`
+        （既作窗口标题进任务栏，又作顶栏左上角可见标题）、以及文档。前两处是
+        独立写死的字符串，改名时极容易只改一处——下拉写着「JSON 格式化」、
+        窗口顶部却还是「JSON 参数」。这条把它们钉在一起。
+        """
+        for key, label, cls in TOOLS:
+            with self.subTest(tool=key):
+                self.assertEqual(label, cls.title,
+                                 f'{key} 的下拉文案与窗口标题不一致')
+
+    def test_tool_names_use_current_wording(self):
+        """工具名措辞：**JSON 格式化** / **JWT 解密**。
+
+        用户原话：「工具下拉框选项JSON参数-改为 JSON格式化  JWT解析-JWT解密」。
+        这是用户偏好而非技术判断（「解密」严格说只解码不验签，但那是文案选择），
+        别再以"更准确"为理由改回「参数」「解析」。
+        """
+        labels = {key: label for key, label, _cls in TOOLS}
+        self.assertEqual(labels['json'], 'JSON 格式化')
+        self.assertEqual(labels['jwt'], 'JWT 解密')
 
     def test_open_tool_rejects_unknown_key(self):
         with self.assertRaises(ValueError):
@@ -1033,13 +1132,23 @@ class ToolWindowTests(unittest.TestCase):
         self.assertIsNone(window._after_id)
 
     # ---------- JSON 参数 ----------
-    def test_json_formats_and_lists_fields(self):
+    def test_json_formats_output_without_field_summary(self):
+        """结果栏只放格式化后的 JSON 本身，不附字段结构摘要。
+
+        原先末尾会追加一段 ``▍ 字段结构`` 摊平清单，用户要求去掉
+        （「JSON格式化右侧的字段结构就不要了去掉」）。**不要再以「信息更全」
+        加回来**——右侧本来就是完整且已缩进对齐的 JSON。
+        """
         window = self._open(JsonParamWindow)
         self._type(window, '{"user":{"name":"张三","age":30}}')
         out = window.output.get('1.0', 'end-1c')
         self.assertIn('"name": "张三"', out)
-        self.assertIn('字段结构', out)
-        self.assertIn('user.name : 字符串', out)
+        self.assertNotIn('字段结构', out, '字段结构摘要应已移除')
+        self.assertNotIn('user.name', out, '字段摊平清单应已移除')
+        # 输出应恰好等于纯格式化结果，不带任何附加段落
+        self.assertEqual(out.strip(),
+                         '{\n  "user": {\n    "name": "张三",\n    "age": 30\n  }\n}',
+                         '结果里混入了格式化 JSON 之外的内容')
         self.assertEqual(window.status.cget('fg').upper(), '#30D158')
 
     def test_json_invalid_input_reports_error_without_crashing(self):
@@ -1059,6 +1168,182 @@ class ToolWindowTests(unittest.TestCase):
         window = self._open(JsonParamWindow)
         self._type(window, '{"a": True}')
         self.assertEqual(window.status.cget('fg').upper(), '#FF453A')
+
+    # ---------- JSON 下拉：从剪贴板详情栏平移过来 ----------
+    def test_json_mode_labels_match_detail_pane(self):
+        """两个模块的「已格式化 / 已压缩 / 已展开转义」必须逐字相同。
+
+        用户要求的是把剪贴板里的下拉**平移**过来，不是另起一套说法。两个字典
+        分居两处（工具窗口不该为了一个字典去 import 整个历史面板），所以必须
+        有一条断言把它们钉在一起，否则改一处就会静默漂移。
+        """
+        from lumina.history_panel import DetailPane
+        self.assertEqual(JSON_MODE_LABELS, DetailPane.JSON_MODE_LABELS)
+
+    def test_json_window_has_menu_button_left_of_footer_actions(self):
+        """底部要有「JSON ▾」入口，且落在「清空 / 复制结果」左侧。"""
+        window = self._open(JsonParamWindow)
+        anchor = window._json_anchor
+        self.assertEqual(str(anchor.cget('text')), 'JSON ▾')
+        self.assertTrue(anchor.winfo_exists())
+        self.assertEqual(anchor.winfo_manager(), 'pack')
+        clear = next(w for w in self._descendants(window.win)
+                     if isinstance(w, tk.Button) and str(w.cget('text')) == '清空')
+        self.assertLess(anchor.winfo_rootx(), clear.winfo_rootx(),
+                        '「JSON ▾」应落在清空/复制结果左侧')
+
+    def test_jwt_window_has_no_json_menu(self):
+        """JWT 没有可转换的模式，不该多一个空下拉。"""
+        window = self._open(JwtWindow)
+        self.assertFalse(hasattr(window, '_json_anchor'),
+                         'JWT 窗口不该出现 JSON 下拉入口')
+        labels = [str(w.cget('text'))
+                  for w in self._descendants(window.win)
+                  if isinstance(w, tk.Button)]
+        self.assertNotIn('JSON ▾', labels)
+
+    def _open_popup(self, window):
+        window._json_menu()
+        window.win.update()
+        return window._popup
+
+    def test_json_menu_has_same_four_items_as_detail_pane(self):
+        """四项的文案 / 提示 / 图标类型必须与详情栏完全一致。"""
+        window = self._open(JsonParamWindow)
+        try:
+            popup = self._open_popup(window)
+            self.assertIsNotNone(popup, '没有弹出下拉')
+            self.assertEqual([item['label'] for item in popup.items],
+                             ['格式化', '压缩', '展开转义', '恢复原文'])
+            self.assertEqual([item['hint'] for item in popup.items],
+                             ['2 空格', '紧凑输出', '换行成行', ''])
+            self.assertEqual([item['kind'] for item in popup.items],
+                             ['format', 'compress', 'expand', 'restore'])
+        finally:
+            window._close_popup()
+
+    def test_json_menu_marks_current_mode_selected(self):
+        """默认勾「格式化」；切到别的模式后勾选跟着走。"""
+        window = self._open(JsonParamWindow)
+        try:
+            popup = self._open_popup(window)
+            self.assertEqual([item['selected'] for item in popup.items],
+                             [True, False, False, False])
+            # 恢复原文在原文态之前是可用的（当前是 format）
+            self.assertTrue(popup.items[3]['enabled'])
+            window._close_popup()
+
+            window._set_mode('compress')
+            popup = self._open_popup(window)
+            self.assertEqual([item['selected'] for item in popup.items],
+                             [False, True, False, False])
+        finally:
+            window._close_popup()
+
+    def test_json_menu_second_click_closes_instead_of_stacking(self):
+        """再点一次同一按钮要收起，不能叠出第二个弹窗。"""
+        window = self._open(JsonParamWindow)
+        popup = self._open_popup(window)
+        self.assertIsNotNone(popup)
+        window._json_menu()
+        self.assertIsNone(window._popup, '第二次点击没有收起下拉')
+
+    def test_switch_to_compress_outputs_single_line(self):
+        window = self._open(JsonParamWindow)
+        self._type(window, '{\n  "a": 1,\n  "b": [1, 2]\n}')
+        window._set_mode('compress')
+        out = window.output.get('1.0', 'end-1c')
+        self.assertEqual(out.strip(), '{"a":1,"b":[1,2]}')
+        self.assertNotIn('\n', out.strip())
+        self.assertIn('已压缩', window.status.cget('text'))
+
+    def test_switch_to_expand_turns_escaped_newlines_into_real_ones(self):
+        window = self._open(JsonParamWindow)
+        self._type(window, '{"stack":"a\\n  at b\\nc"}')
+        window._set_mode('expand')
+        out = window.output.get('1.0', 'end-1c')
+        self.assertIn('a\n  at b\nc', out, '展开转义没有把 \\n 变成真实换行')
+        self.assertIn('已展开转义', window.status.cget('text'))
+
+    def test_restore_original_echoes_input_verbatim(self):
+        """恢复原文：原样回显输入，不做任何结构改动。"""
+        window = self._open(JsonParamWindow)
+        raw = '{\n  "a": 1\n}'
+        self._type(window, raw)
+        window._set_mode('compress')
+        self.assertNotEqual(window.output.get('1.0', 'end-1c').strip(), raw)
+
+        window._restore_original()
+        self.assertEqual(window.output.get('1.0', 'end-1c').strip(), raw.strip())
+        self.assertIn('原文', window.status.cget('text'))
+        self.assertIsNone(window._mode)
+
+    def test_restore_item_disabled_when_already_original(self):
+        window = self._open(JsonParamWindow)
+        window._restore_original()
+        try:
+            popup = self._open_popup(window)
+            self.assertFalse(popup.items[3]['enabled'],
+                             '已在原文态时「恢复原文」应禁用')
+        finally:
+            window._close_popup()
+
+    def test_no_field_summary_in_any_mode(self):
+        """四种模式的结果里都不能出现字段结构摘要。"""
+        window = self._open(JsonParamWindow)
+        self._type(window, '{"user":{"name":"张三","tags":["a","b"]}}')
+        for mode, label in (('format', '格式化'), ('compress', '压缩'),
+                            ('expand', '展开转义')):
+            with self.subTest(mode=mode):
+                window._set_mode(mode)
+                out = window.output.get('1.0', 'end-1c')
+                self.assertNotIn('字段结构', out, f'{label}视图仍带字段结构')
+                self.assertNotIn('user.name', out, f'{label}视图仍带字段摊平清单')
+        window._restore_original()
+        out = window.output.get('1.0', 'end-1c')
+        self.assertNotIn('字段结构', out, '原文视图仍带字段结构')
+        self.assertNotIn('user.name', out, '原文视图仍带字段摊平清单')
+
+    def test_close_and_minimize_dismiss_the_popup(self):
+        """弹窗是独立 Toplevel：窗口收起/销毁时必须一起收掉，否则会飘在桌面上。
+
+        断言的是**弹窗 Toplevel 真的不存在了**，不是「引用被置 None」——后者
+        两条路径都可能满足（``JsonPopup`` 自己绑了父窗口的 ``<Destroy>``），
+        置 None 但窗口还留着才是真正会飘在桌面上的那种 bug。
+
+        反向验证结论：只有**最小化**那条能拦住回退。关闭那条即使去掉
+        ``close()`` 里的显式收尾也依然通过——销毁父窗口会触发弹窗自己的
+        ``<Destroy>`` 回调。所以这条 subTest 对关闭路径是「防御性覆盖」，
+        对最小化路径才是有判别力的守卫（最小化不销毁窗口，弹窗会真的留在屏幕上）。
+        """
+        for action in ('minimize', 'close'):
+            with self.subTest(action=action):
+                window = self._open(JsonParamWindow)
+                popup = self._open_popup(window)
+                self.assertIsNotNone(popup)
+                popup_win = popup.win
+                self.assertTrue(popup_win.winfo_exists())
+                if action == 'minimize':
+                    window.escape()
+                    window.win.update()
+                    time.sleep(0.3)
+                    window.win.update()
+                else:
+                    window.close()
+                    window.win.update()
+                self.assertFalse(bool(popup_win.winfo_exists()),
+                                 f'{action} 后下拉窗口仍在，会飘在桌面上')
+                if action == 'minimize':
+                    self.assertIsNone(window._popup, '最小化后引用还留着')
+                    window.summon()
+                    window.win.update()
+
+    def test_mode_survives_typing_more_input(self):
+        """切了压缩之后继续输入，仍按压缩展示——模式是窗口状态，不是一次性动作。"""
+        window = self._open(JsonParamWindow)
+        window._set_mode('compress')
+        self._type(window, '{\n "a": 1\n}')
+        self.assertEqual(window.output.get('1.0', 'end-1c').strip(), '{"a":1}')
 
     # ---------- JWT ----------
     def _token(self, payload, header=None):

@@ -38,6 +38,7 @@ class FakeWidget:
         self.screen = (1000, 800)
         self.pointer = (0, 0)
         self.focused = None
+        self.topmost = False
         self.selection = ('1.2', '1.8')
         self.drawings = []
         self.visible = False
@@ -56,6 +57,13 @@ class FakeWidget:
         if self.fail_transparency:
             raise TclError('不支持透明色')
         self.attribute_args = args
+        # 支持 ``-topmost`` 的读与写，供「弹窗跟随父窗置顶」的断言使用。
+        if len(args) >= 2 and args[0] == '-topmost':
+            self.topmost = bool(args[1])
+            return None
+        if len(args) == 1 and args[0] == '-topmost':
+            return self.topmost
+        return None
 
     def pack(self, **options):
         pass
@@ -253,6 +261,26 @@ class JsonPopupTests(unittest.TestCase):
         self.assertEqual(menu._separators, [66])
         self.assertEqual(menu.win.geometry_value, '200x109+320+291')
         self.assertTrue(menu.win.visible)
+
+    # ---------- 置顶跟随 ----------
+    def test_popup_follows_parent_topmost(self):
+        """父窗口置顶时弹窗必须也置顶，否则整块菜单被压在父窗下面。
+
+        实测（主面板与工具弹框都复现过）：父窗 ``-topmost`` 后是
+        ``HWND_TOPMOST`` 层，弹窗在普通层。z 序取样父窗 idx=8、弹窗 idx=43
+        —— 菜单**排在父窗下面**，用户点开看不到任何东西。``lift()`` 只在同层
+        内生效，压不过顶层窗口。
+        """
+        self.parent.topmost = True
+        menu = self.make()
+        self.assertTrue(menu.win.topmost,
+                        '父窗置顶时弹窗没跟随，会被父窗盖住')
+
+    def test_popup_does_not_become_topmost_when_parent_is_not(self):
+        """父窗没置顶时绝不能把弹窗设成置顶——否则它会盖住其他应用。"""
+        self.parent.topmost = False
+        menu = self.make()
+        self.assertFalse(menu.win.topmost)
 
     def test_below_fallback_and_edge_avoidance(self):
         self.anchor.rect = (0, 4, 30, 24)

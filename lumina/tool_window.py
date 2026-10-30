@@ -1,4 +1,4 @@
-"""顶栏「工具」下拉里的独立小工具窗口：JSON 参数 / JWT 解析。
+"""顶栏「工具」下拉里的独立小工具窗口：JSON 格式化 / JWT 解密。
 
 两个工具共用同一套无边框外壳（左侧输入、右侧结果、实时解析、一键复制），
 只替换「如何解析」。新增工具只需实现一个 ``_analyze``。
@@ -14,6 +14,10 @@
   才落到剪贴板，避免把调试中间态污染进历史列表。
 - 输入框与结果框都用等宽字体：JSON/JWT 是结构化文本，等宽才能对齐看。
 - **失败不弹模态框**：解析错误直接显示在状态栏，用户改一个字符就能重试。
+- **JSON 窗口的四种转换（格式化 / 压缩 / 展开转义 / 恢复原文）从剪贴板详情栏
+  平移过来**，走同一个 ``json_popup.JsonPopup``、同一套文案与图标。用户原话
+  「JSON格式化弹框将剪贴板中的JSON下拉框平移过去」——是「平移」不是「另做一套」，
+  文案、顺序、图标都照抄 ``DetailPane._json_menu()``，不要另创措辞。
 
 外壳实现要点（Windows）：
 - ``overrideredirect(True)`` 去掉原生标题栏；窗口只剩一条 34px 的操作条，
@@ -54,6 +58,13 @@ RESIZE_EDGE = 6
 
 # 结果里的段落标记。用等宽方块而不是「— xxx —」，更接近终端观感。
 SECTION_MARK = "▍"
+
+# JSON 转换模式的展示名。文案与 ``history_panel.DetailPane.JSON_MODE_LABELS``
+# **必须一致**（用户要求「平移」下拉框，不是另起一套说法）。两者分居两个模块是
+# 有意的：``tool_window`` 不该为了一个字典去 import 整个历史面板。漂移由
+# ``test_json_mode_labels_match_detail_pane`` 守住。
+JSON_MODE_LABELS = {
+    "format": "已格式化", "compress": "已压缩", "expand": "已展开转义"}
 
 # ---------- Win32 窗口扩展样式 ----------
 # 具体实现统一在 lumina/taskbar.py（与主面板共用），这里只做常量再导出，
@@ -199,6 +210,8 @@ class _ToolWindow:
         self._normal_geom = None
         self._min_geom = None
         self._chrome_id = None
+        # 任何自绘下拉（目前只有 JSON 那个）都挂在这里，close()/最小化时统一收掉。
+        self._popup = None
         theme = panel._theme()
         self.T, self.dark = theme if isinstance(theme, tuple) else (theme, False)
         self.win = self.tk.Toplevel(panel.win)
@@ -532,6 +545,8 @@ class _ToolWindow:
         """
         if self._closed:
             return
+        # 先收起下拉：弹窗是独立 Toplevel，窗口最小化后它会孤零零飘在桌面上。
+        self._close_popup()
         self._min_geom = self.win.wm_geometry()
         if taskbar.minimize_window(self.win):
             return
@@ -824,12 +839,16 @@ class _ToolWindow:
         body.columnconfigure(1, weight=1, uniform="col")
         body.rowconfigure(0, weight=1)
 
-        self.input = self._make_text(
-            body, editable=True, edge=self._accent(), wrap_mode="char")
-        self.input.master.grid(row=0, column=0, sticky="nsew")
-        self.output = self._make_text(
-            body, editable=False, edge=self._sys("teal"))
-        self.output.master.grid(row=0, column=1, sticky="nsew", padx=(GAP, 0))
+        self.input = self._make_text(body, editable=True, edge=self._accent())
+        self.input.master.grid(row=0, column=0, sticky="nsew",
+                               padx=(0, GAP // 2))
+        self.output = self._make_text(body, editable=False, edge=self._sys("teal"))
+        # **两栏正文必须等宽。** 这里曾用 ``padx=(GAP, 0)`` 给右栏让出缝隙，代价是
+        # 右栏内容区比左栏窄 10px（实测 440 vs 430）——同样的文本在窄栏里更早折行，
+        # 实测 60 个字符的字符串左栏 1 屏行、右栏 2 屏行，正好违背「右侧和左侧保持
+        # 一致」。改成两栏各让一半缝隙，宽度完全相等。视觉缝隙仍是 ``GAP``。
+        self.output.master.grid(row=0, column=1, sticky="nsew",
+                                padx=(GAP // 2, 0))
         self.input.bind("<KeyRelease>", self._on_input)
         self.input.bind("<<Paste>>", lambda _e: self.win.after(1, self._refresh))
 
@@ -855,24 +874,47 @@ class _ToolWindow:
         self._make_grip(row).pack(side="right", padx=(4, 0))
         self._ghost_button(row, "复制结果", self._copy_output)
         self._ghost_button(row, "清空", self._clear)
+        # 子类专属的下拉入口（目前只有 JSON 工具的「JSON ▾」）。放在最后 pack，
+        # 于是它落在最左——右侧那三个（清空/复制结果/抓手）的位置不变。
+        self._build_footer_menu(row)
 
-    def _make_text(self, parent, editable, edge, wrap_mode="none"):
+    def _build_footer_menu(self, parent):
+        """底部左侧的下拉入口，默认没有。子类按需覆盖。
+
+        单独留一个钩子而不是把下拉写进 ``_build``：JWT 那个工具没有可转换的
+        模式，多一个空的下拉只会让人以为漏了什么。
+        """
+
+    def _close_popup(self):
+        """收起自绘下拉（若有）。幂等，可被最小化/关闭路径无条件调用。"""
+        popup, self._popup = self._popup, None
+        if popup is not None:
+            try:
+                popup.close()
+            except Exception:
+                # 收菜单是尽力而为：这里失败也不能连累主流程（最小化/关闭）。
+                pass
+
+    def _make_text(self, parent, editable, edge):
         """返回 Text 控件；其 ``master`` 是带边框与滚动条的容器 Frame。
 
         ``edge`` 是左侧 2px 强调色条——这是区分「输入 / 结果」的唯一标记，
         刻意不用文字标题。
 
-        ``wrap_mode`` 决定超宽行怎么处理：
+        **两侧都按字符折行（``wrap="char"``），行为与左栏完全一致。**
+        用户原话：「工具弹框右侧和左侧如果超过当前长度自动换行，右侧和左侧保持
+        一致」。早先右栏刻意 ``wrap="none"`` 配横向滚动条，理由是「结果是给人读
+        的结构化输出，折行会打乱缩进列对齐」；但那个取舍的代价是长行必须左右拖
+        才能读到行尾，用户明确要求放弃它、改成两侧统一自动换行。
 
-        - ``"char"``（左侧输入用）：**占满宽度就按字符折行**，不产生横向滚动。
-          JSON 里没有空格，``"word"`` 折行对一整行压缩 JSON 完全无效，只会
-          继续横向溢出，所以必须按字符折。折行只影响显示，``get("1.0","end")``
-          取到的仍是原始文本，不会在内容里插入换行。
-        - ``"none"``（右侧结果用）：保持每行不折、配横向滚动条。结果是**给人
-          读的结构化输出**，强行折行会把缩进层级和列对齐打乱，反而更难看清。
+        用 ``"char"`` 而不是 ``"word"``：JSON 文本里没有空格，一整行压缩 JSON 交给
+        ``"word"`` 只会继续横向溢出。折行只影响显示，``get("1.0","end")`` 取到的
+        仍是原始文本，不会在内容里插入换行符。
+
+        两侧都折行后横向永不溢出，所以**不再建横向滚动条**——它只会白占一条
+        10px 的槽（连轨道都画不出滑块）。
         """
         T, tk = self.T, self.tk
-        wrapped = wrap_mode != "none"
         wrap = tk.Frame(parent, bg=T["hairline"])
         wrap.rowconfigure(1, weight=1)
         wrap.columnconfigure(1, weight=1)
@@ -882,26 +924,19 @@ class _ToolWindow:
         text = tk.Text(
             wrap, bd=0, highlightthickness=0, bg=T["card_bg"], fg=T["label"],
             insertbackground=self._accent(), font=self._mono(10),
-            wrap=wrap_mode, undo=editable, padx=10, pady=8,
+            wrap="char", undo=editable, padx=10, pady=8,
             selectbackground=T["accent_soft"], selectforeground=T["label"])
         # 原生 Scrollbar 在深色下会露出白槽，统一换成自绘细条。
         ys = _MiniScroll(tk, wrap, "vertical", text.yview, T, self._accent())
         text.configure(yscrollcommand=ys.set)
-        scrolls = [ys]
-        # 折行后横向永远不溢出，横条只会白占一条 10px 的槽，直接不建。
-        xs = None
-        if not wrapped:
-            xs = _MiniScroll(tk, wrap, "horizontal", text.xview, T, self._accent())
-            text.configure(xscrollcommand=xs.set)
-            scrolls.append(xs)
         # 挂在 Text 上便于测试与后续主题重绘取用（不参与对外 API）。
-        text._mini_scrolls = tuple(scrolls)
+        text._mini_scrolls = (ys,)
         text.grid(row=1, column=1, sticky="nsew")
         ys.canvas.grid(row=1, column=2, sticky="ns")
-        if xs is not None:
-            xs.canvas.grid(row=2, column=1, sticky="ew")
+        # **行列 minisize 只给真正用到的那一行**：原先无条件
+        # ``rowconfigure(2, minsize=_MiniScroll.LANE)``，折行后第 2 行没有任何控件，
+        # 仍被撑出 10px 空白（实测容器 551 高、Text 只有 540）。
         wrap.columnconfigure(2, minsize=_MiniScroll.LANE)
-        wrap.rowconfigure(2, minsize=_MiniScroll.LANE)
         if not editable:
             text.configure(state="disabled")
         return text
@@ -1026,6 +1061,12 @@ class _ToolWindow:
         if self._closed:
             return
         self._closed = True
+        # 显式收掉下拉。**这条在实测中是冗余的**：``JsonPopup`` 自己绑了父窗口的
+        # ``<Destroy>``，销毁时会 close 并回调 ``_popup_closed`` 把引用清掉。
+        # 保留它是为了不依赖那条隐式链路——「弹窗飘在桌面上」是最难发现的缺陷
+        # 之一，多一行确定性的收尾比省一行代码划算。最小化那条才是必需的：
+        # 最小化不销毁窗口，弹窗会真的孤零零留在屏幕上。
+        self._close_popup()
         # 从 panel 的实例表里摘掉自己：否则下次 open_tool 会拿到一个已销毁的
         # 实例（虽然那里也会判 winfo_exists 兜底，但留着是内存泄漏）。
         registry = getattr(self.panel, "_tool_windows", None)
@@ -1049,66 +1090,132 @@ class _ToolWindow:
 
 
 class JsonParamWindow(_ToolWindow):
-    """JSON 参数工具：格式化 + 字段清单 + 重复键告警。"""
+    """JSON 格式化工具：格式化 / 压缩 / 展开转义 / 恢复原文 + 重复键告警。
 
-    title = "JSON 参数"
-    placeholder = "粘贴接口入参后自动格式化，并列出字段结构"
+    结果栏**只放转换后的 JSON 本身**，不附字段结构摘要（用户明确要求去掉）。
 
+    下拉里的四种转换是从剪贴板详情栏**平移**过来的：同一个 ``JsonPopup``、同一套
+    文案与图标、同样的 ``selected`` 勾选语义。区别只在于结果写到本窗口右侧，
+    而不是详情栏的预览区。
+    """
+
+    title = "JSON 格式化"
+    placeholder = "粘贴接口入参后自动格式化"
+
+    def __init__(self, panel):
+        # 默认模式：格式化。剪贴板详情栏的默认是「原文」，因为那里展示的是历史
+        # 记录本身；这个窗口生来就是为了看格式化结果，换成原文反而莫名其妙。
+        self._mode = "format"
+        super().__init__(panel)
+
+    # ---------- 下拉 ----------
+    def _build_footer_menu(self, parent):
+        """底部左下角的「JSON ▾」入口，与详情栏那颗按钮同款同文案。"""
+        T, tk = self.T, self.tk
+        box = tk.Frame(parent, bg=T["hairline"])
+        btn = tk.Button(
+            box, text="JSON ▾", command=self._json_menu, bd=0, relief="flat",
+            bg=T["fill"], fg=T["label"],
+            activebackground=T["accent_soft"], activeforeground=self._accent(),
+            font=(self.panel.FONT_FAMILY, 9), padx=10, pady=3,
+            cursor="hand2", highlightthickness=0)
+        btn.pack(padx=1, pady=1)
+
+        def enter(_event):
+            box.configure(bg=self._accent())
+            btn.configure(bg=T["accent_soft"], fg=self._accent())
+
+        def leave(_event):
+            box.configure(bg=T["hairline"])
+            btn.configure(bg=T["fill"], fg=T["label"])
+
+        btn.bind("<Enter>", enter)
+        btn.bind("<Leave>", leave)
+        # pack 在最后 -> 落在最左，右侧的 清空 / 复制结果 / 抓手 位置不变。
+        box.pack(side="left", padx=(8, 0), pady=2)
+        self._json_anchor = btn
+
+    def _json_menu(self):
+        """弹出四项转换菜单。**再次点击同一按钮即收起**（与详情栏一致）。
+
+        用 ``json_popup.JsonPopup`` 而不是 Tk 原生 ``menu.post``：后者在 Windows
+        下会进模态跟踪循环，把 UI 线程卡死（这条教训主面板已经付过代价）。
+        """
+        from .json_popup import JsonPopup
+        # 已经开着就收起。判 isinstance 而不是判非空，是因为将来可能还有别种菜单。
+        if isinstance(self._popup, JsonPopup):
+            self._close_popup()
+            return
+        self._close_popup()
+        items = [
+            {"label": "格式化", "hint": "2 空格", "kind": "format",
+             "command": lambda: self._set_mode("format"),
+             "enabled": True, "selected": self._mode == "format"},
+            {"label": "压缩", "hint": "紧凑输出", "kind": "compress",
+             "command": lambda: self._set_mode("compress"),
+             "enabled": True, "selected": self._mode == "compress"},
+            {"label": "展开转义", "hint": "换行成行", "kind": "expand",
+             "command": lambda: self._set_mode("expand"),
+             "enabled": True, "selected": self._mode == "expand"},
+            {"label": "恢复原文", "hint": "", "kind": "restore",
+             "command": self._restore_original,
+             # 已经在原文态时按它等于什么都没做，禁掉更诚实。
+             "enabled": self._mode is not None, "selected": False},
+        ]
+        self._popup = JsonPopup(
+            self.tk, self.win, items, self.T, dpi=self._dpi())
+        self._popup.popup(self._json_anchor, on_close=self._popup_closed)
+
+    def _popup_closed(self):
+        """弹窗自己关掉时（点外部、按 ESC）把引用清干净。"""
+        self._popup = None
+
+    def _dpi(self):
+        """取主面板的缩放系数；替身面板（测试）没有这个属性时退回 1.0。"""
+        value = getattr(self.panel, "_dpi", 1.0)
+        try:
+            return max(0.5, min(3.0, float(value)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _set_mode(self, mode):
+        """切到某个转换模式并立刻重算。剪贴板详情栏同一套语义。"""
+        if self._mode == mode:
+            return
+        self._mode = mode
+        self._refresh()
+
+    def _restore_original(self):
+        """恢复原文：不传给 ``transform_json``（它明确拒绝 restore）。
+
+        这里「原文」指用户粘进左栏的内容本身，不需要回溯任何历史状态。
+        """
+        self._mode = None
+        self._refresh()
+
+    # ---------- 解析 ----------
     def _analyze(self, raw):
-        result = transform_json(raw, "format")
-        parts = [result.text]
-        summary = _field_summary(result.text)
-        if summary:
-            parts += ["", f"{SECTION_MARK} 字段结构", summary]
-        status = f"合法 JSON · {len(result.text)} 字符"
+        if self._mode is None:
+            # 原文态：原样回显，不做任何结构改动。
+            return raw, f"原文 · {len(raw)} 字符", "ok"
+        result = transform_json(raw, self._mode)
+        # **结果栏只放转换后的 JSON 本身，不再附字段结构摘要。**
+        # 用户原话：「JSON格式化右侧的字段结构就不要了去掉」。早先格式化视图会在
+        # 末尾追加一段 ``▍ 字段结构`` 摊平清单（``a.b[0] : 字符串 = 'x'``），本意是
+        # 帮用户快速看结构；但右侧本来就是完整且已缩进对齐的 JSON，再多一段摘要在
+        # 长文档下反而把真正的结果推下去。**这是用户偏好，不要以「信息更全」为由
+        # 加回来。**
+        status = f"{JSON_MODE_LABELS[self._mode]} · {len(result.text)} 字符"
         if result.duplicate_keys:
             status += " · 重复键：" + "、".join(result.duplicate_keys)
-            return "\n".join(parts), status, "error"
-        return "\n".join(parts), status, "ok"
-
-
-def _field_summary(pretty_json):
-    """把 JSON 摊平成 ``a.b[0] : 类型 = 值`` 列表，帮助快速看结构。
-
-    只展开数组首元素（后续元素结构通常相同），并附上总数，避免长数组刷屏。
-    """
-    import json
-    try:
-        obj = json.loads(pretty_json)
-    except json.JSONDecodeError:
-        return ""
-
-    lines = []
-
-    def walk(node, prefix):
-        if isinstance(node, dict):
-            if not node:
-                lines.append(f"{prefix or '(根)'} : 空对象 {{}}")
-                return
-            for key, value in node.items():
-                walk(value, f"{prefix}.{key}" if prefix else key)
-        elif isinstance(node, list):
-            if not node:
-                lines.append(f"{prefix} : 空数组 []")
-                return
-            walk(node[0], f"{prefix}[0]")
-            if len(node) > 1:
-                lines.append(f"{prefix} : 共 {len(node)} 项")
-        else:
-            kind = ("null" if node is None else
-                    "bool" if isinstance(node, bool) else
-                    "数字" if isinstance(node, (int, float)) else "字符串")
-            sample = "" if node is None else f" = {node!r}"[:64]
-            lines.append(f"{prefix} : {kind}{sample}")
-
-    walk(obj, "")
-    return "\n".join(lines)
+            return result.text, status, "error"
+        return result.text, status, "ok"
 
 
 class JwtWindow(_ToolWindow):
-    """JWT 解析工具：解 header/payload，标注过期状态，**不验签**。"""
+    """JWT 解密工具：解 header/payload，标注过期状态，**不验签**。"""
 
-    title = "JWT 解析"
+    title = "JWT 解密"
     placeholder = "粘贴 JWT 后自动解码（只解码，不验签）"
 
     def _analyze(self, raw):
@@ -1160,8 +1267,8 @@ class JwtWindow(_ToolWindow):
 
 # 工具注册表：顶栏下拉与测试都遍历它，新增工具只改这里。
 TOOLS = (
-    ("json", "JSON 参数", JsonParamWindow),
-    ("jwt", "JWT 解析", JwtWindow),
+    ("json", "JSON 格式化", JsonParamWindow),
+    ("jwt", "JWT 解密", JwtWindow),
 )
 
 

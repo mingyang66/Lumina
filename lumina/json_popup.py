@@ -133,6 +133,17 @@ class JsonPopup:
             self._active = next((i for i, item in enumerate(self.items)
                                  if item.get('selected') and self._enabled(i)), None)
             self._draw()
+            # **必须跟随父窗口的置顶状态。** 父窗口 ``-topmost`` 时是
+            # ``HWND_TOPMOST`` 层的窗口（实测 exstyle 带 ``WS_EX_TOPMOST``），
+            # 而本弹窗是普通层。z 序实测：父窗 idx=8、弹窗 idx=43——弹窗排在
+            # 父窗**下面**，整块菜单被盖住。``lift()`` 只在同一层内生效，压不过
+            # 顶层窗口，所以要显式跟随。父窗没置顶时不设，避免弹窗反过来盖住
+            # 用户正在用的其他应用。
+            try:
+                self.win.attributes(
+                    '-topmost', bool(self.parent_win.attributes('-topmost')))
+            except (TclError, AttributeError, TypeError):
+                pass
             self.win.deiconify()
             self.win.lift()
             self._outside_check = self.win.after(120, self._check_outside_click)
