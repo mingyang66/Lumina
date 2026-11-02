@@ -132,6 +132,20 @@ class HistoryPanel:
     }
     FONT_FAMILY = "Microsoft YaHei UI"
     RESIZE_GRIP = 12
+    # 左栏右缘滚动指示条的几何（逻辑像素，绘制时乘 DPI）。
+    # 指示条画在**列表画布的最右缘**，所以左栏内容必须整体让出这条通道，
+    # 否则会压在卡片右侧的圆角描边上（用户实测报告：「滚动条压着列表项了」）。
+    # 卡片 margin 由 12 改成 0 之后卡片铺满整个画布，这个压盖就暴露出来了
+    # ——改之前卡片右边界是 478、画布 493，中间那 8px 空隙把指示条挡在外面。
+    SCROLLBAR_W = 4
+    SCROLLBAR_RIGHT_PAD = 1
+    SCROLLBAR_GAP = 2
+    # 指示条的可抓取宽度（逻辑像素）。**必须比画出来的宽**：4px 的细条用鼠标
+    # 抓极难命中，实测用户根本点不上。这里把「轨道右缘」整条按右手边算作热区，
+    # 于是热区宽 = 条宽 + 条左侧的额外余量，宽到能轻松抓到，而视觉上仍是细条。
+    SCROLLBAR_HIT_W = 12
+    # 拖拽时的颜色反馈：抓住时加深，松手恢复。
+    SCROLLBAR_DRAG_COLOR = "label2"
     WM_NCHITTEST = 0x0084
     HTCLIENT = 1
     HTLEFT = 10
@@ -542,6 +556,23 @@ class HistoryPanel:
             return
         self._refresh_cards(self._rows_displayed)
 
+    def _on_scrollbar_or_click(self, event):
+        """``<Button-1>`` 总入口：先问滚动条要不要，否则交给列表选择。
+
+        合在一个处理器里而不是各绑一次，是因为 Tk 同事件多次 ``bind`` 会互相
+        覆盖：若直接再绑一次 ``<Button-1>``，行选择就失效了。这里显式分派，
+        两个行为都保住，且「谁先谁后」一目了然。
+        """
+        if self._on_scrollbar_press(event) == "break":
+            return "break"
+        return self._on_canvas_click(event)
+
+    def _on_scrollbar_motion(self, event):
+        """``<B1-Motion>``：拖拽滚动条时接管，否则交回列表。"""
+        if self._on_scrollbar_drag(event) == "break":
+            return "break"
+        return None
+
     def _on_canvas_click(self, event):
         canvas = self._active_canvas()
         if canvas is None or event.widget is not canvas:
@@ -582,6 +613,8 @@ class HistoryPanel:
         canvas = self._active_canvas()
         if canvas is None or event.widget is not canvas:
             return
+        # 悬停到滚动条上时高亮 + 换光标，提示「这里能拖」。
+        self._update_scrollbar_hover(event)
         clip_id = self._get_clip_id_from_event(canvas, event)
         cid = str(clip_id) if clip_id is not None else None
         if cid != self._hover_id:
@@ -617,7 +650,7 @@ class HistoryPanel:
         event.widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _on_list_scroll(self, first, last):
-        """紧凑列表的 Apple 风格细滚动指示条（画在卡片画布右缘）。"""
+        """紧凑列表的细滚动条（**固定在视口右缘，可鼠标拖拽**）。"""
         canvas = getattr(self, "cards_canvas", None)
         if canvas is None:
             return
@@ -631,14 +664,30 @@ class HistoryPanel:
                     canvas.delete(self._scroll_ind)
                     self._scroll_ind = None
                 return
-            y0 = max(2, first_x * h)
-            y1 = min(h - 2, last_x * h)
-            if y1 - y0 < 24:
-                y1 = min(h - 2, y0 + 24)
-            w = max(3, int(round(4 * self._dpi)))
-            x1 = canvas.winfo_width() - 3
-            x0 = x1 - w
-            col = self._c("label3")
+            # **y 必须换算到视口坐标再加偏移**。`yview` 给的是「视口在整段
+            # 内容里的比例」，而 Canvas 图元的坐标是**画布坐标**——随滚动
+            # 一起移动的那种。直接拿 `first * h` 当画布 y 塞进去，图元就钉
+            # 死在滚动区域的最顶段：滚动偏移一变大，它就整条滑到可视区上方
+            # 消失（用户报告「滚动的时候直接到最上面隐藏了」）。
+            # `canvasy(0)` 正是当前滚动偏移，加上它才能把图元抬到「此刻视口
+            # 所在的位置」，从而相对于视口保持不动。
+            # 实测反证：偏移 6 时指示条还在屏内，偏移 144 时它落在 22~132，
+            # 整条跑到视口顶端之外。
+            off = canvas.canvasy(0)
+            thumb_top = max(2.0, first_x * h)
+            thumb_bottom = min(h - 2.0, last_x * h)
+            if thumb_bottom - thumb_top < self._scrollbar_min_thumb():
+                thumb_bottom = min(h - 2.0,
+                                   thumb_top + self._scrollbar_min_thumb())
+            y0 = off + thumb_top
+            y1 = off + thumb_bottom
+            x0, x1 = self._scrollbar_rect(h)
+            # 抓住 / 悬停时颜色加深，给一个「抓住了」的反馈。拖拽过程中
+            # 每次 yview 变化都会重画，颜色必须保持一致，否则会闪。
+            if self._scroll_drag is not None or self._scroll_hover:
+                col = self._c(self.SCROLLBAR_DRAG_COLOR)
+            else:
+                col = self._c("label3")
             if self._scroll_ind is None or not canvas.winfo_exists():
                 self._scroll_ind = canvas.create_rectangle(
                     x0, y0, x1, y1, fill=col, outline="", width=0,
@@ -649,6 +698,154 @@ class HistoryPanel:
             canvas.tag_raise(self._scroll_ind)
         except Exception:
             pass
+
+    # ---------- 滚动条：几何与拖拽 ----------
+
+    def _scrollbar_min_thumb(self):
+        """滑块最小高度（物理像素）。太短会让它在长列表里变成一个小点。"""
+        return max(24, int(round(24 * self._dpi)))
+
+    def _scrollbar_rect(self, height=None):
+        """返回指示条的横向范围 ``(x0, x1)``（画布坐标，物理像素）。
+
+        **唯一来源**：绘制与命中判定都必须走这里，否则会出现「看得见却抓不到」
+        ——两边各写一份算式的典型后果。x1 直接贴画布右缘减 1，
+        让细条尽量靠右侧边框（用户要求「稍微靠右侧边框点」）。
+        """
+        canvas = self.cards_canvas
+        w = canvas.winfo_width()
+        if w <= 1:
+            w = height or 0
+        x1 = w - int(round(self.SCROLLBAR_RIGHT_PAD * self._dpi))
+        bw = max(3, int(round(self.SCROLLBAR_W * self._dpi)))
+        return x1 - bw, x1
+
+    def _scrollbar_hit_x(self):
+        """判定「鼠标是否落在滚动条上」的横向阈值（画布 x，物理像素）。
+
+        热区比画出来的条宽得多（``SCROLLBAR_HIT_W`` 12 逻辑像素），因为 4px
+        的条用鼠标几乎抓不中。热区从画布最右缘往左量，覆盖细条以及它左侧
+        那点余量。
+        """
+        canvas = self.cards_canvas
+        w = canvas.winfo_width()
+        if w <= 1:
+            return -1
+        hit_w = max(8, int(round(self.SCROLLBAR_HIT_W * self._dpi)))
+        return w - hit_w
+
+    def _scrollbar_grabbed(self, event):
+        """指针是否落在滚动条热区内（且当前确实有滚动条可抓）。"""
+        canvas = self._active_canvas()
+        if canvas is None or self._scroll_ind is None:
+            return False
+        try:
+            if event.widget is not canvas:
+                return False
+        except AttributeError:
+            return False
+        # 树上有选中项时也可以拖；只要指示条存在就说明内容溢出了。
+        return canvas.canvasx(event.x) >= self._scrollbar_hit_x()
+
+    def _scrollbar_jump_to(self, event, grab_offset=None):
+        """把滚动位置移到「指针所指的轨道位置」。
+
+        ``grab_offset`` 是按下时指针相对滑块顶端的偏移：拖拽时保持它不变，
+        滑块就不会在指针下突然跳一下（那种「一按就跑偏」的手感非常糟）。
+        """
+        canvas = getattr(self, "cards_canvas", None)
+        if canvas is None:
+            return
+        h = canvas.winfo_height()
+        if h <= 1:
+            return
+        first, last = canvas.yview()
+        span = max(1e-6, last - first)
+        thumb_h = max(1.0, span * h)
+        # 指针在视口内的纵向位置 = 事件 y（Motion/Button 事件的 y 已是 widget 坐标）
+        py = event.y - (grab_offset if grab_offset is not None else
+                        thumb_h / 2.0)
+        # 滑块顶端能走的范围只有 [0, h - thumb_h]
+        travel = max(1.0, h - thumb_h)
+        ratio = min(1.0, max(0.0, py / travel))
+        # 视口顶端能到的最远位置是 1 - span
+        canvas.yview_moveto(ratio * (1.0 - span))
+
+    def _on_scrollbar_press(self, event):
+        """按下滚动条：开始拖拽（记住抓取偏移，避免滑块跳到指针下）。"""
+        if not self._scrollbar_grabbed(event):
+            return None
+        canvas = self.cards_canvas
+        ind = self._scroll_ind
+        if ind is None:
+            return None
+        coords = canvas.coords(ind)
+        if not coords:
+            return None
+        # 显示坐标（相对视口）= 画布坐标 - 滚动偏移
+        thumb_top_view = coords[1] - canvas.canvasy(0)
+        thumb_bottom_view = coords[3] - canvas.canvasy(0)
+        on_thumb = thumb_top_view <= event.y <= thumb_bottom_view
+        # 点在滑块上 → 保持抓取点；点在轨道空白处 → 先跳过去再把指针当中心
+        self._scroll_drag = ("offset" if on_thumb else "center")
+        self._scroll_drag_grab = (event.y - thumb_top_view) if on_thumb else None
+        # **必须 grab_set**：`<B1-Motion>` 只在指针位于画布内时投递，鼠标拖
+        # 得快一点就滑出画布，拖动会突然断掉（用户会觉得"拖一半就不动了"）。
+        # 抓住指针后无论它跑到哪，Motion 都还归本控件。
+        try:
+            canvas.grab_set()
+        except Exception:
+            pass
+        if not on_thumb:
+            self._scrollbar_jump_to(event, grab_offset=None)
+        # 重画一次以应用「抓住」的高亮色
+        first, last = canvas.yview()
+        self._on_list_scroll(first, last)
+        return "break"
+
+    def _on_scrollbar_drag(self, event):
+        """拖拽中：按指针位置滚动。"""
+        if self._scroll_drag is None:
+            return None
+        self._scrollbar_jump_to(event, grab_offset=self._scroll_drag_grab)
+        return "break"
+
+    def _on_scrollbar_release(self, _event=None):
+        """松开：结束拖拽并恢复颜色。"""
+        if self._scroll_drag is None:
+            return None
+        self._scroll_drag = None
+        self._scroll_drag_grab = None
+        canvas = getattr(self, "cards_canvas", None)
+        if canvas is not None and canvas.winfo_exists():
+            # 必须配对释放，否则整个面板的鼠标事件都被这个画布吞掉
+            # （表现为点别处全无反应，直到再点一次列表）。
+            try:
+                canvas.grab_release()
+            except Exception:
+                pass
+            first, last = canvas.yview()
+            self._on_list_scroll(first, last)
+        return "break"
+
+    def _update_scrollbar_hover(self, event):
+        """悬停到滚动条上时高亮，并切竖分割光标提示「可拖」。"""
+        if self._scroll_drag is not None:
+            return
+        canvas = getattr(self, "cards_canvas", None)
+        if canvas is None:
+            return
+        over = self._scrollbar_grabbed(event)
+        if over == self._scroll_hover:
+            return
+        self._scroll_hover = over
+        try:
+            canvas.configure(cursor="sb_v_double_arrow" if over else "")
+        except Exception:
+            pass
+        if self._scroll_ind is not None:
+            first, last = canvas.yview()
+            self._on_list_scroll(first, last)
 
     def _paste_row(self, row):
         try:
@@ -1762,6 +1959,28 @@ class HistoryPanel:
             return self.cards_canvas
         return None
 
+    def _scrollbar_gutter(self):
+        """左栏右缘必须让出的宽度（物理像素）= 指示条 + 右侧留白 + 间隙。
+
+        **为什么需要它**：滚动指示条是画在**列表画布右缘**上的（见
+        ``_on_list_scroll``），不是独立控件、不占布局。卡片 margin 由 12
+        改成 0 之后卡片铺满整个画布，指示条就压在卡片右侧的圆角描边上
+        （用户实测报告：「滚动条压着列表项了」）。
+
+        **搜索胶囊必须用同一个值**：它和卡片本来就是为「左右边界一致」才
+        对齐的（见 ``_card_margin``），只给卡片让通道会让上面那行重新突出
+        一截，等于把刚修好的对齐问题换个方向又犯一遍。
+
+        **注意这里算的是「内容要让多少」，不是「可抓取区域有多宽」**：
+        抓取热区宽 ``SCROLLBAR_HIT_W``（12）比这条通道（现在 7）宽，多出来的
+        部分覆盖在卡片右侧边缘上。这是故意的——视觉上内容几乎贴着指示条，
+        鼠标却能抓得住；热区只在按下时参与判定，不影响绘制，故不需要
+        让出 12px 的空档（那会把列表整体缩小一圈，正是刚修掉的毛病）。
+        """
+        total = (self.SCROLLBAR_W + self.SCROLLBAR_RIGHT_PAD
+                 + self.SCROLLBAR_GAP)
+        return int(round(total * self._dpi))
+
     def _card_margin(self):
         """卡片相对左栏边框的水平缩进（逻辑像素，会乘 DPI）。
 
@@ -1773,7 +1992,11 @@ class HistoryPanel:
         **取 0 是为了和顶部的搜索胶囊严格对齐**：搜索框是 ``pack(fill="x")``
         满铺左栏，左右边界就是左栏的 0 和 492；卡片原来缩进 12（加上圆角
         描边的 2px 抗锯齿，实测约 14），于是列表比搜索框窄一圈，看着像
-        「下面那列小一号」。改为 0 后两者左右边界完全一致（实测均 0/492）。
+        「下面那列小一号」。改为 0 后两者左右边界完全一致。
+
+        **右边界另外由 ``_scrollbar_gutter()`` 让出**，不并进这里：margin
+        管的是「左侧内缩」，让出右缘滚动条通道是另一件事，混在一起会让
+        margin 的语义变模糊。卡片的实际宽度 = 画布宽 - 2*margin - gutter。
 
         代价是卡片圆角直接贴着左栏边缘与中缝。这是**刻意的**：搜索胶囊是
         ``radius=h//2`` 的全圆头，贴边本来就是它的正常形态；卡片跟着贴边，
@@ -1804,7 +2027,12 @@ class HistoryPanel:
         cw = canvas.winfo_width()
         if cw <= 1:
             cw = self._left_col_width()
-        card_w = max(80, cw - 2 * margin)
+        # 右缘必须再让出滚动指示条的通道（见 `_scrollbar_gutter`）：
+        # 指示条画在**画布内部**的右缘，不从布局里占位，所以缩小容器没用
+        # ——容器变窄时画布的右缘跟着变窄，指示条也跟着挪，二者永远重叠。
+        # 只能让卡片自己的右边界退到通道左侧。
+        gutter = self._scrollbar_gutter()
+        card_w = max(80, cw - 2 * margin - gutter)
         gap = int(round(8 * self._dpi))
         self._card_w, self._row_h = card_w, row_h
         # 收藏按钮是 Canvas 上的真实 Tk 控件，重绘前必须销毁旧控件。
@@ -1816,7 +2044,8 @@ class HistoryPanel:
 
         if not rows:
             eh = max(row_h * 4, int(round(300 * self._dpi)))
-            self._draw_empty(canvas, cw, eh, T)
+            # 空态居中也要落在「卡片区域」里，不然图标会比卡片整体偏右半个通道宽
+            self._draw_empty(canvas, cw - gutter, eh, T)
             canvas.configure(scrollregion=(0, 0, cw, eh))
             self._rows_displayed = rows
             return
@@ -2561,12 +2790,27 @@ class HistoryPanel:
         self.cards_canvas.pack(side="left", fill="both", expand=True)
         self.cards_canvas.configure(yscrollcommand=self._on_list_scroll)
         self._scroll_ind = None
-        self.cards_canvas.bind("<Button-1>", self._on_canvas_click)
+        # 滚动条拖拽状态：`_scroll_drag` 为 None 表示空闲，否则是抓取模式
+        # （"offset" = 抓住滑块本体，保留按下点偏移；"center" = 点在轨道
+        # 空白处，指针当作滑块中心）。`_scroll_drag_grab` 是按下时指针相对
+        # 滑块顶端的偏移，拖拽全程保持不变，滑块才不会在指针下跳一下。
+        self._scroll_drag = None
+        self._scroll_drag_grab = None
+        self._scroll_hover = False
+        # **`<Button-1>` 只绑一次，绑在分派器上**。Tk 同一个事件重复 `bind`
+        # （不带 "+"）是**覆盖**而不是叠加，若这里再单独绑一次
+        # `_on_canvas_click`，后绑的分派器会把它顶掉——反过来也一样。
+        # 所以统一由 `_on_scrollbar_or_click` 先问滚动条、再交回列表选择。
+        self.cards_canvas.bind("<Button-1>", self._on_scrollbar_or_click)
         self.cards_canvas.bind("<Button-3>", self._on_canvas_rightclick)
         self.cards_canvas.bind("<Motion>", self._on_canvas_motion)
         self.cards_canvas.bind("<Leave>", self._on_canvas_leave)
         self.cards_canvas.bind("<MouseWheel>", self._on_canvas_wheel)
         self.cards_canvas.bind("<Configure>", self._on_canvas_configure)
+        # 拖拽与松开原来没有绑定，用 "+" 追加是安全的。
+        self.cards_canvas.bind("<B1-Motion>", self._on_scrollbar_motion, add="+")
+        self.cards_canvas.bind("<ButtonRelease-1>",
+                               self._on_scrollbar_release, add="+")
 
         # ---------- 底部：细状态行（行级动作由详情区动作栏承担） ----------
         # footer 的 bg 与窗口同为 window_bg，它下方的留白在视觉上和文字行
@@ -2784,15 +3028,20 @@ class HistoryPanel:
         h = self._search_h
         if w <= 1:
             return
+        # **胶囊右边界必须和卡片一样让出滚动条通道**。这里原先用整个画布宽
+        # 画胶囊，而卡片只铺到 `画布宽 - gutter`，两者右边界就差出那 10px，
+        # 下面那列看着比搜索框窄一截——正是「左栏对齐」刚修好的那个问题
+        # 换个方向重犯。两个值都从 `_scrollbar_gutter()` 来，不再各写一份。
+        pw = max(40, w - self._scrollbar_gutter())
         T, _dark = self._theme()
-        if self._search_pill_size != (w, h):
-            self._search_pill_photo = self._make_pill_photo(w, h, T["field"])
-            self._search_pill_size = (w, h)
+        if self._search_pill_size != (pw, h):
+            self._search_pill_photo = self._make_pill_photo(pw, h, T["field"])
+            self._search_pill_size = (pw, h)
         c.delete("all")
         c.create_image(0, 0, image=self._search_pill_photo, anchor="nw")
         if not self._search_active and not self.search_var.get():
             # 占位态：图标居中，不映射输入框
-            c.create_image(w // 2, h // 2, image=self._search_icon,
+            c.create_image(pw // 2, h // 2, image=self._search_icon,
                            anchor="center")
             return
         pad = int(round(9 * self._dpi))
@@ -2802,13 +3051,13 @@ class HistoryPanel:
         clear_w = 0
         if self.search_var.get():
             clear_w = int(round(18 * self._dpi))
-            item = c.create_text(w - pad - clear_w // 2, h // 2, text="✕",
+            item = c.create_text(pw - pad - clear_w // 2, h // 2, text="✕",
                                  fill=T["label3"], font=self._font(9))
             c.tag_bind(item, "<Button-1>", self._search_clear)
         self.search_entry_c.configure(bg=T["field"], fg=T["label"],
                                       insertbackground=T["label"])
         c.create_window(ex, h // 2, anchor="w", window=self.search_entry_c,
-                        width=max(20, w - ex - pad - clear_w), height=h - 2)
+                        width=max(20, pw - ex - pad - clear_w), height=h - 2)
 
     # ---------- 搜索激活状态机 ----------
     def _on_search_key(self, e):

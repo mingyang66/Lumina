@@ -21,6 +21,7 @@ import sys
 import time
 import tkinter as tk
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,11 +52,16 @@ WINDOW_BG = (242, 242, 247)
 
 
 def _make_row(i):
-    """构造一条字段齐全的假记录（缺字段会让 _render_list 抛 KeyError）。"""
+    """构造一条字段齐全的假记录（缺字段会让 _render_list 抛 KeyError）。
+
+    ``created_at`` 必须是**合法的**时间字符串且相对 now 递减：条数一多（滚动条
+    那条需要几十行才能溢出）时原来手写的 ``12:0{i}:00`` 会出现 ``12:040:00``
+    这种非法值，``_parse_ts`` 解析失败后分组标题与行高都会异常。
+    """
+    ts = (datetime.now() - timedelta(minutes=i)).strftime('%Y-%m-%d %H:%M:%S')
     return {
         "id": i, "kind": "text", "category": "text", "source": "vscode",
-        "content": f"示例文本 {i}",
-        "created_at": f"2026-10-30 12:0{i}:00", "pinned": 0,
+        "content": f"示例文本 {i}", "created_at": ts, "pinned": 0,
         "data": None, "file_path": "", "preview": f"示例文本 {i}",
         "meta": "", "tags": "", "size": 100, "hash": "",
     }
@@ -193,16 +199,52 @@ class LeftColumnAlignmentTests(unittest.TestCase):
     # ---------- 2. 卡片宽度撑满 ----------
 
     def test_card_width_fills_left_column(self):
-        """卡片宽度必须等于「左栏宽 - 2 * margin」，不能因改 margin 而变窄。"""
+        """卡片宽度必须撑满「左栏宽 - 2 * margin - 滚动条通道」。
+
+        右缘的滚动条通道（``_scrollbar_gutter()``）是**必须**扣掉的：指示条画在
+        画布内部的右缘，不从布局占位，卡片铺到画布最右就会被它压住。
+        除此之外不能再有任何额外收缩——那才是「列表比搜索框窄一圈」的缺陷。
+        """
         p = self.panel
         left_w = p.cards_canvas.winfo_width()
         margin = int(round(p._card_margin() * p._dpi))
+        gutter = p._scrollbar_gutter()
         self.assertGreater(left_w, 1, '画布尚未映射，宽度不可信')
+        self.assertGreater(gutter, 0, '滚动条通道宽度不能为 0，否则指示条会压卡片')
         self.assertEqual(
-            p._card_w, left_w - 2 * margin,
-            f'_card_w={p._card_w} 与 left_w({left_w}) - 2*margin({margin}) 不符')
+            p._card_w, left_w - 2 * margin - gutter,
+            f'_card_w={p._card_w} 与 left_w({left_w}) - 2*margin({margin})'
+            f' - gutter({gutter}) 不符')
 
-    # ---------- 3. 像素级对齐 ----------
+    # ---------- 3. 对齐（画布坐标 + 像素双保险） ----------
+
+    def test_cards_align_with_search_pill_by_canvas_bbox(self):
+        """画布坐标实测：卡片与搜索胶囊的左右边界必须一致。
+
+        **不依赖屏幕抓取**，比像素那条更耐环境（锁屏 / RDP 下 ``ImageGrab``
+        会直接 ``OSError: screen grab failed``）。卡片是精确指定宽度的位图，
+        胶囊也是按算出的 ``pw`` 贴的位图，``bbox`` 就是真实绘制范围。
+        """
+        p = self.panel
+        c = p.cards_canvas
+        self._pump(0.2)
+        bgs = c.find_withtag('cardbg')
+        self.assertTrue(bgs, '画布上没有卡片图元（列表可能是空的）')
+        card_left = min(c.bbox(i)[0] for i in bgs)
+        card_right = max(c.bbox(i)[2] for i in bgs)
+
+        sc = p._search_canvas
+        imgs = [i for i in sc.find_all() if sc.type(i) == 'image']
+        self.assertTrue(imgs, '搜索胶囊没画出来')
+        # 第 0 个是胶囊底图，其余是图标
+        pill = sc.bbox(imgs[0])
+        self.assertEqual(
+            pill[0], card_left,
+            f'胶囊左边界 {pill[0]} != 卡片左边界 {card_left}')
+        self.assertEqual(
+            pill[2], card_right,
+            f'胶囊右边界 {pill[2]} != 卡片右边界 {card_right}——'
+            '只给卡片让滚动条通道、没给胶囊让，上面那行会重新突出')
 
     @unittest.skipUnless(PIL_OK, '缺少 Pillow，无法做像素扫描')
     def test_cards_align_with_search_pill_horizontally(self):
@@ -211,14 +253,21 @@ class LeftColumnAlignmentTests(unittest.TestCase):
         **不能用 `winfo_width()` 代替**：卡片是圆角描边位图，画布宽度相等
         不代表绘制出来的可见边界相等（圆角处抗锯齿还会吃掉 1~2px）。
         这里对窗口做一次真实截图，逐像素找每一层的可见左右边界。
+
+        与上一条 canvas bbox 版重复是**故意的**：bbox 给的是绘制规格，
+        像素给的是最终可见结果（含抗锯齿与裁剪）。抓屏不可用时本条跳过，
+        由 bbox 那条兜底。
         """
         from PIL import ImageGrab
         p = self.panel
         self._pump(0.2)
         rx = p.win.winfo_rootx()
         ry = p.win.winfo_rooty()
-        img = ImageGrab.grab(bbox=(rx, ry, rx + p.win.winfo_width(),
-                                   ry + p.win.winfo_height())).convert('RGB')
+        try:
+            img = ImageGrab.grab(bbox=(rx, ry, rx + p.win.winfo_width(),
+                                       ry + p.win.winfo_height())).convert('RGB')
+        except OSError as exc:  # 锁屏 / RDP / 受保护桌面
+            self.skipTest(f'屏幕抓取不可用（{exc}），由 canvas bbox 那条兜底')
         base = self._left_col_origin()
         left_w = p._left_frame.winfo_width()
 
@@ -273,6 +322,77 @@ class LeftColumnAlignmentTests(unittest.TestCase):
         self.assertEqual(
             int(title_x), icon_x,
             f'分组标题 x={int(title_x)} 与卡片图标列 x={icon_x} 不对齐')
+
+    # ---------- 5. 右缘滚动条通道 ----------
+
+    def test_scrollbar_gutter_is_a_single_source_of_truth(self):
+        """滚动条通道宽度必须只有一个来源，且确实被卡片与搜索胶囊共用。
+
+        这条是「滚动条压着列表项」的**根因守卫**。指示条画在画布内部右缘，
+        不从布局占位，所以：
+        · 只缩小容器没用（容器窄了画布也窄，指示条跟着挪，永远重叠）；
+        · 给卡片让通道却不给搜索胶囊让，会让上面那行重新突出——等于把刚修好的
+          左右对齐换个方向又犯一遍。
+
+        所以必须断言源码里 ``_scrollbar_gutter()`` 被**至少两处**引用
+        （卡片宽度 + 搜索胶囊），而不是各处自己算 ``4 + 3 + 3``。
+        """
+        import re
+        src = (ROOT / 'lumina' / 'history_panel.py').read_text(encoding='utf-8')
+        calls = len(re.findall(r'self\._scrollbar_gutter\(\)', src))
+        self.assertGreaterEqual(
+            calls, 2,
+            f'只有 {calls} 处调用 _scrollbar_gutter()，'
+            '卡片宽度与搜索胶囊应各有一处')
+        # 不得再把 4+3+3 的魔数散写回去
+        self.assertNotIn('cw - 2 * margin - 10', src,
+                         '卡片宽度又写死通道宽度了，应改用 _scrollbar_gutter()')
+        self.assertNotIn('width=max(20, w - ex - pad - clear_w)', src,
+                         '搜索胶囊的宽度计算被绕开画布宽了，应与卡片共用 gutter')
+
+    def test_scroll_indicator_does_not_cover_cards(self):
+        """滚动指示条与卡片右边界之间必须留出间隙。
+
+        用户实测报告：「剪贴板左侧列表项中滚动条压着列表项了」。margin 改成 0
+        之后卡片铺满画布，指示条（画布右缘 4px 宽）就压在卡片右侧圆角上。
+        改之前卡片右边界 478、画布 493，中间那 8px 空隙把它挡在外面。
+
+        这里拿**画布坐标**比，不拿屏幕坐标：卡片是指定宽度的位图，
+        ``bbox`` 给的就是真实绘制范围，比 ``winfo_width()`` 精确得多。
+        """
+        p = self.panel
+        c = p.cards_canvas
+        # 指示条只在内容溢出时才画。临时塞一批行进去顶出滚动，测完还原——
+        # 依赖 setUp 里那 4 行会让这条永远 skip，等于没有守卫。
+        saved = p._rows_displayed
+        p._rows_displayed = [_Row(_make_row(i)) for i in range(1, 41)]
+        try:
+            p._render_list(c, p._rows_displayed, datetime.now(),
+                           row_h=int(round(66 * p._dpi)),
+                           tile_size=int(round(46 * p._dpi)),
+                           margin=int(round(p._card_margin() * p._dpi)),
+                           title_size=11, meta_size=9)
+            self._pump(0.2)
+            self.assertIsNotNone(
+                p._scroll_ind,
+                '滚动指示条仍未创建，_on_list_scroll 可能没被触发')
+            bgs = c.find_withtag('cardbg')
+            self.assertTrue(bgs, '画布上没有卡片图元')
+            card_right = max(c.bbox(i)[2] for i in bgs)
+            ind_x0 = c.coords(p._scroll_ind)[0]
+            # **必须要求真实间隙，不能只要求「不重叠」**：gutter 少算间隙那 3px
+            # 时卡片右边界正好等于指示条左边界，「>=」判等也算通过（实测漏过）。
+            # 而视觉上贴着同样难看——卡片右侧圆角描边有抗锯齿，紧贴会像是
+            # 被指示条切断。`SCROLLBAR_GAP` 就是为这条留白定义的。
+            want_gap = int(round(p.SCROLLBAR_GAP * p._dpi))
+            actual_gap = ind_x0 - card_right
+            self.assertGreaterEqual(
+                actual_gap, want_gap,
+                f'卡片右边界 {card_right} 与指示条左边界 {ind_x0:.0f} 之间'
+                f'只有 {actual_gap:.0f}px 间隙（应 >= {want_gap}px），'
+                '滚动条会贴住/压住列表项')
+        finally:
+            p._rows_displayed = saved
 
 
 if __name__ == '__main__':

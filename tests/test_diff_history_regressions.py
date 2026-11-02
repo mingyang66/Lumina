@@ -15,7 +15,12 @@ METHOD_NAMES = {
     '_cat_of', '_row_meta', '_diff_summary', '_build_diff_banner',
     '_layout_diff_banner', '_sync_diff_banner', '_fit_text', '_sync_theme',
     '_diff_role', '_diff_color', '_draw_diff_marker', '_render_list',
-    '_close_diff_session', '_view_diff',
+    '_close_diff_session', '_view_diff', '_card_margin', '_scrollbar_gutter',
+}
+# 这些方法在运行期会读类常量，必须一起抽出来，否则重组出的类里 `NameError`。
+CONST_NAMES = {
+    'SCROLLBAR_W', 'SCROLLBAR_RIGHT_PAD', 'SCROLLBAR_GAP',
+    'LEFT_RATIO', 'LEFT_MIN', 'LEFT_MAX', 'DETAIL_MIN',
 }
 
 
@@ -26,9 +31,19 @@ def load_history_methods():
                if isinstance(node, ast.FunctionDef) and node.name in METHOD_NAMES]
     if {node.name for node in methods} != METHOD_NAMES:
         raise AssertionError('HistoryPanel 缺少待测方法')
+    # 只取**普通** ``Assign``：``AnnAssign`` 的注解（``ClassVar[tuple]``）在
+    # exec 类体时会被求值，而这里没有导入 ``ClassVar``，会直接 NameError。
+    consts = [node for node in panel.body
+              if isinstance(node, ast.Assign)
+              and any(getattr(t, 'id', None) in CONST_NAMES
+                      for t in node.targets)]
+    found = {t.id for node in consts for t in node.targets
+             if getattr(t, 'id', None) in CONST_NAMES}
+    if found != CONST_NAMES:
+        raise AssertionError(f'HistoryPanel 缺少这些类常量：{CONST_NAMES - found}')
     # 直接执行源码方法，不导入真实 Tk、Win32 或剪贴板组件。
-    cls = ast.ClassDef(name='HistoryPanel', bases=[], keywords=[], body=methods,
-                       decorator_list=[])
+    cls = ast.ClassDef(name='HistoryPanel', bases=[], keywords=[],
+                       body=consts + methods, decorator_list=[])
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     namespace = {'FlatMenu': Mock()}
     exec(compile(module, str(SOURCE), 'exec'), namespace)
@@ -913,8 +928,17 @@ class DiffHistoryRegressionTests(unittest.TestCase):
                          if c.kwargs.get('font') == self.panel._font(9)]
                 self.assertEqual([c.args[0] for c in titles], [106, 106, 82])
                 self.assertEqual([c.args[0] for c in metas], [82, 82, 82])
+                # 文本可用宽度由卡片宽度推出：``card_w = 画布宽 - 2*margin
+                # - gutter``，而 gutter 是滚动指示条的通道（不改的话卡片会被
+                # 它压住）。这里按公式算而不是写死 236/260——gutter 一调就得
+                # 改数字的断言，等于把实现细节抄了两遍。
+                gutter = self.panel._scrollbar_gutter()
+                # 顺序是「每行先 title 后 meta」，第三行两个值相同
+                want = [236 - gutter, 260 - gutter,
+                        236 - gutter, 260 - gutter,
+                        260 - gutter, 260 - gutter]
                 self.assertEqual([c.args[2] for c in self.panel._fit_text.call_args_list],
-                                 [236, 260, 236, 260, 260, 260])
+                                 want)
                 self.assertEqual([c.args[2] for c in self.panel._row_card_bg.call_args_list],
                                  ['selected' if cid == selected else 'normal'
                                   for cid in ('1', '2', '3')])
