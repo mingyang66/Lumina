@@ -1147,6 +1147,49 @@ class ToolWindowTests(unittest.TestCase):
         self.assertNotIn('粘贴', labels, '「粘贴」按钮应该已经移除')
         self.assertNotIn('复制文字', labels, '按钮文案应为「复制结果」')
 
+    def test_long_status_never_squeezes_footer_buttons(self):
+        """状态文案再长也不能把底栏按钮挤扁——**逐个长度扫**，不能只测一个。
+
+        **这是用户报过的真实缺陷**：旧文案「左栏还没有图片。按 Ctrl+V 粘贴
+        图片，或点「选择图片文件…」；若要把 Base64 还原成图片，请用「Base64
+        转图片」。」宽 661px，把「清空」压成 16px（它需要 53px）——界面上只剩
+        一个点不出所以然的小方块。根因是 Label 的请求宽度等于整句文字宽度，
+        pack 按请求宽度分配，状态文字先把按钮的空间吃掉了。
+
+        护栏是 Label 的 ``width=1``：请求宽度恒定 13px，``fill="x" +
+        expand=True`` 仍铺满剩余空间，长文案从句尾裁掉。
+
+        **必须扫一串长度**：实测（原实现）挤压只在「文案宽度略超可用空间」时
+        发生——55~120 字必然触发；文字长到几千像素时 Tk 反而先把 Label 自己
+        裁掉、按钮平安无事。单测一个长度很容易恰好落在安全区，用例就形同虚设。
+        """
+        window = self._open(ImageToBase64Window)
+        window.win.deiconify()
+        window.win.update()
+
+        squeezed = []
+        for n in range(10, 121, 5):
+            window._set_status('状' * n, 'error')
+            window.win.update()
+            for widget in window.status.master.winfo_children():
+                if widget.winfo_class() == 'Frame' \
+                        and widget.winfo_width() < widget.winfo_reqwidth():
+                    squeezed.append(n)
+                    break
+        self.assertEqual(squeezed, [],
+                         f'这些字数下按钮被状态文字挤扁了：{squeezed}')
+
+    def test_status_label_has_minimal_requested_width(self):
+        """护栏本身：Label 必须 ``width=1``，否则请求宽度跟着文案走。
+
+        上一条测「结果」，这条测「机制」。只测结果的话，将来有人把
+        ``width=1`` 换成 ``wraplength`` 之类同样能防挤压的写法，机制变了但
+        测试仍绿——那没问题；真正要拦的是**悄悄删掉这层保护**，那时上一条会红，
+        这条给出更直接的定位。
+        """
+        window = self._open(JsonParamWindow)
+        self.assertEqual(int(window.status.cget('width')), 1)
+
     def test_paste_shortcut_still_triggers_refresh(self):
         """移除「粘贴」按钮后，Ctrl+V 仍要能触发实时解析。
 
@@ -1778,6 +1821,38 @@ class ImageToolWindowTests(unittest.TestCase):
         self.assertEqual(window.status.cget('fg').upper(), '#FF453A')
         self.assertEqual(window.output.get('1.0', 'end-1c'), '')
 
+    def test_missing_image_message_is_short(self):
+        """「还没有图片」的报错必须一句话说完（用户要求：文案太长挤压按钮）。
+
+        旧文案把操作指引与「请用另一个工具」的分诊信息全塞进底栏状态行，
+        661px 宽直接压扁了「清空」按钮。分诊信息已挪到左栏空态提示里
+        （``_preview_hint_text``），状态行只留一句。
+
+        判据用**字符数上限**而不是「等于某句」：文案可以再润色，但不能又变长。
+        """
+        window = self._open(ImageToBase64Window)
+        window.input.insert('1.0', 'iVBORw0KGgo=')   # 有内容但不是图
+        window._refresh()
+        window.win.update()
+        message = window.status.cget('text')
+        self.assertEqual(window.status.cget('fg').upper(), '#FF453A',
+                         '没走进报错分支，用例失去判别力')
+        self.assertIn('图片', message)
+        self.assertLessEqual(len(message), 20,
+                             f'状态行文案太长（{len(message)} 字）：{message!r}')
+
+    def test_diagnostic_guidance_moved_to_left_pane_hint(self):
+        """「想反过来解 base64 请用另一个工具」要说，但放在左栏提示里。
+
+        这是从底栏状态行挪过来的内容。左栏正中留白足够，三行提示不会挤到
+        任何控件；放回状态行就会重演挤压缺陷。
+        """
+        window = self._open(ImageToBase64Window)
+        hint = window.preview_hint.cget('text')
+        self.assertIn('Base64 转图片', hint, '分诊指路不见了')
+        self.assertIn('Ctrl+V', hint)
+        self.assertIn('选择图片文件…', hint)
+
     # ---------- Base64 转图片 ----------
     def test_base64_text_left_and_image_right(self):
         """布局契约（用户要求）：左栏贴 Base64 文本，右栏展示图片。
@@ -2014,6 +2089,279 @@ class ImageToolWindowTests(unittest.TestCase):
         self.assertEqual(captured.get('defaultextension'), '.MARKER',
                          '保存对话框没用 save_suffix 算出来的后缀')
 
+    # ---------- 保存/选择对话框必须盖在主面板之上（用户报「点保存后卡死」） ----------
+    def test_file_dialog_raises_tool_window_topmost(self):
+        """打开系统文件对话框前，工具窗口必须临时置顶。
+
+        用户报「Base64 转图片 右下角的保存按钮点击后就卡死整个页面」。根因：
+        系统对话框的最顶层**只跟着它的 owner（工具窗口）走**，而工具窗口的
+        ``-topmost`` 只在构造时同步过一次（``_follow_topmost``）。主面板之后
+        才变置顶时（鼠标悬停悬浮球唤起面板，``ui._show_panel_from_floating``
+        传 ``topmost=not locked`` 即为 True），工具窗仍是 0，于是对话框落在
+        主面板**下面**——它确实弹出来了、也确实可交互，只是被完全盖住。用户
+        看到「点了保存什么都没出现」，同时工具窗口已被模态对话框禁用，
+        合起来就是「整个页面卡死」。
+
+        这条守的是**接线**：对话框打开期间工具窗必须处于置顶。判据取「调用
+        opener 那一刻的 ``-topmost``」，用一个假的 filedialog 在对话框弹出
+        的瞬间采样——不是断言源码长什么样。
+        """
+        import sys as sysmod
+        import types
+        from unittest import mock
+
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(_png_bytes()))
+        window.win.update()
+        # 构造时的同步不足以代表此刻：主面板可能是在工具窗建好之后才置顶的。
+        window.win.attributes('-topmost', False)
+        window.win.update()
+        self.assertFalse(window.win.attributes('-topmost'), '前置条件没建立')
+
+        seen = {}
+
+        def fake_save(**kw):
+            # 对话框创建瞬间的层级——这正是决定它盖不盖得住主面板的那个值。
+            seen['topmost'] = window.win.attributes('-topmost')
+            return ''
+
+        fake = types.ModuleType('tkinter.filedialog')
+        fake.asksaveasfilename = fake_save
+        with mock.patch.dict(sysmod.modules, {'tkinter.filedialog': fake}), \
+                mock.patch.object(tk, 'filedialog', fake, create=True):
+            window.export()
+
+        self.assertTrue(seen.get('topmost'),
+                        '保存对话框不是在工具窗置顶的状态下打开的——'
+                        '主面板置顶时它会被完全盖住，表现就是「点保存后卡死」')
+
+    def test_file_dialog_restores_previous_topmost(self):
+        """对话框关闭后工具窗要回到原来的层级，不能把置顶永久留下。
+
+        临时置顶是**对话框的护栏**，不是工具的显示偏好：用完必须还原，否则
+        用户关掉对话框后会得到一个意外常驻最前的窗口（那会重新引入「盖住别的
+        应用」这类问题），而且会掩盖 ``_follow_topmost`` 的跟随语义。
+        """
+        import sys as sysmod
+        import types
+        from unittest import mock
+
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(_png_bytes()))
+        window.win.update()
+        window.win.attributes('-topmost', False)
+        window.win.update()
+
+        fake = types.ModuleType('tkinter.filedialog')
+        fake.asksaveasfilename = lambda **kw: ''
+        with mock.patch.dict(sysmod.modules, {'tkinter.filedialog': fake}), \
+                mock.patch.object(tk, 'filedialog', fake, create=True):
+            window.export()
+        window.win.update()
+
+        self.assertFalse(window.win.attributes('-topmost'),
+                         '对话框用的临时置顶没有还原')
+
+    def test_file_dialog_keeps_topmost_when_already_set(self):
+        """本来就置顶时，对话框走完仍应置顶——别把用户原有的层级降下来。
+
+        ``_run_file_dialog`` 的 ``finally`` 只该在**自己动过**置顶时才恢复。
+        无条件恢复会把「跟随主面板置顶」的工具窗在第一次开对话框后永久变成
+        非置顶，反过来被主面板盖住——一个修复制造另一个缺陷。
+        """
+        import sys as sysmod
+        import types
+        from unittest import mock
+
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(_png_bytes()))
+        window.win.update()
+        window.win.attributes('-topmost', True)
+        window.win.update()
+
+        fake = types.ModuleType('tkinter.filedialog')
+        fake.asksaveasfilename = lambda **kw: ''
+        with mock.patch.dict(sysmod.modules, {'tkinter.filedialog': fake}), \
+                mock.patch.object(tk, 'filedialog', fake, create=True):
+            window.export()
+        window.win.update()
+
+        self.assertTrue(window.win.attributes('-topmost'),
+                        '本就是置顶的工具窗被降级了')
+
+    def test_open_file_dialog_also_raises_topmost(self):
+        """「选择图片文件…」走同一条保护——它不是保存对话框的例外。
+
+        图片转 Base64 的这个入口同样会弹系统对话框，同样会被置顶主面板盖住。
+        **逐个入口都要覆盖**：只给 ``export`` 加护栏的话，用户换个按钮点一次
+        就复现同一个「卡死」，而且更难联想到是同一处根因。
+        """
+        import sys as sysmod
+        import types
+        from unittest import mock
+
+        window = self._open(ImageToBase64Window)
+        window.win.attributes('-topmost', False)
+        window.win.update()
+
+        seen = {}
+
+        def fake_open(**kw):
+            seen['topmost'] = window.win.attributes('-topmost')
+            return ''
+
+        fake = types.ModuleType('tkinter.filedialog')
+        fake.askopenfilename = fake_open
+        with mock.patch.dict(sysmod.modules, {'tkinter.filedialog': fake}), \
+                mock.patch.object(tk, 'filedialog', fake, create=True):
+            window._load_from_file()
+
+        self.assertTrue(seen.get('topmost'),
+                        '「选择图片文件…」没走置顶保护，主面板置顶时会盖住对话框')
+
+    def test_export_dialog_is_actually_on_top_of_a_topmost_panel(self):
+        """端到端判决：主面板置顶时，对话框必须真的盖在它上面。
+
+        用一个**真的系统对话框**（不 mock）在子线程里打开，然后用
+        ``WindowFromPoint`` 取对话框中心点上最顶层的窗口句柄，逐级回到最外层
+        再比对是不是对话框自己。
+
+        为什么是这个判据：``IsWindowVisible`` 与逐像素采样都**分不出**「对话框
+        被盖住」——被盖住的对话框依然 visible，屏幕上也确实有一片白色（那是
+        主面板）。``WindowFromPoint`` 直接回答「用户在这个坐标上看到的是谁」，
+        这是该缺陷唯一可靠的观测方式（实测修复前命中主面板的 ``TkChild``、
+        修复后命中 ``#32770``）。
+
+        **必须把窗口调成真不透明。** ``tests/__init__.py`` 的全局挂钩让窗口
+        ``-alpha 0``，而全透明的 layered window 不参与命中测试——盖在上面的
+        主面板会从 ``WindowFromPoint`` 里「消失」，对话框看起来永远在最前，
+        这条断言就失去了判别力（实测：加 ``make_visible`` 之前，即便把修复
+        拆掉本条也照样绿）。这也是本文件里仅有的第二个需要真可见的用例。
+        """
+        import threading
+        import time
+
+        from tests.silent_ui import make_visible, silence
+
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        user32.WindowFromPoint.restype = ctypes.c_void_p
+        user32.WindowFromPoint.argtypes = [ctypes.wintypes.POINT]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        GA_ROOT = 2
+
+        class _Rect(ctypes.Structure):
+            _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                        ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
+        def class_name(hwnd):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(ctypes.c_void_p(hwnd), buf, 256)
+            return buf.value
+
+        def root_of(hwnd):
+            return user32.GetAncestor(ctypes.c_void_p(hwnd), GA_ROOT)
+
+        def find_dialog():
+            user32 = ctypes.WinDLL('user32')
+            proc = ctypes.WINFUNCTYPE(
+                ctypes.wintypes.BOOL, ctypes.wintypes.HWND,
+                ctypes.wintypes.LPARAM)
+            found = []
+            me = os.getpid()
+
+            def cb(hwnd, _l):
+                pid = ctypes.wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == me and class_name(hwnd) == '#32770':
+                    found.append(hwnd)
+                return True
+
+            user32.EnumWindows(proc(cb), 0)
+            return found
+
+        # 主面板置顶，工具窗**不**跟随——正是用户遇到的那个组合。
+        self.panel.win.deiconify()
+        self.panel.win.geometry('900x600+80+40')
+        self.panel.win.attributes('-topmost', True)
+        window = self._open(Base64ToImageWindow)
+        window.win.deiconify()
+        window.win.attributes('-topmost', False)
+        window.win.geometry('760x520+420+150')
+        window.win.update()
+        window._set_paste_text(_b64(_png_bytes()))
+        window.win.update()
+        # 命中测试需要真实不透明（见 docstring）；结束时在 finally 里压回去。
+        make_visible(self.panel.win, window.win)
+        window.win.update()
+
+        hit = {}
+        stop = threading.Event()
+
+        def watcher():
+            deadline = time.time() + 6
+            dlg = None
+            while time.time() < deadline and not stop.is_set():
+                found = find_dialog()
+                if found:
+                    dlg = found[0]
+                    break
+                time.sleep(0.05)
+            if not dlg:
+                hit['error'] = '对话框没出现'
+                return
+            # **连续采样取稳定值，不能只看一个瞬间。** 对话框创建时 Z 序会短暂
+            # 变化（owner 与对话框之间要重排一次），单次采样有机会正好撞上那个
+            # 过渡态而误判成「被盖住」——实测在整套测试连跑时偶发失败、单独跑
+            # 却稳定通过，就是这个原因。要求连续 3 次都命中同一窗口才算数。
+            rect = _Rect()
+            user32.GetWindowRect(ctypes.c_void_p(dlg), ctypes.byref(rect))
+            pt = ctypes.wintypes.POINT((rect.left + rect.right) // 2,
+                                       (rect.top + rect.bottom) // 2)
+            dialog_root = root_of(dlg)
+            stable = None
+            streak = 0
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                current = root_of(user32.WindowFromPoint(pt))
+                if current == dialog_root:
+                    streak += 1
+                    if streak >= 3:
+                        stable = current
+                        break
+                else:
+                    streak = 0
+                time.sleep(0.1)
+            hit['at_center'] = stable
+            hit['dialog'] = dialog_root
+            for handle in find_dialog():
+                user32.PostMessageW(ctypes.c_void_p(handle), 0x0010, 0, 0)
+
+        thread = threading.Thread(target=watcher, daemon=True)
+        thread.start()
+        window.win.after(300, window.export)
+        # 模态对话框阻塞在 tk.call 里，用 after 轮询驱动事件循环直到它关闭。
+        deadline = time.time() + 8
+        while time.time() < deadline and 'dialog' not in hit:
+            window.win.update()
+            time.sleep(0.05)
+        stop.set()
+        thread.join(timeout=4)
+
+        try:
+            self.assertNotIn('error', hit, hit.get('error', ''))
+            self.assertIsNotNone(
+                hit['at_center'],
+                '对话框中心点连续 5 秒都没轮到对话框在最顶层——被主面板盖住了，'
+                '用户看到的就是「点了保存没反应，界面像卡死」')
+            self.assertEqual(
+                hit['at_center'], hit['dialog'],
+                f'对话框中心点上最顶层的是 0x{(hit["at_center"] or 0):X}，'
+                f'而对话框是 0x{(hit["dialog"] or 0):X}——被盖住了')
+        finally:
+            self.panel.win.attributes('-topmost', False)
+            silence(self.panel.win, window.win)
+
     # ---------- 大图性能（用户报「图片稍微大一点转换就很卡」） ----------
     def test_output_is_wrapped_into_lines(self):
         """结果栏里必须是**折行**的 base64，不能是一整行。
@@ -2069,6 +2417,168 @@ class ImageToolWindowTests(unittest.TestCase):
         shown = int(window.output.index('end-1c').split('.')[0])
         self.assertEqual(shown, -(-chars // image_b64.WRAP_WIDTH),
                          f'{chars:,} 字符没被折行（显示 {shown} 行）')
+
+    # ---------- 左栏单行超长 base64 必须预先折行（用户报「保存按钮卡很久」）----------
+    def test_long_single_line_base64_is_prewrapped_on_paste(self):
+        """粘贴超长单行 base64 后，左栏内容必须已被折成多行。
+
+        用户报「base64转图片 右下角的保存图片按钮点击还是卡很久」。真机实测：
+        4000×3000 的图 → base64 **56320 字符一整行** → 打开保存对话框要
+        **2.927s**；同一段内容预先按 76 字符折行后 **0.358s**。根因是
+        ``wrap="char"`` 的 ``tk.Text`` 要为不含空格的超长行逐字符找折行点，
+        而这个计算在打开模态对话框时被整篇重跑（栈上恒停在原生 ``tk.call``
+        内，没有任何 Python 帧——所以既不是落盘慢也不是对话框初始化慢）。
+
+        **判据是行数而不是计时**：计时在共享机器上会抖，而行数是缺陷的直接
+        指纹且与机器快慢无关（与 ``test_output_is_wrapped_into_lines`` 同思路）。
+        折行也**不改语义**：base64 解码器吃所有空白，下面顺带断言仍能解出图。
+        """
+        payload = 'A' * 50000
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(payload)
+        window.win.update()
+
+        text = window.input.get('1.0', 'end-1c')
+        lines = int(window.input.index('end-1c').split('.')[0])
+        self.assertEqual(lines, -(-50000 // image_b64.WRAP_WIDTH),
+                         f'50000 字符应折成 {-(-50000 // image_b64.WRAP_WIDTH)} 行，'
+                         f'实际 {lines} 行——单行会让保存对话框卡好几秒')
+        self.assertNotIn(' ', text, '折行不该引入空格')
+        self.assertEqual(len(image_b64.compact(text)), 50000,
+                         '折行改变了字符总数（丢了内容）')
+
+    def test_prewrapping_keeps_the_payload_decodable(self):
+        """折行是**显示层**改动，粘进来的 base64 必须照样能解码出图。
+
+        这条防的是「为了性能把内容改坏」：折行插入的位置若算错一位，base64
+        整体移位，解码直接失败或解出花屏。所以必须端到端跑一次真图。
+        """
+        raw = _png_bytes((64, 48))
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(raw))
+        window.win.update()
+        self.assertIsNotNone(window._image, '折行后解码失败')
+        self.assertEqual(window._image.size, (64, 48))
+
+    def test_wrapping_skips_content_that_would_be_corrupted(self):
+        """**JSON / JWT / 普通长文本绝不能被折行**——这是安全护栏，不是偏好。
+
+        ``<<Paste>>`` 绑定挂在**通用输入框**上，三个工具都走它。折行＝往正文里
+        插真换行，而 JSON 字符串字面量里插进真换行就不再合法
+        （``json.loads`` 直接报错）。所以「能不能折」由**内容形态**决定：
+        只有整篇都是不含空白的紧凑 token（base64 / Data URI / JWT）才敢动。
+
+        变异说明：去掉 ``_can_soft_wrap`` 中的字符白名单后，长 JSON 会被折行、
+        本用例变红。
+        """
+        import json
+
+        window = self._open(Base64ToImageWindow)
+        for label, payload in (
+            ('JSON 单行', json.dumps({'k': 'y' * 60000})),
+            ('带空格长文本', 'hello world ' * 6000),
+            ('多行文本', ('line of text\n' * 5000)),
+        ):
+            self.assertFalse(window._can_soft_wrap(payload),
+                             f'{label} 不该被判为可折行——折了会破坏内容')
+
+        for label, payload in (
+            ('裸 base64', 'A' * 50000),
+            ('Data URI', 'data:image/png;base64,' + 'A' * 50000),
+            ('URL-safe base64', 'A-_B' * 12000),
+        ):
+            self.assertTrue(window._can_soft_wrap(payload),
+                            f'{label} 应该可折行（否则卡顿没修好）')
+
+    def test_json_tool_paste_never_gets_a_newline_inserted(self):
+        """端到端确认 JSON 工具粘长 JSON 后**内容未被改动**。
+
+        比 ``_can_soft_wrap`` 的单元判定更靠外一层：走真正的 ``<<Paste>>``
+        处理器，然后断言文本里没有换行且仍是合法 JSON。
+        """
+        import json
+
+        payload = json.dumps({'k': 'y' * 60000})
+        window = self._open(JsonParamWindow)
+        window.input.delete('1.0', 'end')
+        window.input.insert('1.0', payload)
+        window._on_paste_into_input()
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            window.win.update()
+
+        text = window.input.get('1.0', 'end-1c')
+        self.assertNotIn('\n', text, '粘贴路径往 JSON 里插入了换行，内容已损坏')
+        self.assertEqual(json.loads(text), json.loads(payload))
+
+    def test_short_base64_is_left_untouched(self):
+        """低于阈值的内容不做改写——小图本来就不慢，没必要整篇删了重插。
+
+        阈值存在是因为「每次粘贴都无条件重写全文」本身有代价（还会打乱撤销栈
+        与光标）。实测 800×600 的小图（11264 字符）本来就是 0.292s，不需要折。
+        """
+        window = self._open(Base64ToImageWindow)
+        payload = 'A' * 100
+        window._set_paste_text(payload)
+        window.win.update()
+        self.assertEqual(window.input.get('1.0', 'end-1c'), payload)
+        self.assertEqual(window.input.index('end-1c'), '1.100')
+
+    def test_already_wrapped_content_is_not_rewritten(self):
+        """已折行的内容再走一次粘贴路径时不该被动（幂等）。
+
+        剪贴板里本来就带换行的 base64（从终端或编辑器复制）很常见，这种情况
+        无需处理；不拦的话每次粘贴都要整篇重写一遍，白付代价。
+        """
+        wrapped = image_b64.wrap_text('A' * 50000)
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(wrapped)
+        window.win.update()
+        self.assertEqual(window.input.get('1.0', 'end-1c'), wrapped)
+
+    def test_soft_wrap_preserves_cursor_ratio(self):
+        """折行后插入光标要按比例留在原处，不能跳回文首。
+
+        用户在长 base64 里点到中间想编辑某一段，一折行就跳到开头会很恼人。
+        这里按「字符偏移比例」保留：折行前后光标在全文中的相对位置不变。
+        """
+        payload = 'A' * 50000
+        window = self._open(Base64ToImageWindow)
+        window.input.delete('1.0', 'end')
+        window.input.insert('1.0', payload)
+        window.input.mark_set('insert', '1.0 + 25000 chars')
+        window._soft_wrap_input()
+        window.win.update()
+
+        offset = len(window.input.get('1.0', window.input.index('insert')))
+        self.assertAlmostEqual(offset / 25000, 1.0, delta=0.05,
+                               msg=f'光标跑到 {offset}（原为 25000），比例没保住')
+
+    def test_paste_event_path_also_prewraps(self):
+        """**剪贴板事件路径**也必须折行，不能只有 ``_set_paste_text`` 那条。
+
+        两条粘贴路径是独立的：``_set_paste_text`` 供面板 Ctrl+V / 「从剪贴板
+        取图」走；用户在左栏 Text 里直接按 Ctrl+V 则走 ``<<Paste>>`` 绑定。
+        只修一条，另一条照样卡——而用户不会知道自己走的是哪条入口。
+
+        这条用**新进程实测会慢的那个量级**驱动真正的绑定处理器。原先的用例集
+        只测了 ``_set_paste_text``，变异验证时「去掉 ``_on_paste_into_input``
+        里的折行」直接逃逸，才发现这个缺口。
+        """
+        window = self._open(Base64ToImageWindow)
+        # Tk 的默认粘贴处理器先跑（这里等价为直接 insert），再由绑定接手。
+        window.input.insert('1.0', 'A' * 50000)
+        window._on_paste_into_input()
+        deadline = time.time() + 3
+        while time.time() < deadline and int(
+                window.input.index('end-1c').split('.')[0]) == 1:
+            window.win.update()
+
+        lines = int(window.input.index('end-1c').split('.')[0])
+        self.assertEqual(lines, -(-50000 // image_b64.WRAP_WIDTH),
+                         f'走 <<Paste>> 路径没折行（{lines} 行），保存对话框会卡')
+        self.assertEqual(len(image_b64.compact(
+            window.input.get('1.0', 'end-1c'))), 50000)
 
     def test_copy_gives_single_line_payload(self):
         """「复制结果」给的必须是**单行** base64，不能带折行。

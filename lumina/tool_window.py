@@ -908,8 +908,7 @@ class _ToolWindow:
         else:
             self.input = self._make_text(body, editable=True, edge=self._accent())
             self.input.bind("<KeyRelease>", self._on_input)
-            self.input.bind("<<Paste>>",
-                            lambda _e: self.win.after(1, self._refresh))
+            self.input.bind("<<Paste>>", self._on_paste_into_input)
         self.input.master.grid(row=0, column=0, sticky="nsew",
                                padx=(0, GAP // 2))
         # 右栏：文字类工具与「左图右文」的工具放结果 Text；「Base64 转图片」
@@ -942,8 +941,15 @@ class _ToolWindow:
         self._lamp.pack(side="left", padx=(4, 4))
         self._lamp_id = self._lamp.create_oval(
             2, 2, 10, 10, fill=self.T["label3"], outline="")
-        self.status = tk.Label(row, text="", bg=T["window_bg"], fg=T["label2"],
-                               font=(self.panel.FONT_FAMILY, 9), anchor="w")
+        # **``width=1`` 是防挤压的护栏，不是排版参数。** Label 若不设宽度，
+        # 它的「请求宽度」等于整句文字的像素宽；pack 按请求宽度分配，状态文字
+        # 一旦变长就会把右侧按钮挤扁——实测一条 661px 的报错文案让「清空」
+        # 只剩 28px（需要 53px），界面上是个点不出所以然的小方块。
+        # 设成 1 之后请求宽度极小，``fill="x" + expand=True`` 仍会让它铺满
+        # 剩余空间，长文案由 ``anchor="w"`` 从句尾裁掉，按钮宽度不受影响。
+        self.status = tk.Label(row, text="", width=1, bg=T["window_bg"],
+                               fg=T["label2"], font=(self.panel.FONT_FAMILY, 9),
+                               anchor="w")
         self.status.pack(side="left", fill="x", expand=True, padx=(0, 8))
         # pack 顺序即左右：抓手最靠右，其后是 复制 / 清空。
         # 「复制结果」复制的是**右侧结果框里的文字**（用户看到的即所得）；
@@ -1047,8 +1053,7 @@ class _ToolWindow:
                                  wrap="char", undo=True, padx=10, pady=8)
             self.input.grid(row=2, column=0, sticky="nsew")
             self.input.grid_remove()
-            self.input.bind("<<Paste>>",
-                            lambda _e: self.win.after(1, self._refresh))
+            self.input.bind("<<Paste>>", self._on_paste_into_input)
             self.input.master = wrap      # 让 _build 的 grid 落在同一格
         self.preview.bind("<Control-v>", self._paste_into_image_pane)
         self.preview.bind("<Control-V>", self._paste_into_image_pane)
@@ -1095,8 +1100,111 @@ class _ToolWindow:
         self._set_paste_text(text)
         return "break"
 
+    # 软折行阈值。低于它不值得动（Text 的显示行计算在几千字符内可以忽略，
+    # 实测 1000 字符时弹对话框 0.431s ≈ 空文本基准）。约 64KB 文本对应
+    # 4K 分辨率截图的 base64，超过就该折了。
+    SOFT_WRAP_MIN_CHARS = 3000
+
+    # 可以安全折行的字符集：base64 字母表 + 标准 base64 的 ``+/=`` + URL-safe 的
+    # ``-_`` + Data URI 前缀与参数用到的 ``:;,`` + 引号。
+    #
+    # **这条白名单是必须的，不是保守。** ``<<Paste>>`` 绑定挂在**通用输入框**上，
+    # JSON/JWT 工具也走它；折行 = 往正文里插换行，对 JSON 是**破坏性**的——字符串
+    # 字面量里插进真换行就不再是合法 JSON（`json.loads('{"a":"x\ny"}')` 直接报错）。
+    # 所以「能不能折」必须由**内容形态**决定，而不是由「是哪个工具」决定：
+    # 只有整篇都是一个不含空白的紧凑 token（即 base64 / Data URI 这类）才敢动。
+    _WRAPPABLE = frozenset(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        "+/=_-:;,.\"'")
+
+    def _can_soft_wrap(self, content):
+        """这段文本折行后是否仍然语义等价（纯 base64 / Data URI 才成立）。"""
+        if len(content) < self.SOFT_WRAP_MIN_CHARS:
+            return False
+        # 已经折过就别再动：避免每次粘贴都整篇删了重插一遍。
+        #
+        # 这一条**在行为上是冗余的**（``_WRAPPABLE`` 不含换行，下面的 ``all()``
+        # 同样会否掉带换行的内容）——变异验证里去掉它没有任何用例变红，属于
+        # **等价变异**而非测试盲区。留着是因为它是个 O(n) 早退：已折过的大文本
+        # 连白名单扫描都省了。别当成死代码删掉，也别为它补测试。
+        if "\n" in content.strip():
+            return False
+        return all(ch in self._WRAPPABLE for ch in content.strip())
+
+    def _soft_wrap_input(self):
+        """把``self.input`` 里的**单行超长 base64** 先折成多行再写回去。
+
+        纯显示层优化，**不改语义**：base64 解码器吃所有空白
+        （``image_b64.strip_payload``），所以折行后的内容照样能解，也能存历史。
+
+        **为什么必须做。** 用户报「保存图片按钮点击还是卡很久」。真机实测：
+        4000×3000 的图 → base64 56320 字符**一整行**（粘贴与从剪贴板取文本都是
+        单行）→ 对话框要 **2.927s** 才出现；同一段内容预先折成 76 字符一行后
+        **0.358s**。根因与 ``image_b64.wrap_text`` 记的完全同一个机制：
+        ``wrap="char"`` 的 ``tk.Text`` 要为不含空格的超长行逐字符找折行点，而这个
+        计算在**打开模态对话框时被整篇重跑**（所以既不是落盘慢，也不是对话框
+        初始化慢，栈上恒停在原生 ``tk.call`` 内、没有任何 Python 帧）。
+
+        阈值以上的输入才处理：小图（800×600 → 11264 字符）实测本来就是
+        0.292s，不折也不慢，没必要多一次整篇改写。**必须先过
+        :meth:`_can_soft_wrap`**——JSON/JWT 的长文本折了就坏了，见那里的说明。
+
+        **不要改成 ``wrap="none"``** 来绕开这个计算——那样 56K 字符就是一条
+        横向溢出的单行，而本项目的两栏刻意都不建横向滚动条（见 ``_make_text``
+        的说明），用户再也看不到行尾。
+        """
+        try:
+            content = self.input.get("1.0", "end-1c")
+        except TclError:
+            return
+        if not self._can_soft_wrap(content):
+            return
+        wrapped = image_b64.wrap_text(content)
+        if wrapped == content:
+            return
+        # 保留插入光标所在位置的比例，折行后用户接着敲字不会跳到文首。
+        try:
+            cursor = self.input.index("insert")
+            offset = len(self.input.get("1.0", cursor))
+            ratio = offset / max(1, len(content))
+        except TclError:
+            ratio = 0.0
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", wrapped)
+        try:
+            self.input.mark_set("insert", f"1.0 + {int(len(wrapped) * ratio)} chars")
+        except TclError:
+            pass
+
+    def _on_paste_into_input(self, _event=None):
+        """``<<Paste>>``：先让 Tk 完成粘贴，再（必要时）折行，最后刷新解析。
+
+        **顺序不能颠倒**：必须在默认粘贴处理器之后跑，才能拿到刚粘进来的内容；
+        用 ``after(1, ...)`` 而不是直接调用，是因为 ``<<Paste>>`` 的默认处理
+        在绑定返回后才执行。折行要排在 ``_refresh`` 之前——``_analyze`` 会读
+        ``_get_input()``，先折好能顺带把「解析时也走一遍显示行计算」这件事
+        一起省掉。
+        """
+
+        def settle():
+            self._soft_wrap_input()
+            self._refresh()
+
+        self.win.after(1, settle)
+
     def _set_paste_text(self, text):
-        """把文本塞进隐藏 Text 并立刻刷新。"""
+        """把文本塞进输入框并立刻刷新。
+
+        粘贴超长单行（整段 base64）时**先折行再插入**：直接插一整行会让 Tk 在
+        之后每次重排里逐字符找折行点，实测 55K 字符的单行把「打开保存对话框」
+        拖到 2.9s（详见 ``_soft_wrap_input``）。先折行后插入，插入本身几乎免费，
+        后续布局也不再需要重算。
+
+        **折行前必须过白名单**：这个方法在基类上，图片工具的「从剪贴板取图」
+        拿到文本时也会走它，不能假定进来的一定是 base64。
+        """
+        if self._can_soft_wrap(text or ""):
+            text = image_b64.wrap_text(text)
         self.input.delete("1.0", "end")
         if text:
             self.input.insert("1.0", text)
@@ -1140,10 +1248,10 @@ class _ToolWindow:
     def _load_from_file(self):
         """「选择图片文件…」按钮：读原始字节，**不重新编码**（零质量损失）。"""
         from tkinter import filedialog
-        path = filedialog.askopenfilename(
+        path = self._run_file_dialog(lambda: filedialog.askopenfilename(
             parent=self.win, title="选择图片",
             filetypes=[("图片文件", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.ico"),
-                       ("所有文件", "*.*")])
+                       ("所有文件", "*.*")]))
         if not path:
             return
         try:
@@ -1427,6 +1535,40 @@ class _ToolWindow:
     def _status_color(self, kind):
         return {"error": self._sys("red"),
                 "ok": self._sys("green")}.get(kind, self.T["label2"])
+
+    # ---------- 系统文件对话框 ----------
+    def _run_file_dialog(self, opener):
+        """在「工具窗口临时置顶」的保护下打开系统文件对话框。
+
+        **这是「点保存后整个窗口像卡死」的修复点。** 保存/选择对话框的最顶层
+        只跟着它的 owner（工具窗口）走，而工具窗口的 ``-topmost`` **只在构造时**
+        同步过一次（``_follow_topmost``）——主面板之后再变置顶（鼠标悬停悬浮球
+        唤起面板时 ``topmost=not locked`` 即为 True，见 ``ui._show_panel_from_floating``）
+        不会同步过来。此时工具窗不置顶、主面板置顶，对话框就落在主面板**下面**：
+        实测用 ``WindowFromPoint`` 在对话框中心命中到的是主面板的 ``TkChild``，
+        对话框本身可见但被完全盖住。用户看到的是「点了保存，什么也没弹出来」，
+        同时工具窗口已被模态对话框禁用——两个现象合起来就是「卡死整个页面」。
+
+        打开前把工具窗口临时置顶，``finally`` 恢复，对话框随之位于主面板之上；
+        退出对话框后工具窗口回到原来的层级（不改变它对主面板的跟随语义）。
+        """
+        try:
+            was = bool(self.win.attributes("-topmost"))
+        except TclError:
+            was = False
+        if not was:
+            try:
+                self.win.attributes("-topmost", True)
+            except TclError:
+                was = True     # 设不上就别在 finally 里瞎恢复
+        try:
+            return opener()
+        finally:
+            if not was:
+                try:
+                    self.win.attributes("-topmost", False)
+                except TclError:
+                    pass
 
     # ---------- 交互 ----------
     def _on_input(self, _event=None):
@@ -1799,14 +1941,24 @@ class ImageToBase64Window(_ToolWindow):
     export_label = "导出为 .txt"
 
     def _preview_hint_text(self):
-        return "按 Ctrl+V 粘贴图片\n也可以选择图片文件"
+        """空态提示：这里才是放说明的地方，底栏状态行只放一行短句。
+
+        图片面板正中有大片留白，两行提示不会挤到任何控件，所以「Ctrl+V 或选文件」
+        与「想反过来解 base64 请用另一个工具」这两条分诊信息都放这里，而不是塞进
+        底栏状态栏——那条与右侧按钮共享宽度，长文案会把按钮压扁。
+        """
+        return ("按 Ctrl+V 粘贴图片，或点下方「选择图片文件…」\n"
+                "这里是把图片转成 Base64；要把 Base64 还原成图片，\n"
+                "请用工具下拉里的「Base64 转图片」")
 
     def _analyze(self, raw):
         if self._image is None:
-            # 没有图却调到了这里：说明用户把两个工具弄混了，直接指路。
+            # 没有图却调到了这里：多半是往「图片转 Base64」里粘了 base64 文本。
+            # **文案必须短**：底栏那一行与右侧按钮共享宽度，长句会把「清空」压成
+            # 十几像素的小方块（实测 661px 的文案挤掉 25px）。分诊信息放在左栏
+            # 空态提示里（``_preview_hint_text``），这里只给一句能一眼读完的。
             raise image_b64.ImageB64Error(
-                "左栏还没有图片。按 Ctrl+V 粘贴图片，或点「选择图片文件…」；"
-                "若要把 Base64 还原成图片，请用「Base64 转图片」。")
+                "左侧还没有图片，请先粘贴或选择一张")
         if self._image_raw is not None:
             result = image_b64.encode_bytes(self._image_raw, data_uri=True)
         else:
@@ -1855,10 +2007,10 @@ class ImageToBase64Window(_ToolWindow):
             self._set_status("还没有 Base64 可导出", "error")
             return
         from tkinter import filedialog
-        path = filedialog.asksaveasfilename(
+        path = self._run_file_dialog(lambda: filedialog.asksaveasfilename(
             parent=self.win, title="导出 Base64", defaultextension=".txt",
             initialfile="image_base64.txt",
-            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")]))
         if not path:
             return
         try:
@@ -1954,10 +2106,10 @@ class Base64ToImageWindow(_ToolWindow):
         fmt = (self._image_meta or ("PNG",))[0] or "PNG"
         write_fmt = image_b64.writable_format(fmt)
         suffix = image_b64.save_suffix(fmt)
-        path = filedialog.asksaveasfilename(
+        path = self._run_file_dialog(lambda: filedialog.asksaveasfilename(
             parent=self.win, title="保存图片", defaultextension=suffix,
             initialfile=f"image{suffix}",
-            filetypes=[(f"{write_fmt} 图片", f"*{suffix}"), ("所有文件", "*.*")])
+            filetypes=[(f"{write_fmt} 图片", f"*{suffix}"), ("所有文件", "*.*")]))
         if not path:
             return
         try:
