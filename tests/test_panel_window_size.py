@@ -93,7 +93,11 @@ class WindowSizeTests(unittest.TestCase):
         return HistoryPanel(self.root, tk, _FakeUI(config))
 
     def _rebuild(self, config):
-        """换一份 config 重建面板（配置只在构造期读一次）。"""
+        """换一份 config 重建面板（配置只在构造期读一次）。
+
+        新建的 Toplevel 由 ``tests/__init__.py`` 的全局挂钩自动设成透明，
+        这里不需要额外处理。
+        """
         try:
             self.panel.win.destroy()
         except tk.TclError:

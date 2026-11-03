@@ -11,4 +11,11 @@
 顶层目录由 discover 的起始目录决定；也可显式指定
 ``python -m unittest discover -s tests -t .``，此时项目根会被加入 sys.path，
 测试内的 ``import main`` 与 ``from lumina import ...`` 均可正常解析。
+
+这里还装了一个**全局静默挂钩**：让测试创建的 Tk 窗口默认完全透明，跑测试时
+不在屏幕上闪。挂在包初始化里，所有测试模块都自动生效。详见
+``tests/silent_ui.py``。
 """
+from tests import silent_ui
+
+silent_ui.silence_windows()

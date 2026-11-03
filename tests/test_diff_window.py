@@ -547,6 +547,9 @@ class DiffWindowTests(unittest.TestCase):
         real_tk_patch = patch.object(diff_window.ImageTk, 'tkinter', tk)
         real_tk_patch.start()
         self.addCleanup(real_tk_patch.stop)
+        # 本用例要真的建 Tk 窗口跑事件分发。窗口由 tests/__init__.py 的全局
+        # 挂钩设成全透明——仍需 mapped（``event_generate`` 与 ``focus_get``
+        # 都要求如此），实测 mapped 状态下事件分发与焦点行为不变，只是不画。
         window = diff_window.DiffWindow(SimpleNamespace(_root=root, _tk=tk,
                                         actions=self.ui.actions), self.left, self.right)
         self.addCleanup(window.close)

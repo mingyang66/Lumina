@@ -103,6 +103,15 @@ class _FakeUI:
 
 @unittest.skipUnless(TK_OK, SKIP_REASON)
 class LeftColumnAlignmentTests(unittest.TestCase):
+    """左栏对齐。
+
+    窗口由 ``tests/__init__.py`` 装的全局挂钩设成完全透明：照常映射
+    （``winfo_rootx()`` 等需要 mapped 才准），但屏幕上不画，跑测试不会闪。
+    唯一需要真实可见的是 :meth:`test_cards_align_with_search_pill_horizontally`
+    ——它用 ``ImageGrab`` 逐像素找可见边界，抓全透明窗口只能拿到背景，所以
+    那条在抓屏前临时把窗口恢复成不透明，抓完再压回去。
+    """
+
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()
@@ -257,17 +266,28 @@ class LeftColumnAlignmentTests(unittest.TestCase):
         与上一条 canvas bbox 版重复是**故意的**：bbox 给的是绘制规格，
         像素给的是最终可见结果（含抗锯齿与裁剪）。抓屏不可用时本条跳过，
         由 bbox 那条兜底。
+
+        **唯一需要窗口真可见的用例**：本类平时把窗口设成全透明（跑测试不闪屏），
+        但全透明窗口抓到的只有背景，所以这里临时恢复不透明、抓完立刻压回去。
+        窗口只在这一次抓屏期间可见。
         """
         from PIL import ImageGrab
+
+        from tests.silent_ui import make_visible, silence
         p = self.panel
         self._pump(0.2)
         rx = p.win.winfo_rootx()
         ry = p.win.winfo_rooty()
         try:
+            # 透明窗口抓屏 = 抓到背景。恢复不透明 → 抓 → 立刻压回透明。
+            make_visible(self.root, p.win)
+            self._pump(0.15)
             img = ImageGrab.grab(bbox=(rx, ry, rx + p.win.winfo_width(),
                                        ry + p.win.winfo_height())).convert('RGB')
         except OSError as exc:  # 锁屏 / RDP / 受保护桌面
             self.skipTest(f'屏幕抓取不可用（{exc}），由 canvas bbox 那条兜底')
+        finally:
+            silence(self.root, p.win)
         base = self._left_col_origin()
         left_w = p._left_frame.winfo_width()
 

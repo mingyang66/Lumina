@@ -2,8 +2,10 @@
 
 需要真实 Tk；TTY 环境无 Tk 时整体跳过，避免 CI 报错。
 """
+import base64
 import ctypes
 import os
+import random
 import sys
 import time
 import tkinter as tk
@@ -13,7 +15,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from lumina import taskbar  # noqa: E402
+from lumina import image_b64, taskbar  # noqa: E402
+from lumina import tool_window as TW  # noqa: E402
 from lumina.history_panel import HistoryPanel  # noqa: E402
 from lumina.tool_window import (  # noqa: E402
     JSON_MODE_LABELS,
@@ -25,6 +28,8 @@ from lumina.tool_window import (  # noqa: E402
     WS_MAXIMIZEBOX,
     WS_MINIMIZEBOX,
     WS_SYSMENU,
+    Base64ToImageWindow,
+    ImageToBase64Window,
     JsonParamWindow,
     JwtWindow,
     open_tool,
@@ -94,6 +99,13 @@ class FakePanel:
 
 @unittest.skipUnless(TK_OK, SKIP_REASON)
 class ToolWindowTests(unittest.TestCase):
+    """工具窗口。
+
+    窗口由 ``tests/__init__.py`` 的全局挂钩设成全透明，跑测试不在屏幕上闪。
+    例外是 :meth:`test_edge_pixels_actually_hit_the_zone_not_the_shell`——
+    它用 ``winfo_containing`` 做屏幕命中测试，必须真可见。
+    """
+
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()
@@ -366,6 +378,11 @@ class ToolWindowTests(unittest.TestCase):
         """
         window = self._open(JsonParamWindow)
         window.win.geometry('920x640+420+180')
+        # **必须可见**：`winfo_containing` 是对屏幕坐标做命中测试，而全透明的
+        # layered window 不参与命中——实测 alpha=0 时 (1,1) 返回 None，
+        # 这条会假红。只有本用例需要可见，跑完立刻压回透明。
+        from tests.silent_ui import make_visible, silence
+        make_visible(window.win)
         window.win.update()
         window.win.update_idletasks()
 
@@ -403,6 +420,7 @@ class ToolWindowTests(unittest.TestCase):
         # 正文区不能被热区覆盖——否则用户点边框附近的文字会变成改尺寸
         self.assertIsNone(hit_name(w // 2, h // 2), '窗口中心被热区盖住了')
         self.assertIsNone(hit_name(w // 2, 20), '顶栏被热区盖住了')
+        silence(window.win)      # 用完立刻压回透明，后面的用例照旧不闪
 
     def _drag_edge(self, window, name, dx, dy):
         """模拟从某条边/角拖拽，返回窗口几何的实际变化量。"""
@@ -875,9 +893,15 @@ class ToolWindowTests(unittest.TestCase):
         self.assertNotEqual(ok_color, bad_color)
 
     # ---------- 通用骨架 ----------
-    def test_tool_registry_has_two_tools(self):
+    def test_tool_registry_keys_and_order(self):
+        """注册表顺序即下拉顺序。图片两个工具排在两个文本工具之后。
+
+        这是**有意的分组**：JSON / JWT 是「文本转换」，图片两个是「二进制
+        转换」，中间那条界线让用户不必在一次扫视里比较两类东西。加新工具时
+        想插队就要改这条，逼着人想一下分组是否还成立。
+        """
         keys = [key for key, _label, _cls in TOOLS]
-        self.assertEqual(keys, ['json', 'jwt'])
+        self.assertEqual(keys, ['json', 'jwt', 'img2b64', 'b642img'])
 
     def test_registry_label_matches_window_title(self):
         """注册表里的下拉文案必须与窗口标题一致。
@@ -892,16 +916,58 @@ class ToolWindowTests(unittest.TestCase):
                 self.assertEqual(label, cls.title,
                                  f'{key} 的下拉文案与窗口标题不一致')
 
-    def test_tool_names_use_current_wording(self):
-        """工具名措辞：**JSON 格式化** / **JWT 解密**。
+    def test_every_tool_has_a_registered_icon(self):
+        """注册表里每个工具都必须配了图标字形。
 
-        用户原话：「工具下拉框选项JSON参数-改为 JSON格式化  JWT解析-JWT解密」。
-        这是用户偏好而非技术判断（「解密」严格说只解码不验签，但那是文案选择），
-        别再以"更准确"为理由改回「参数」「解析」。
+        漏登记时下拉不会报错——``TOOL_ICONS.get(key, ("?", "gray"))`` 会静默
+        回退成灰色「?」，用户看到的就是一个意义不明的方块。变异验证时确实
+        漏过：删掉 ``"img2b64"`` 那一行，全套 106 项测试依然全绿。
+
+        同时钉住「字形非空、颜色是已知系统色」——空字形画出来是个空心框，
+        同样没有信息量。
+        """
+        from lumina.history_panel import HistoryPanel
+        icons = HistoryPanel.TOOL_ICONS
+        for key, _label, _cls in TOOLS:
+            with self.subTest(tool=key):
+                self.assertIn(key, icons, f'{key} 没有配图标，下拉里会显示灰色 ?')
+                mark, color = icons[key]
+                self.assertTrue(mark, f'{key} 的字形是空的')
+                self.assertLessEqual(len(mark), 3,
+                                     f'{key} 的字形太长，方块里塞不下')
+                self.assertIn(color, HistoryPanel.SYS_COLORS,
+                              f'{key} 的配色不是已知系统色')
+
+    def test_tool_icon_table_has_no_stale_entries(self):
+        """反向：图标表里不能留着已经不存在的工具 key。
+
+        只查「每个工具都有图标」会让删掉的工具在表里慢慢堆积——某天有人把
+        ``json`` 改名，旧条目留在那里谁也不会发现。
+        """
+        from lumina.history_panel import HistoryPanel
+        keys = {key for key, _label, _cls in TOOLS}
+        extra = set(HistoryPanel.TOOL_ICONS) - keys
+        self.assertFalse(extra, f'图标表里有不存在的工具：{sorted(extra)}')
+
+    def test_tool_names_use_current_wording(self):
+        """工具名措辞：**JSON 格式化** / **JWT 解密** / 图片双向转换。
+
+        前两条是用户原话：「工具下拉框选项JSON参数-改为 JSON格式化
+        JWT解析-JWT解密」。这是用户偏好而非技术判断（「解密」严格说只解码
+        不验签，但那是文案选择），别再以"更准确"为理由改回「参数」「解析」。
+
+        图片两条的措辞理由：
+        - **「转」而不是「编码/解码」**——对用户来说这是同一次转换的两个方向，
+          统一动词才看得出它们是一对。
+        - **「Base64」居中在前者、在前者在后者**（图片转 Base64 / Base64 转
+          图片），方向由词序自然读出，不需要「→」这类符号（下拉框里会很挤）。
+        - **「Base64」大小写固定**，不写 base64 也不写 BASE64：官方写法就是这个。
         """
         labels = {key: label for key, label, _cls in TOOLS}
         self.assertEqual(labels['json'], 'JSON 格式化')
         self.assertEqual(labels['jwt'], 'JWT 解密')
+        self.assertEqual(labels['img2b64'], '图片转 Base64')
+        self.assertEqual(labels['b642img'], 'Base64 转图片')
 
     def test_open_tool_rejects_unknown_key(self):
         with self.assertRaises(ValueError):
@@ -910,9 +976,13 @@ class ToolWindowTests(unittest.TestCase):
     def test_open_tool_returns_expected_window(self):
         json_window = open_tool(self.panel, 'json')
         jwt_window = open_tool(self.panel, 'jwt')
-        self.created += [json_window, jwt_window]
+        img_window = open_tool(self.panel, 'img2b64')
+        b64_window = open_tool(self.panel, 'b642img')
+        self.created += [json_window, jwt_window, img_window, b64_window]
         self.assertIsInstance(json_window, JsonParamWindow)
         self.assertIsInstance(jwt_window, JwtWindow)
+        self.assertIsInstance(img_window, ImageToBase64Window)
+        self.assertIsInstance(b64_window, Base64ToImageWindow)
 
     # ---------- ESC = 最小化到任务栏 ----------
     def test_escape_minimizes_instead_of_closing(self):
@@ -1438,7 +1508,6 @@ class ToolWindowTests(unittest.TestCase):
 
     # ---------- JWT ----------
     def _token(self, payload, header=None):
-        import base64
         import json as jsonlib
         def enc(obj):
             raw = jsonlib.dumps(obj, ensure_ascii=False).encode('utf-8')
@@ -1487,7 +1556,6 @@ class ToolWindowTests(unittest.TestCase):
         self.assertIn('alg=RS256', window.status.cget('text'))
 
     def test_jwt_no_signature_states_alg_none(self):
-        import base64
         import json as jsonlib
         def enc(obj):
             raw = jsonlib.dumps(obj).encode()
@@ -1495,6 +1563,817 @@ class ToolWindowTests(unittest.TestCase):
         window = self._open(JwtWindow)
         self._type(window, f'{enc({"alg": "none"})}.{enc({"sub": "1"})}')
         self.assertIn('alg=none', window.output.get('1.0', 'end-1c'))
+
+
+def _png_bytes(size=(40, 30), color=(220, 60, 60)):
+    """内存里造一张 PNG，不落任何临时文件。"""
+    import io as iolib
+
+    from PIL import Image
+    buffer = iolib.BytesIO()
+    Image.new('RGB', size, color).save(buffer, 'PNG')
+    return buffer.getvalue()
+
+
+def _b64(text):
+    import base64 as b64lib
+    return b64lib.b64encode(text).decode('ascii')
+
+
+def _jpeg_bytes(size=(28, 20), quality=85):
+    """内存里造一张 JPEG。前缀那条测试需要**非 PNG** 的格式。"""
+    import io as iolib
+
+    from PIL import Image
+    buffer = iolib.BytesIO()
+    Image.new('RGB', size, (40, 120, 220)).save(buffer, 'JPEG', quality=quality)
+    return buffer.getvalue()
+
+
+def _data_uri(raw, mime='image/png'):
+    """原始字节 → 带前缀的 Data URI（单行，与「复制结果」的产物同形）。"""
+    return f'data:{mime};base64,' + _b64(raw)
+
+
+@unittest.skipUnless(TK_OK, SKIP_REASON)
+class ImageToolWindowTests(unittest.TestCase):
+    """图片 ↔ Base64 两个工具窗口。
+
+    纯逻辑（编码/解码/异常）在 ``tests/test_image_b64.py`` 里已经测透，这里
+    只盯**外壳接线**：左栏换成了图片面板、按钮对不对、状态灯跟不跟、清空是否
+    真的把图和缓存一起丢掉。
+    """
+
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.panel = FakePanel(self.root, tk)
+        self.created = []
+
+    def tearDown(self):
+        for window in self.created:
+            window.close()
+        if hasattr(self, '_tmp_ctx'):
+            self._tmp_ctx.cleanup()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _open(self, cls):
+        window = cls(self.panel)
+        key = next((k for k, _l, c in TOOLS if c is cls), None)
+        if key is not None:
+            registry = getattr(self.panel, '_tool_windows', None)
+            if registry is None:
+                registry = {}
+                self.panel._tool_windows = registry
+            registry[key] = window
+        self.created.append(window)
+        window.win.update()
+        return window
+
+    def _buttons(self, window):
+        return [str(w.cget('text')) for w in self._descendants(window.win)
+                if isinstance(w, tk.Button)]
+
+    def _type(self, window, text):
+        window.input.delete('1.0', 'end')
+        window.input.insert('1.0', text)
+        window._refresh()
+
+    def _descendants(self, widget):
+        found = []
+        for child in widget.winfo_children():
+            found.append(child)
+            found += self._descendants(child)
+        return found
+
+    # ---------- 布局 ----------
+    def test_left_column_is_a_preview_not_a_text_box(self):
+        """左栏必须是图片预览。**不能留一个能键入的空文本框**——图片打不进去。
+
+        判据是「预览已 mapped」且「隐藏 Text 未 mapped」：后者正是被
+        ``grid_remove()`` 藏起来的那个粘贴入口，它必须还在（删除会丢掉
+        base64 的粘贴路径），但绝不能占屏幕。
+        """
+        window = self._open(ImageToBase64Window)
+        self.assertTrue(window.uses_image_pane)
+        self.assertTrue(window.preview.winfo_ismapped(), '预览区没有显示')
+        self.assertFalse(window.input.winfo_ismapped(),
+                         '隐藏的粘贴 Text 不该占屏幕')
+
+    def test_left_column_matches_right_column_width(self):
+        """两栏仍要等宽——换了左栏内容不能把这条既有约束弄丢。"""
+        window = self._open(ImageToBase64Window)
+        self.assertEqual(window.preview.master.master.winfo_width(),
+                         window.output.master.winfo_width())
+
+    def test_hint_asks_for_ctrl_v(self):
+        """空态提示必须写明 Ctrl+V：这是本工具的主要输入方式。
+
+        **判据用 ``assertIn(('', 'normal'))``**：Tk 对未显式设过 state 的 canvas
+        项返回空字符串，语义上等同于 ``normal``。直接断言 ``== 'normal'`` 会红，
+        而这个差别与「提示可见与否」无关，不能拿它当判据。
+        """
+        window = self._open(ImageToBase64Window)
+        self.assertIn('Ctrl+V', window.preview_hint.cget('text'))
+        self.assertIn(window.preview.itemcget(window._hint_id, 'state'),
+                      ('', 'normal'), '空态提示被隐藏了')
+
+    def test_open_file_button_is_named_for_files(self):
+        """文件名按钮要带省略号：它确实会弹对话框，省略号是这个约定的标记。"""
+        window = self._open(ImageToBase64Window)
+        labels = self._buttons(window)
+        self.assertIn('选择图片文件…', labels)
+        self.assertIn('从剪贴板取图', labels)
+
+    # ---------- 图片转 Base64 ----------
+    def test_image_encodes_to_base64_in_output(self):
+        import base64 as b64lib
+        raw = _png_bytes()
+        window = self._open(ImageToBase64Window)
+        self.assertTrue(window._adopt_raw(raw, source='t.png'))
+        window.win.update()
+        text = window.output.get('1.0', 'end-1c')
+        # 结果栏里是折行的 Data URI，去空白后再解。
+        self.assertEqual(b64lib.b64decode(image_b64.strip_payload(text)[0]), raw,
+                         '结果不是原字节的 base64——中间被重新编码了')
+        self.assertIn('PNG', window.status.cget('text'))
+        self.assertEqual(window.status.cget('fg').upper(), '#30D158')
+        self.assertEqual(window._lamp.itemcget(window._lamp_id, 'fill').upper(),
+                         '#30D158')
+
+    def test_preview_shows_photo_and_hides_hint(self):
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(_png_bytes(), source='t.png')
+        window.win.update()
+        self.assertTrue(window.preview.find_withtag('photo'), '预览没有画出图像')
+        self.assertEqual(window.preview.itemcget(window._hint_id, 'state'),
+                         'hidden', '有图之后空态提示还在')
+
+    def test_result_carries_data_uri_prefix(self):
+        """产物必须带 ``data:image/png;base64,`` 前缀（用户明确要求）。
+
+        也能被「Base64 转图片」原样解回来——前缀是可选输入，不是额外负担。
+        """
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(_png_bytes(), source='t.png')
+        window.win.update()
+        text = window.output.get('1.0', 'end-1c')
+        self.assertTrue(text.startswith('data:image/png;base64,'),
+                        f'前提缀缺失：{text[:40]!r}')
+        self.assertEqual(window._payload, image_b64.compact(text),
+                         '产物缓冲与结果栏内容不一致')
+        self.assertEqual(image_b64.decode_base64(window._payload).format, 'PNG')
+
+    def test_clear_drops_image_and_restores_hint(self):
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(_png_bytes(), source='t.png')
+        window.win.update()
+        window._clear()
+        window.win.update()
+        self.assertIsNone(window._image)
+        self.assertEqual(window.output.get('1.0', 'end-1c'), '')
+        self.assertEqual(window.preview.itemcget(window._hint_id, 'state'),
+                         'normal', '清空后空态提示没回来')
+
+    def test_image_tool_export_buttons_are_present(self):
+        """图片工具的导出按钮在场，且文案与「导出的是图片」相符。"""
+        img_labels = self._buttons(self._open(ImageToBase64Window))
+        b64_labels = self._buttons(self._open(Base64ToImageWindow))
+        self.assertIn('导出为 .txt', img_labels)
+        self.assertIn('保存图片…', b64_labels)
+        # 「导出图片」这种写法会被读成「把图另存出来」，而这里导出的是 .txt。
+        self.assertNotIn('导出图片', img_labels)
+        self.assertNotIn('', img_labels)
+        self.assertNotIn('', b64_labels)
+
+    def test_text_tools_have_exactly_two_footer_buttons(self):
+        """文本工具的底栏必须**恰好**是「复制结果」「清空」两个按钮。
+
+        **不能只查文字**。原先这条用「文字里没有『导出』」判断，但变异验证
+        揭出真相：去掉 ``if self.export_label:`` 这个判断后，文本工具会多出
+        一个**空文字按钮**——它没有文字，按文字比对的断言完全看不见，界面
+        上就是一个点不出所以然的小方块。
+
+        所以判据换成「按钮数量 + 非空文字」。空文字按钮在用户眼里是一个
+        无意义的方框，与「多了一个导出按钮」是同一个缺陷的两个面孔。
+        """
+        for cls, name in ((JsonParamWindow, 'JSON'), (JwtWindow, 'JWT')):
+            with self.subTest(tool=name):
+                window = self._open(cls)
+                buttons = [str(w.cget('text'))
+                           for w in self._descendants(window.win)
+                           if isinstance(w, tk.Button)]
+                # 「JSON ▾」是 JSON 工具特有的下拉入口，不算底栏动作按钮。
+                footer = [t for t in buttons if t not in ('', 'JSON ▾')]
+                self.assertEqual(footer, ['复制结果', '清空'],
+                                 f'{name} 底栏按钮不对：{buttons}')
+                self.assertNotIn('', buttons, f'{name} 出现了空文字按钮')
+
+    def test_bad_file_bytes_report_error_without_crashing(self):
+        window = self._open(ImageToBase64Window)
+        self.assertFalse(window._adopt_raw(b'not an image at all'))
+        self.assertEqual(window.status.cget('fg').upper(), '#FF453A')
+        self.assertEqual(window.output.get('1.0', 'end-1c'), '')
+
+    # ---------- Base64 转图片 ----------
+    def test_base64_text_left_and_image_right(self):
+        """布局契约（用户要求）：左栏贴 Base64 文本，右栏展示图片。
+
+        与「图片转 Base64」正好镜像。左栏必须是**可见可编辑**的 Text；
+        右栏是图片面板、**没有**结果 Text——格式/尺寸/体积进状态栏。
+        面板也不建隐藏 Text（``self.input`` 就是左栏那个可见框）。
+        """
+        window = self._open(Base64ToImageWindow)
+        self.assertEqual(str(window.input.cget('state')), 'normal',
+                         '左栏 Base64 文本框必须可编辑')
+        self.assertEqual(window.input.master.grid_info()['column'], 0,
+                         'Base64 输入框应占据左栏')
+        self.assertEqual(window.image_pane.grid_info()['column'], 1,
+                         '图片预览面板应占据右栏')
+        self.assertFalse(hasattr(window, 'output'),
+                         '右栏是图片面板，不应再建结果文本框')
+        # 镜像的另一侧不能被顺手改掉：图片转 Base64 仍是左图右文。
+        img_window = self._open(ImageToBase64Window)
+        self.assertIs(img_window.input.master, img_window.image_pane,
+                      '图片转 Base64 的输入框应是面板里的隐藏 Text')
+        self.assertEqual(img_window.image_pane.grid_info()['column'], 0)
+        self.assertEqual(img_window.output.master.grid_info()['column'], 1)
+
+    def test_base64_decodes_into_preview(self):
+        from PIL import Image
+        raw = _png_bytes((24, 18))
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(raw))
+        window.win.update()
+        self.assertIsInstance(window._image, Image.Image)
+        self.assertEqual(window._image.size, (24, 18))
+        self.assertTrue(window.preview.find_withtag('photo'))
+        # 右栏没有文字结果了：格式与尺寸只进状态栏。
+        status = window.status.cget('text')
+        self.assertIn('PNG', status)
+        self.assertIn('24 × 18', status)
+
+    def test_prefix_matches_actual_format(self):
+        """前缀的 MIME 必须跟着**实际格式**走，不能一律写 ``image/png``。
+
+        写死 png 时浏览器会拿 PNG 解码器去解 JPEG 字节，图直接显示不出来——
+        而界面上一切正常（状态栏也写着 JPEG），是典型的「看着对、用起来坏」。
+        """
+        window = self._open(ImageToBase64Window)
+        raw = _png_bytes((30, 20))
+        jpeg = _jpeg_bytes()
+        for sample, mime in ((raw, 'image/png'), (jpeg, 'image/jpeg')):
+            with self.subTest(mime=mime):
+                window._adopt_raw(sample, source='x')
+                window.win.update()
+                self.assertTrue(window._payload.startswith(f'data:{mime};base64,'),
+                                f'{mime} 的前缀不对：{window._payload[:40]!r}')
+
+    def test_prefix_survives_bmp_forced_to_png(self):
+        """BMP 会被降级成 PNG，前缀也必须跟着变成 ``image/png``。
+
+        这里挡的是「按原始 MIME 拼前缀」的写法：原始格式是 BMP，实际编码出来
+        的字节却是 PNG，前缀若还用 ``image/bmp`` 就与实际字节不符。
+        """
+        import io as iolib
+
+        from PIL import Image
+        buf = iolib.BytesIO()
+        Image.new('RGB', (12, 9), (30, 90, 200)).save(buf, 'BMP')
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(buf.getvalue(), source='x.bmp')
+        window.win.update()
+        self.assertTrue(window._payload.startswith('data:image/png;base64,'))
+        self.assertIn('PNG', window.status.cget('text'))
+
+    def test_roundtrip_through_both_tools(self):
+        """从「图片转 Base64」复制出来的东西，直接粘进「Base64 转图片」要能解。
+
+        这是两个工具互为反向的实际契约——前缀是这里面唯一的接口约定，
+        改动它的形态（比如改成 ``data:;base64,``）会静默破坏往返。
+        """
+        encoder = self._open(ImageToBase64Window)
+        encoder._adopt_raw(_png_bytes((36, 24)), source='t.png')
+        encoder.win.update()
+        copied = encoder._copy_content(encoder.output.get('1.0', 'end-1c'))
+
+        decoder = self._open(Base64ToImageWindow)
+        decoder._set_paste_text(copied)
+        decoder.win.update()
+        self.assertIsNotNone(decoder._image)
+        self.assertEqual(decoder._image.size, (36, 24))
+        self.assertEqual(decoder.status.cget('fg').upper(), '#30D158')
+
+    def test_prefix_is_optional_on_the_decode_side(self):
+        """解码侧既收带前缀的串，也收裸串——用户手里两种形态都有。"""
+        raw = _png_bytes((20, 16))
+        window = self._open(Base64ToImageWindow)
+        for payload in (_data_uri(raw), _b64(raw)):
+            with self.subTest(starts_with_data_uri=payload.startswith('data:')):
+                window._set_paste_text(payload)
+                window.win.update()
+                self.assertIsNotNone(window._image)
+                self.assertEqual(window._image.size, (20, 16))
+
+    def test_hint_tells_users_the_prefix_is_accepted(self):
+        """左栏提示要写明前缀可带可不带，否则用户会以为自己粘错了。"""
+        window = self._open(Base64ToImageWindow)
+        self.assertIn('data:image/png;base64,', window.preview_hint.cget('text'))
+
+    def test_copy_and_save_live_in_the_footer(self):
+        """复制/保存图片都在底栏，面板不重复摆按钮（右栏整栏留给预览）。
+
+        旧布局「复制图片」挂在预览下方；改成左文右图后动作统一收进底栏：
+        复制图片 / 保存图片… / 清空。右栏没有文字结果，不该再出现「复制结果」。
+        """
+        labels = self._buttons(self._open(Base64ToImageWindow))
+        self.assertIn('复制图片', labels)
+        self.assertIn('保存图片…', labels)
+        self.assertNotIn('复制结果', labels,
+                         '右栏没有文字结果，不该有「复制结果」按钮')
+        self.assertNotIn('从剪贴板取图', labels)
+        self.assertNotIn('选择图片文件…', labels)
+
+    def test_copy_without_image_reports_error(self):
+        """右栏是图片面板时「复制」动作分派到 ``_copy_image``。没图时报错。"""
+        window = self._open(Base64ToImageWindow)
+        window._copy_output()
+        self.assertIn('图片', window.status.cget('text'))
+        self.assertEqual(window.status.cget('fg').upper(), '#FF453A')
+
+    def test_invalid_base64_reports_error_and_clears_preview(self):
+        """解码失败要报错，且**上一张旧图必须清掉**——图是产物不是输入。"""
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(_png_bytes((24, 18))))
+        window.win.update()
+        self.assertIsNotNone(window._image)
+        window._set_paste_text('this is not base64 !!!')
+        window.win.update()
+        self.assertEqual(window.status.cget('fg').upper(), '#FF453A')
+        self.assertIsNone(window._image, '解码失败后旧图还挂在预览里')
+        self.assertFalse(window.preview.find_withtag('photo'))
+        self.assertEqual(window.preview.itemcget(window._hint_id, 'state'),
+                         'normal', '出错后空态提示没回来')
+
+    def test_clearing_input_clears_stale_preview(self):
+        """删光左栏文本后右栏不能还挂着上一张图。"""
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(_png_bytes((24, 18))))
+        window.win.update()
+        window._set_paste_text('')
+        window.win.update()
+        self.assertIsNone(window._image)
+        self.assertEqual(window.status.cget('text'), window.placeholder)
+
+    def test_valid_base64_of_non_image_reports_error(self):
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(b'just some text'))
+        window.win.update()
+        self.assertEqual(window.status.cget('fg').upper(), '#FF453A')
+        self.assertIn('图片', window.status.cget('text'))
+
+    def test_repeated_refresh_does_not_redecode(self):
+        """同一段载荷被反复刷新时不该重解码。
+
+        ``_refresh`` 会因粘贴、防抖、预览重建被多次调到；对一张几 MB 的图
+        每次都 decode 会让界面明显卡顿。这里用「解码结果的 identity」当判据
+        ——只有命中缓存才可能拿到同一个对象。
+        """
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(_png_bytes()))
+        window.win.update()
+        first = window._decoded
+        window._refresh()
+        window._refresh()
+        self.assertIs(window._decoded, first, '每次刷新都重新解码了')
+
+    def test_changed_payload_invalidates_cache(self):
+        """缓存不能粘住：内容一变必须重解，否则改一个字还是旧图。"""
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(_png_bytes((24, 18))))
+        window.win.update()
+        first = window._decoded
+        window._set_paste_text(_b64(_png_bytes((30, 22))))
+        window.win.update()
+        self.assertIsNot(window._decoded, first)
+        self.assertEqual(window._image.size, (30, 22))
+
+    def test_clear_drops_decode_cache(self):
+        """清空后必须丢掉缓存，否则再粘同一段文本会命中旧结果。"""
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(_png_bytes()))
+        window.win.update()
+        window._clear()
+        self.assertIsNone(window._decoded)
+        self.assertIsNone(window._decoded_for)
+        self.assertIsNone(window._image)
+
+    def test_save_dialog_uses_format_derived_suffix(self):
+        """保存对话框的后缀必须来自 ``image_b64.save_suffix``，不能写死。
+
+        这条**替换掉了原先「读 ``export`` 源码里有没有 ``write_fmt``」**的写法
+        ——用测试去断言「代码长什么样」是用测试补架构缺口。后缀映射抽成纯
+        函数之后，行为本身在 ``tests/test_image_b64.py`` 里直测；这里只守
+        「保存路径确实用了它」这一条接线。
+
+        拦截方式：把假 ``filedialog`` 模块塞进 ``sys.modules``，捕获它收到的
+        ``defaultextension``，同时把 ``save_suffix`` 换成返回标记值的替身。
+        写死常量的实现拿不到标记值，立刻变红。
+
+        **不能靠 ``mock.patch('builtins.__import__')``**：``from tkinter import
+        filedialog`` 是在已导入的 ``tkinter`` 包上取属性，根本不走 import 钩子；
+        钩子没拦住，真的对话框就会弹出来把测试挂住（实测直接 SIGTERM）。
+        """
+        import sys as sysmod
+        import types
+        from unittest import mock
+
+        window = self._open(Base64ToImageWindow)
+        window._set_paste_text(_b64(_png_bytes()))
+        window.win.update()
+
+        captured = {}
+        calls = []
+
+        def fake_suffix(fmt):
+            calls.append(fmt)
+            return '.MARKER'
+
+        fake = types.ModuleType('tkinter.filedialog')
+        fake.asksaveasfilename = lambda **kw: captured.update(kw) or ''
+        with mock.patch.dict(sysmod.modules, {'tkinter.filedialog': fake}), \
+                mock.patch.object(tk, 'filedialog', fake, create=True), \
+                mock.patch.object(image_b64, 'save_suffix', fake_suffix):
+            window.export()
+        # ``patch.object(obj, name, new)`` 的 ``as`` 拿到的是 ``new`` 本身而不是
+        # MagicMock（只有不传 new 时才给你 mock），所以计数得自己攒。
+        self.assertEqual(len(calls), 1, '保存时没调用 save_suffix')
+        self.assertEqual(captured.get('defaultextension'), '.MARKER',
+                         '保存对话框没用 save_suffix 算出来的后缀')
+
+    # ---------- 大图性能（用户报「图片稍微大一点转换就很卡」） ----------
+    def test_output_is_wrapped_into_lines(self):
+        """结果栏里必须是**折行**的 base64，不能是一整行。
+
+        **这是性能守卫，不是排版偏好。** 用户报「图片稍微大一点转换就很卡」，
+        实测根因就在这里：base64 是一整行、不含空格，``tk.Text(wrap="char")``
+        会为它逐字符找折行点。1.79 M 字符平铺单行实测让 Tk 重排 **310 秒**
+        （另一轮 48.7 s），折成 76 字符的行后只要 **18.4 ms**，而 ``insert()``
+        本身始终只花 2.4 ms —— 全部代价都在折行计算上。
+
+        判据用「显示行数 ≈ 字符数 / 76」而**不是计时**：计时在共享 CI 上会
+        抖动，而这个数量关系是缺陷的直接指纹，且与机器快慢无关。
+        """
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(_png_bytes(), source='t.png')
+        window.win.update()
+        chars = len(window._payload)
+        shown = int(window.output.index('end-1c').split('.')[0])
+        self.assertEqual(shown, -(-chars // image_b64.WRAP_WIDTH),
+                         f'{chars} 字符应折成 {-(-chars // image_b64.WRAP_WIDTH)} 行，'
+                         f'实际 {shown} 行——单行会把 Tk 卡死')
+
+    def test_wrap_survives_a_large_payload(self):
+        """大图也必须折行。小图的行数关系对了，不代表大图没走特例分支。
+
+        这里的样本要大到「若退回单行则必然卡顿」的量级。**不能用计时断言**，
+        仍用行数：几百万字符折行后行数上万，这个量级骗不了人。
+
+        样本用**纯随机字节**而不是 ``Image.new`` 填色：填色图 JPEG 压得极狠，
+        1400x1000 也才 70 KB，测不出「大」。随机噪声压不动，同样的尺寸能到
+        2 MB 以上。
+        """
+        import io as iomod
+
+        from PIL import Image
+        # 固定种子保证可复现。噪声数据的字节数是尺寸决定的，不受 PIL 版本影响。
+        rnd = random.Random(11)
+        side = 1400
+        img = Image.frombytes(
+            'RGB', (side, 1000),
+            bytes(rnd.randrange(256) for _ in range(side * 1000 * 3)))
+        buf = iomod.BytesIO()
+        img.save(buf, 'JPEG', quality=95)
+        raw = buf.getvalue()
+        self.assertGreater(len(raw), 1_500_000,
+                           f'样本只有 {len(raw):,} 字节，测不出折行缺陷')
+
+        window = self._open(ImageToBase64Window)
+        self.assertTrue(window._adopt_raw(raw, source='big.jpg'))
+        window.win.update()
+        chars = len(window._payload)
+        self.assertGreater(chars, 2_000_000, 'base64 不够大，用例失去判别力')
+        shown = int(window.output.index('end-1c').split('.')[0])
+        self.assertEqual(shown, -(-chars // image_b64.WRAP_WIDTH),
+                         f'{chars:,} 字符没被折行（显示 {shown} 行）')
+
+    def test_copy_gives_single_line_payload(self):
+        """「复制结果」给的必须是**单行** base64，不能带折行。
+
+        这是本工具唯一「显示 ≠ 复制」的地方。用户拿到 base64 的去处是 DB 字段、
+        JSON 参数、CSS ``url()``——正文夹换行会直接把它们弄坏，而且**报错信息
+        通常离得很远**，排查成本极高。
+        """
+        window = self._open(ImageToBase64Window)
+        raw = _png_bytes((60, 40))
+        window._adopt_raw(raw, source='t.png')
+        window.win.update()
+
+        displayed = window.output.get('1.0', 'end-1c')
+        self.assertIn('\n', displayed, '显示文本没折行，这条测试就失去判别力')
+
+        copied = window._copy_content(displayed)
+        self.assertNotIn('\n', copied, '复制出去的内容带了换行')
+        self.assertEqual(copied, _data_uri(raw),
+                         '复制内容不是原始字节的 Data URI')
+
+    def test_copy_falls_back_to_compacting_without_dropping_the_prefix(self):
+        """缓冲为空时，兜底分支去换行**且保留** ``data:`` 前缀，与主路径一致。
+
+        两件事都要守：
+
+        1. 写成 ``self._payload or displayed`` ——看着像无害的默认值，实际把
+           折行原样复制出去，正是本方法要防的事。
+        2. 写成 ``unwrap_text(displayed)`` ——去换行对了，但它顺带把
+           ``data:image/png;base64,`` 也剥掉了：有缓冲时复制带前缀、没缓冲时
+           不带，同一份数据两种形态。
+
+        判据直接与主路径比对（``_payload``），「两条路给同一个答案」才是契约。
+        """
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(_png_bytes((60, 40)), source='t.png')
+        window.win.update()
+        displayed = window.output.get('1.0', 'end-1c')
+        self.assertIn('\n', displayed, '显示文本没折行，用例失去判别力')
+
+        expected = window._payload
+        self.assertTrue(expected.startswith('data:image/png;base64,'))
+        window._payload = ''                      # 模拟缓冲缺失
+        copied = window._copy_content(displayed)
+        self.assertNotIn('\n', copied, '兜底分支把折行复制出去了')
+        self.assertEqual(copied, expected,
+                         '兜底分支与主路径结果不一致（前缀被剥掉？）')
+
+    def test_export_writes_wrapped_text(self):
+        """导出的是**折行版**（与结果栏所见一致），且带尾换行。
+
+        尾换行不是可有可无的：``base64 -d`` 与 PEM 解析器都按行读，末行没有
+        行尾在有些工具上会报警告。
+        """
+        window = self._open(ImageToBase64Window)
+        raw = _png_bytes((60, 40))
+        window._adopt_raw(raw, source='t.png')
+        window.win.update()
+
+        path = os.path.join(self._tmpdir(), 'out.txt')
+        self._run_with_save_path(window, path)
+        with open(path, encoding='utf-8') as handle:
+            written = handle.read()
+
+        self.assertTrue(written.endswith('\n'), '导出文件缺尾换行')
+        self.assertEqual(written.count('\n'), window._displayed.count('\n') + 1)
+        # 去换行后必须等于原始字节的 Data URI —— 折行只是形态，不是内容
+        self.assertEqual(written.replace('\n', ''), _data_uri(raw))
+
+    def test_clear_drops_payload_buffer(self):
+        """清空后缓冲必须一起丢。
+
+        不丢的话「贴图 → 清空 → 点复制结果」会把上一张图的 base64 送进剪贴板
+        ——用户以为清空了，实际上手上是一份看不出错的旧数据。
+        """
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(_png_bytes(), source='t.png')
+        window.win.update()
+        self.assertTrue(window._payload, '贴图后缓冲是空的，用例失效')
+        window._clear()
+        self.assertEqual(window._payload, '', '清空后 _payload 还留着旧内容')
+        self.assertEqual(window._displayed, '', '清空后 _displayed 还留着旧内容')
+        self.assertEqual(window._copy_content(''), '', '清空后还能复制出内容')
+
+    def test_failed_analysis_drops_payload_buffer(self):
+        """解析失败时缓冲也要丢，否则导出的是上一次成功的结果。
+
+        **必须让 ``_analyze`` 真的抛错，而不是让输入变空**：输入为空会走
+        ``_refresh`` 的「没有内容」早退分支（那条也清缓冲），两条路径长得像
+        但覆盖的是不同代码。变异验证正是这样漏过一轮：只把 ``_image`` 设为
+        None 而左栏仍空，测试停在早退分支上，异常分支的清理根本没被执行到。
+
+        构造方式：撤掉图（让 ``_analyze`` 报「没有图片」），同时在左栏塞一个
+        非空字符——否则早退分支会先拦下来。
+        """
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(_png_bytes(), source='t.png')
+        window.win.update()
+        self.assertTrue(window._payload, '贴图后缓冲是空的，用例失效')
+
+        window._image = None
+        window.input.insert('1.0', 'x')      # 防止走「输入为空」早退分支
+        window._refresh()
+        window.win.update()
+
+        self.assertIn('图片', window.status.cget('text'))
+        self.assertEqual(window.status.cget('fg').upper(), '#FF453A',
+                         '没走进报错分支，用例失去判别力')
+        self.assertEqual(window._payload, '', '报错后 _payload 没清')
+        self.assertEqual(window._displayed, '', '报错后 _displayed 没清')
+        self.assertEqual(window.output.get('1.0', 'end-1c'), '')
+
+    def test_export_reads_buffer_not_the_widget(self):
+        """导出读的是产物缓冲，不是结果栏控件里的显示文本。
+
+        缓冲存在的意义就是「数据源与控件分离」。这条通过**人为把结果栏改坏**
+        来验证分离确实成立：结果栏被外部改动后，导出内容不受影响。
+        （现实里对应「将来给结果栏加行号/统计等装饰」这类改动——那时若 export
+        还从控件读，导出文件就会被装饰内容污染，而且不会有任何报错。）
+        """
+        window = self._open(ImageToBase64Window)
+        raw = _png_bytes((60, 40))
+        window._adopt_raw(raw, source='t.png')
+        window.win.update()
+
+        # 把结果栏改成别的内容（模拟控件被装饰/污染）
+        window.output.configure(state='normal')
+        window.output.insert('1.0', '被污染的前缀\n')
+        window.output.configure(state='disabled')
+
+        path = os.path.join(self._tmpdir(), 'from_buffer.txt')
+        self._run_with_save_path(window, path)
+        with open(path, encoding='utf-8') as handle:
+            written = handle.read()
+
+        self.assertNotIn('污染', written, '导出内容跟着结果栏控件走了')
+        self.assertEqual(written.replace('\n', ''), _data_uri(raw))
+
+    # ---------- 预览重缩放（拖窗口卡顿） ----------
+    def test_preview_scales_from_a_bounded_master(self):
+        """预览重缩放必须走**有界主图**，不能每次都拿原图缩。
+
+        拖动窗口时 ``<Configure>`` 密集触发，每次都会重跑一遍缩放：
+        4000×3000 的原图每次 **61 ms**，一次拖动累积到秒级——用户感知就是
+        「拖窗口一卡一卡的」。改成从最长边 ≤ ``PREVIEW_MASTER_BOX`` 的主图缩，
+        同样条件下每次约 11 ms。
+
+        断言用「主图尺寸有界」这个**可观察的不变量**，不测时间（CI 上会抖）。
+        """
+        import io as iomod
+
+        from PIL import Image
+        rnd = random.Random(3)
+        side = 2600
+        img = Image.frombytes(
+            'RGB', (side, 1800),
+            bytes(rnd.randrange(256) for _ in range(side * 1800 * 3)))
+        buf = iomod.BytesIO()
+        img.save(buf, 'PNG')
+        window = self._open(ImageToBase64Window)
+        self.assertTrue(window._adopt_raw(buf.getvalue(), source='big.png'))
+
+        master = window._preview_master()
+        self.assertIsNotNone(master)
+        self.assertLessEqual(max(master.size), TW.PREVIEW_MASTER_BOX,
+                             '主图没有被限制尺寸，拖窗口时会拿原图重缩')
+
+    def test_master_is_cached_until_image_changes(self):
+        """主图要缓存，不能每次 Configure 重建（重建等于没省）。
+
+        用 identity 判断命中，并用「换图后必须拿到新主图」兜住缓存粘滞——
+        那会让预览显示上一张图，比卡顿严重得多。
+
+        **样本必须大于 ``PREVIEW_MASTER_BOX``**：小图的主图就是原图本身
+        （不做无谓拷贝），identity 会恒成立，测不出缓存有没有生效。
+        """
+        import io as iomod
+
+        from PIL import Image
+        side = TW.PREVIEW_MASTER_BOX + 400
+        for label in ('a', 'b'):
+            buf = iomod.BytesIO()
+            Image.new('RGB', (side, 900), (30, 90, 200)).save(buf, 'PNG')
+            if label == 'a':
+                raw_a = buf.getvalue()
+            else:
+                raw_b = buf.getvalue()
+
+        window = self._open(ImageToBase64Window)
+        self.assertTrue(window._adopt_raw(raw_a, source='a.png'))
+        first = window._preview_master()
+        self.assertIsNot(first, window._image, '样本没触发主图缩小，用例失效')
+        self.assertIs(window._preview_master(), first, '主图没被缓存')
+
+        self.assertTrue(window._adopt_raw(raw_b, source='b.png'))
+        second = window._preview_master()
+        self.assertIsNot(second, first, '换图后主图缓存没失效')
+        self.assertLessEqual(max(second.size), TW.PREVIEW_MASTER_BOX)
+
+    def test_small_image_is_not_upscaled_by_master(self):
+        """小图不该被主图放大——那会让预览变模糊。"""
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(_png_bytes((40, 30)), source='s.png')
+        self.assertEqual(window._preview_master().size, (40, 30))
+
+    def test_clear_releases_master_cache(self):
+        """清空要连主图缓存一起放掉。
+
+        缓存是 ``(原图, 主图)`` 元组，置空 ``_image`` 并不解除元组对原图的
+        引用——不清就是「界面清空了，几 MB 内存还压着」，大图上很可观。
+        """
+        window = self._open(ImageToBase64Window)
+        window._adopt_raw(_png_bytes((80, 60)), source='a.png')
+        self.assertIsNotNone(window._preview_master_img)
+        window._clear()
+        self.assertIsNone(window._preview_master_img, '清空后主图缓存还占着内存')
+
+    def test_clipboard_image_encodes_at_full_resolution(self):
+        """剪贴板来的图（没有原始字节）也必须按**原尺寸**编码，不能被预览主图降采样。
+
+        这条覆盖 ``_analyze`` 的 ``else`` 分支（``_image_raw is None`` →
+        ``encode_image(self._image)``）。``_adopt_raw``（文件路径）总会设
+        ``_image_raw``，所以文件路径永远走不到这个分支——而它恰恰最容易被
+        「顺手拿主图省点内存」改坏。改坏后图变小、体积变小、**没有任何报错**，
+        用户只会觉得「怎么糊了」。
+
+        判据用产物解码回来的像素尺寸，比任何中间变量都直接。
+        """
+
+        from PIL import Image
+        side = TW.PREVIEW_MASTER_BOX + 400
+        big = Image.new('RGB', (side, 900), (200, 80, 40))
+
+        window = self._open(ImageToBase64Window)
+        # 直接走「剪贴板」形态：只有 PIL 图，没有原始字节
+        window._adopt_image(big, source='剪贴板', raw=None, fmt='PNG')
+        window.win.update()
+
+        master = window._preview_master()
+        self.assertIsNot(master, big, '没触发主图缩小，用例失去判别力')
+        self.assertLessEqual(max(master.size), TW.PREVIEW_MASTER_BOX)
+
+        decoded = image_b64.decode_base64(window._payload)
+        self.assertEqual((decoded.width, decoded.height), (side, 900),
+                         '编码用了预览主图，产物被静默降采样')
+
+    def test_encoding_still_uses_original_image(self):
+        """**主图只服务显示**，编码必须仍走原图/原始字节。
+
+        这条是本组修复里最要紧的不变量：为了提速引入的中间图一旦参与编码，
+        产物就会被悄悄降采样，而界面上一切正常、状态栏体积也「看起来对」。
+
+        样本要**大于** ``PREVIEW_MASTER_BOX``，否则主图就是原图本身，
+        identity 断言恒成立、失去判别力（第一版用 300×200 正是这样假通过的）。
+        """
+        import io as iomod
+
+        from PIL import Image
+        big = Image.new('RGB', (TW.PREVIEW_MASTER_BOX + 400, 1200), (90, 120, 200))
+        buf = iomod.BytesIO()
+        big.save(buf, 'PNG')
+        raw = buf.getvalue()
+
+        window = self._open(ImageToBase64Window)
+        self.assertTrue(window._adopt_raw(raw, source='big.png'))
+        window.win.update()
+
+        master = window._preview_master()
+        self.assertIsNot(master, window._image,
+                         '样本没触发主图缩小，用例失去判别力')
+        self.assertLessEqual(max(master.size), TW.PREVIEW_MASTER_BOX)
+        # 产物必须是**原始字节**的 Data URI，不是被缩过的图重编出来的
+        self.assertEqual(_data_uri(raw), window._payload,
+                         '产物不是原始字节的 base64——中间图被拿去编码了')
+
+    def test_text_tools_copy_verbatim(self):
+        """文本类工具没覆写 ``_copy_content``，复制必须与显示逐字一致。
+
+        这条挡的是「把 base64 的折行处理顺手加进基类」——那会让 JSON 结果的
+        缩进换行全部消失，是肉眼可见但很容易漏测的破坏。
+        """
+        window = self._open(JsonParamWindow)
+        self._type(window, '{"a":1,"b":[1,2]}')
+        window.win.update()
+        displayed = window.output.get('1.0', 'end-1c')
+        self.assertIn('\n', displayed, 'JSON 结果没换行，用例失效')
+        self.assertEqual(window._copy_content(displayed), displayed)
+
+    def _tmpdir(self):
+        import tempfile
+        if not hasattr(self, '_tmp_ctx'):
+            self._tmp_ctx = tempfile.TemporaryDirectory()
+        return self._tmp_ctx.name
+
+    def _run_with_save_path(self, window, path):
+        """在假 ``filedialog`` 下执行 window.export()，返回固定路径。"""
+        import sys as sysmod
+        import types
+        from unittest import mock
+
+        fake = types.ModuleType('tkinter.filedialog')
+        fake.asksaveasfilename = lambda **kw: path
+        with mock.patch.dict(sysmod.modules, {'tkinter.filedialog': fake}), \
+                mock.patch.object(tk, 'filedialog', fake, create=True):
+            window.export()
 
 
 if __name__ == '__main__':

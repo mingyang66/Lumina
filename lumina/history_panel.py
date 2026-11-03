@@ -130,6 +130,27 @@ class HistoryPanel:
         "image": ("purple", "photo"),
         "file":  ("green",  "folder"),
     }
+    # 工具下拉的图标：工具 key → (字形, 系统色名)。
+    #
+    # **放在类上而不是写进 ``_open_popup_menu`` 方法体**：写在方法里测试就够
+    # 不着它，漏登记一个工具只会让下拉里悄悄出现一个灰色「?」，没有任何断言
+    # 拦得住（变异验证时确实是这样漏过的）。提到类上之后
+    # ``test_every_tool_has_a_registered_icon`` 可以直接比对。
+    #
+    # 字形是「方块里塞一个短标记」，与 ``_draw_glyph`` 的线描图形**不要混用**：
+    # 实测线描的覆盖率只有 22~31%，而方块+文字是 65%，两套混在同一个竖列表格
+    # 里一轻一重，扫视时会跳。四条标记刻意等长（2~3 字符），同一个字号分支
+    # 渲染，视觉重量一致（实测 18px 下 185~203 个不透明像素）。
+    # **不要**为了「更精确」把 ``IMG`` 换成 ``▣`` 之类的手势符：那种字符缩到
+    # 6px 就是个方框，和外层圆角框叠在一起几乎看不出内容。
+    #
+    # 配色按语义分：橙=结构文本、紫=凭据、青=图片、绿=还原。
+    TOOL_ICONS: ClassVar[dict] = {
+        "json": ("{}", "orange"),
+        "jwt": ("JWT", "purple"),
+        "img2b64": ("IMG", "teal"),
+        "b642img": ("B64", "green"),
+    }
     FONT_FAMILY = "Microsoft YaHei UI"
     RESIZE_GRIP = 12
     # 左栏右缘滚动指示条的几何（逻辑像素，绘制时乘 DPI）。
@@ -1522,7 +1543,7 @@ class HistoryPanel:
         if kind == "tools":
             # 工具下拉：遍历注册表生成，新增工具只需改 tool_window.TOOLS。
             from .tool_window import TOOLS
-            tool_icons = {"json": ("{}", "orange"), "jwt": ("JWT", "purple")}
+            tool_icons = self.TOOL_ICONS
             first = True
             for tool_key, label, _cls in TOOLS:
                 mark, color_name = tool_icons.get(tool_key, ("?", "gray"))

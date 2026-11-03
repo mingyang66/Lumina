@@ -1,7 +1,14 @@
-"""顶栏「工具」下拉里的独立小工具窗口：JSON 格式化 / JWT 解密。
+"""顶栏「工具」下拉里的独立小工具窗口：JSON 格式化 / JWT 解密 / 图片 Base64。
 
-两个工具共用同一套无边框外壳（左侧输入、右侧结果、实时解析、一键复制），
+三个工具共用同一套无边框外壳（左侧输入、右侧结果、实时解析、一键复制），
 只替换「如何解析」。新增工具只需实现一个 ``_analyze``。
+
+**图片 Base64 两个工具是外壳的例外**：图片不是文本，既没法「粘贴进左栏」，
+也没法「把结果当文字看」。它们因此在左栏位置放**图片预览与取图入口**，右栏
+仍是纯文本结果（base64 字符串 / 图片信息），底栏在通用「清空 + 复制结果」
+之外多一个「导出」——因为 base64 解出来的图必须落到磁盘或剪贴板才有用。
+这条分支由 ``_IMAGE_TOOLS`` 里的类名特征 ``uses_image_pane = True`` 打开，
+**不是**按 key 判断：``TOOLS`` 注册表不应知道自己被哪套布局消费。
 
 设计取舍：
 - **不画系统标题栏，但顶部要显示工具名**。标题以次级文字色、小一号字号写在
@@ -32,10 +39,11 @@
 """
 
 import ctypes
+import io
 import os
 from tkinter import TclError
 
-from . import jwt_tools, taskbar
+from . import image_b64, jwt_tools, media, taskbar
 from .json_modes import ESCAPE_JAVA_NOTICE, MODE_LABELS, build_menu_items
 from .json_tools import transform_json
 
@@ -62,6 +70,11 @@ RESIZE_EDGE = 6
 
 # 结果里的段落标记。用等宽方块而不是「— xxx —」，更接近终端观感。
 SECTION_MARK = "▍"
+
+# 预览用「主图」的最长边上限。预览区通常只有四五百像素，先缩到这个尺寸再
+# 做后续所有重缩放：拖动窗口时每次只花 ~11 ms，而不是对原图重缩的 61 ms
+# （4000×3000 实测）。**主图只服务显示**，编码始终走原图/原始字节。
+PREVIEW_MASTER_BOX = 1600
 
 # JSON 转换模式的展示名。**唯一来源是 ``json_modes.MODE_LABELS``**，这里只做
 # 再导出，便于 ``tool_window.JSON_MODE_LABELS`` 这个既有引用点继续可用。
@@ -200,6 +213,25 @@ class _ToolWindow:
     width = 920
     height = 640
 
+    # ---------- 图片类工具的开关 ----------
+    # True 时其中一栏换成图片面板（预览 + 取图入口），底栏多一个导出按钮。
+    # 文字类工具保持默认 False。
+    uses_image_pane = False
+    # 图片面板放哪一栏。「左」= 图片是输入（图片转 Base64：左图右文）；
+    # 「右」= 图片是产物（Base64 转图片：左贴 Base64 文本，右侧出图）。
+    image_pane_side = "left"
+    # 图片是「输入」还是「由文本解码出的产物」。产物图必须在输入被清空/
+    # 解析报错时一并清掉——不然左栏文本删光了，右栏还挂着上一张旧图。
+    image_is_input = True
+    # 图片面板里剪贴板里同时有图和文本时是否优先取图。图片转 Base64 是
+    # （图是合法输入）；Base64 转图片的输入只认 Base64 文本，粘图没有意义。
+    paste_prefers_image = True
+    # 底栏「复制」按钮的文案。文字类工具复制结果文本；右栏是图片面板的
+    # 工具没有文字结果可复制，改为复制图片。
+    copy_label = "复制结果"
+    # 导出按钮的文案；空字符串表示这个工具没有导出动作。
+    export_label = ""
+
     def __init__(self, panel):
         self.panel = panel
         self.ui = panel.ui
@@ -217,6 +249,23 @@ class _ToolWindow:
         self._chrome_id = None
         # 任何自绘下拉（目前只有 JSON 那个）都挂在这里，close()/最小化时统一收掉。
         self._popup = None
+        # 图片类工具的当前图像。文字类工具永远保持 None，两条路径互不干扰。
+        self._image = None
+        self._image_raw = None
+        self._image_source = ""
+        self._image_meta = None
+        self._preview_photo = None
+        # 预览主图缓存：``(原图对象, 缩好的主图)``。连原图 identity 一起存，
+        # 换图时自动失效，不需要在每处换图的地方记得清它。
+        self._preview_master_img = None
+        # Base64 转图片的解码缓存，避免 ``_refresh`` 重复解码同一段大文本。
+        self._decoded_for = None
+        self._decoded = None
+        # 「图片转 Base64」的两份产物：单行原串（复制用）与折行文本（显示/导出用）。
+        # 放基类而不是子类，是为了 ``_copy_content`` / ``export`` 在任何窗口上
+        # 都有确定取值，不会因属性缺失炸在用户操作路径上。
+        self._payload = ""
+        self._displayed = ""
         theme = panel._theme()
         self.T, self.dark = theme if isinstance(theme, tuple) else (theme, False)
         self.win = self.tk.Toplevel(panel.win)
@@ -230,7 +279,14 @@ class _ToolWindow:
         # 不在 close() 的取消范围内，Tk 会在销毁后报 invalid command name。
         self._after_id = self.win.after(30, self._refresh)
         self.win.focus_force()
-        self.input.focus_set()
+        # 焦点给「真正接输入的那个控件」：图片面板在左栏时它自己处理
+        # Ctrl+V，焦点给它；面板在右栏（Base64 转图片）时左侧是可见的
+        # Base64 文本框，焦点必须给它——否则按键落进看不见的地方。
+        if self.uses_image_pane and self.image_pane_side == "left":
+            target = self.preview
+        else:
+            target = self.input
+        target.focus_set()
 
     # ---------- 外壳 ----------
     def _build_shell(self):
@@ -844,18 +900,34 @@ class _ToolWindow:
         body.columnconfigure(1, weight=1, uniform="col")
         body.rowconfigure(0, weight=1)
 
-        self.input = self._make_text(body, editable=True, edge=self._accent())
+        # 左栏：默认是可编辑 Text；「左图右文」的图片工具（图片转 Base64）
+        # 换成图片面板（内部按需再露出一个隐藏 Text 承接粘贴）。「Base64 转
+        # 图片」的图片面板在右栏，左栏仍是普通 Text——用户在那里贴 Base64。
+        if self.uses_image_pane and self.image_pane_side == "left":
+            self._make_image_pane(body)
+        else:
+            self.input = self._make_text(body, editable=True, edge=self._accent())
+            self.input.bind("<KeyRelease>", self._on_input)
+            self.input.bind("<<Paste>>",
+                            lambda _e: self.win.after(1, self._refresh))
         self.input.master.grid(row=0, column=0, sticky="nsew",
                                padx=(0, GAP // 2))
-        self.output = self._make_text(body, editable=False, edge=self._sys("teal"))
-        # **两栏正文必须等宽。** 这里曾用 ``padx=(GAP, 0)`` 给右栏让出缝隙，代价是
-        # 右栏内容区比左栏窄 10px（实测 440 vs 430）——同样的文本在窄栏里更早折行，
-        # 实测 60 个字符的字符串左栏 1 屏行、右栏 2 屏行，正好违背「右侧和左侧保持
-        # 一致」。改成两栏各让一半缝隙，宽度完全相等。视觉缝隙仍是 ``GAP``。
-        self.output.master.grid(row=0, column=1, sticky="nsew",
-                                padx=(GAP // 2, 0))
-        self.input.bind("<KeyRelease>", self._on_input)
-        self.input.bind("<<Paste>>", lambda _e: self.win.after(1, self._refresh))
+        # 右栏：文字类工具与「左图右文」的工具放结果 Text；「Base64 转图片」
+        # 的右栏换成图片面板——图片就是它的结果，没有第二块文字可看。
+        if self.uses_image_pane and self.image_pane_side == "right":
+            self._make_image_pane(body)
+            self.image_pane.grid(row=0, column=1, sticky="nsew",
+                                 padx=(GAP // 2, 0))
+        else:
+            self.output = self._make_text(body, editable=False,
+                                          edge=self._sys("teal"))
+            # **两栏正文必须等宽。** 这里曾用 ``padx=(GAP, 0)`` 给右栏让出缝隙，
+            # 代价是右栏内容区比左栏窄 10px（实测 440 vs 430）——同样的文本在窄栏
+            # 里更早折行，实测 60 个字符的字符串左栏 1 屏行、右栏 2 屏行，正好违背
+            # 「右侧和左侧保持一致」。改成两栏各让一半缝隙，宽度完全相等。视觉
+            # 缝隙仍是 ``GAP``。
+            self.output.master.grid(row=0, column=1, sticky="nsew",
+                                    padx=(GAP // 2, 0))
 
         foot = tk.Frame(self.shell, bg=T["hairline"])
         foot.place(x=CONTENT_INSET, rely=1.0, y=-CONTENT_INSET,
@@ -873,14 +945,24 @@ class _ToolWindow:
         self.status = tk.Label(row, text="", bg=T["window_bg"], fg=T["label2"],
                                font=(self.panel.FONT_FAMILY, 9), anchor="w")
         self.status.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        # pack 顺序即左右：抓手最靠右，其后是 清空 / 复制结果。
-        # 「复制结果」复制的是**右侧结果框里的文字**（用户看到的即所得）。
+        # pack 顺序即左右：抓手最靠右，其后是 复制 / 清空。
+        # 「复制结果」复制的是**右侧结果框里的文字**（用户看到的即所得）；
+        # 右栏是图片面板的工具（Base64 转图片）没有文字结果，按钮文案改成
+        # 「复制图片」、动作改为复制图像（见 ``_copy_output`` 的分派）。
         # 曾短暂改叫「复制文字」，后又按用户要求改回「复制结果」。
         self._make_grip(row).pack(side="right", padx=(4, 0))
-        self._ghost_button(row, "复制结果", self._copy_output)
+        # 图片类工具的「导出」排在「复制结果」左边：复制结果仍是右边第一个
+        # （最常用），导出是它的补充动作。两种工具各自只出现需要的按钮。
+        #
+        # **判断必须用真值而不是 ``hasattr``**：``export_label`` 定义在基类上，
+        # 文本工具继承到的是空串；去掉这个判断会生成一个**空文字按钮**——
+        # 界面上是个点不出所以然的小方块，按文字扫描的测试也看不见它。
+        if self.export_label and self.uses_image_pane:
+            self._ghost_button(row, self.export_label, self.export)
+        self._ghost_button(row, self.copy_label, self._copy_output)
         self._ghost_button(row, "清空", self._clear)
         # 子类专属的下拉入口（目前只有 JSON 工具的「JSON ▾」）。放在最后 pack，
-        # 于是它落在最左——右侧那三个（清空/复制结果/抓手）的位置不变。
+        # 于是它落在最左——右侧那几个（清空/复制结果/导出/抓手）的位置不变。
         self._build_footer_menu(row)
 
     def _build_footer_menu(self, parent):
@@ -899,6 +981,327 @@ class _ToolWindow:
             except Exception:
                 # 收菜单是尽力而为：这里失败也不能连累主流程（最小化/关闭）。
                 pass
+
+    # ---------- 图片面板（仅 ``uses_image_pane`` 的工具有） ----------
+    def _make_image_pane(self, parent):
+        """把某一栏换成「预览 + 操作按钮」面板（栏位由 ``image_pane_side`` 定）。
+
+        **为什么左栏是图片面板时还要留一个隐藏 Text 当 input**：外壳的粘贴、
+        清空、刷新都挂在 ``self.input`` 上。图片类工具里用户真正按的是
+        Ctrl+V——剪贴板里是图时 Tk 的 Text 什么也收不到，所以面板显式占住
+        焦点、自己处理 Ctrl+V；但剪贴板里是 base64 **文本**时交给隐藏 Text
+        走通用路径，一个快捷键覆盖两种输入，不必让用户先想「我现在剪贴板里
+        是什么」。
+
+        面板建在**右栏**时（Base64 转图片）``self.input`` 已是左侧可见的
+        Base64 文本框，**绝不能再建隐藏 Text 把它覆盖掉**——所以只有 input
+        尚不存在时才创建。预览区只负责「看」，不参与任何解析。
+        """
+        T, tk = self.T, self.tk
+        wrap = tk.Frame(parent, bg=T["hairline"])
+        # 留下引用：面板在右栏时由 ``_build`` 直接把它 grid 进那一格。
+        self.image_pane = wrap
+        wrap.rowconfigure(1, weight=1)
+        wrap.columnconfigure(1, weight=1)
+        tk.Frame(wrap, bg=T["hairline"], height=1).grid(
+            row=0, column=0, columnspan=2, sticky="ew")
+        tk.Frame(wrap, bg=self._accent(), width=2).grid(row=1, column=0, sticky="ns")
+
+        holder = tk.Frame(wrap, bg=T["card_bg"])
+        holder.grid(row=1, column=1, sticky="nsew")
+        holder.rowconfigure(0, weight=1)
+        holder.columnconfigure(0, weight=1)
+
+        # 预览画布：占满，图片按比例缩放到装得下，并画棋盘格衬出透明区域。
+        self.preview = tk.Canvas(holder, bg=T["card_bg"], highlightthickness=0,
+                                 bd=0, takefocus=1)
+        self.preview.grid(row=0, column=0, sticky="nsew")
+        self.preview.bind("<Configure>", self._on_preview_configure)
+        self.preview.bind("<Button-1>", lambda _e: self.preview.focus_set())
+
+        # 空态提示：没有图时它就是全部内容，所以放在预览区正中。
+        self.preview_hint = tk.Label(
+            self.preview, text=self._preview_hint_text(),
+            bg=T["card_bg"], fg=T["label3"],
+            font=(self.panel.FONT_FAMILY, 9), justify="center")
+        self._hint_id = self.preview.create_window(
+            0, 0, window=self.preview_hint, anchor="center")
+
+        # 面板按钮行：入口覆盖不同来源/去向，按工具方向而定。没有动作的
+        # 工具（Base64 转图片的动作都在底栏）**不建这一行**——空按钮行
+        # 只会在预览下方白占一条 padding。
+        actions = self.pane_actions()
+        if actions:
+            buttons = tk.Frame(holder, bg=T["card_bg"])
+            buttons.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+            self._pane_buttons = []
+            for label, command in actions:
+                self._pane_buttons.append(
+                    self._pane_button(buttons, label, command))
+
+        if getattr(self, "input", None) is None:
+            # 隐藏的粘贴 Text：承接 base64 文本的 Ctrl+V。**必须保留 focus 之外
+            # 的能力**——它被 ``grid_remove()`` 后 Tk 仍然能 insert/get，事件则由
+            # ``preview`` 转发过来。
+            self.input = tk.Text(holder, bd=0, highlightthickness=0,
+                                 wrap="char", undo=True, padx=10, pady=8)
+            self.input.grid(row=2, column=0, sticky="nsew")
+            self.input.grid_remove()
+            self.input.bind("<<Paste>>",
+                            lambda _e: self.win.after(1, self._refresh))
+            self.input.master = wrap      # 让 _build 的 grid 落在同一格
+        self.preview.bind("<Control-v>", self._paste_into_image_pane)
+        self.preview.bind("<Control-V>", self._paste_into_image_pane)
+
+    def _preview_hint_text(self):
+        """空态提示。含 Ctrl+V 的说明——这是本工具最主要的输入方式。"""
+        return "按 Ctrl+V 粘贴图片或 Base64 文本\n也可用下方按钮取图"
+
+    def pane_actions(self):
+        """左栏图片面板下方的按钮，``(文案, 命令)`` 列表。子类按输入方向覆盖。
+
+        默认是「取图」方向：从剪贴板拿、从文件选。Base64 转图片那边方向相反，
+        图是产物而不是输入，所以它覆盖成「复制图片 / 另存为」——按钮文案直接
+        回答「拿到图之后做什么」。
+        """
+        return [("从剪贴板取图", self._load_from_clipboard),
+                ("选择图片文件…", self._load_from_file)]
+
+    def _pane_button(self, parent, label, command):
+        """图片面板里的次级按钮：填充底、无描边，比底栏幽灵按钮更轻。"""
+        T, tk = self.T, self.tk
+        button = tk.Button(
+            parent, text=label, command=command, bd=0, relief="flat",
+            bg=T["fill"], fg=T["label"],
+            activebackground=T["accent_soft"], activeforeground=self._accent(),
+            font=(self.panel.FONT_FAMILY, 9), padx=10, pady=4,
+            cursor="hand2", highlightthickness=0)
+        button.pack(side="left", padx=(0, 8))
+        return button
+
+    def _paste_into_image_pane(self, _event=None):
+        """面板上的 Ctrl+V：图走图片、文本走输入框，一个键覆盖两种输入。
+
+        **必须先判断图片**（``paste_prefers_image`` 的工具）：Windows 剪贴板里
+        图片同时带 ``CF_DIB`` 与一些文本描述，先取文本会拿到没用的空串或文件名。
+        Base64 转图片的输入只认文本，粘一张图对它毫无意义，直接走文本路径。
+        """
+        if self.paste_prefers_image and self._take_clipboard_image():
+            return "break"
+        try:
+            text = self.win.clipboard_get()
+        except TclError:
+            return "break"
+        self._set_paste_text(text)
+        return "break"
+
+    def _set_paste_text(self, text):
+        """把文本塞进隐藏 Text 并立刻刷新。"""
+        self.input.delete("1.0", "end")
+        if text:
+            self.input.insert("1.0", text)
+        self._refresh()
+
+    def _take_clipboard_image(self):
+        """剪贴板里有图就取出来当预览图并返回 True，否则 False。
+
+        ``clipboard_api.get_clipboard_dib`` 返回的是 DIB（Windows 位图原样），
+        必须经 ``media.dib_to_image`` 才能变成 PIL 图像。取不到（无图、被别的
+        程序占着、格式不支持）一律当「没有图」，不报错——用户可能是想粘文本。
+        """
+        try:
+            dib = self.clipboard_api.get_clipboard_dib()
+        except Exception:
+            return False
+        if not dib:
+            return False
+        try:
+            image = media.dib_to_image(dib)
+        except Exception:
+            return False
+        if image is None:
+            return False
+        self._adopt_image(image, source="剪贴板")
+        return True
+
+    def _load_from_clipboard(self):
+        """「从剪贴板取图」按钮：取不到图时给一句可读提示，不弹模态框。"""
+        if not self._take_clipboard_image():
+            # 剪贴板里是文本时，多半是用户想经这条路径贴 base64——顺手接住。
+            try:
+                text = self.win.clipboard_get()
+            except TclError:
+                text = ""
+            if text and text.strip():
+                self._set_paste_text(text)
+                return
+            self._set_status("剪贴板里没有图片", "error")
+
+    def _load_from_file(self):
+        """「选择图片文件…」按钮：读原始字节，**不重新编码**（零质量损失）。"""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self.win, title="选择图片",
+            filetypes=[("图片文件", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.ico"),
+                       ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read()
+        except OSError as exc:
+            self._set_status(f"读取失败：{exc}", "error")
+            return
+        self._adopt_raw(raw, source=os.path.basename(path))
+
+    def _adopt_raw(self, raw, source=""):
+        """原始字节 → 预览图。校验与上限都在 ``image_b64.inspect_image``。"""
+        try:
+            fmt, width, height = image_b64.inspect_image(raw)
+        except image_b64.ImageB64Error as exc:
+            self._set_status(str(exc), "error")
+            return False
+        try:
+            from PIL import Image
+            image = Image.open(io.BytesIO(raw))
+            image.load()
+            image = image.copy()
+        except Exception as exc:
+            self._set_status(f"图片无法解析：{exc}", "error")
+            return False
+        self._adopt_image(image, source=source, raw=raw, fmt=fmt,
+                          size=(width, height))
+        return True
+
+    def _adopt_image(self, image, source="", raw=None, fmt="", size=None):
+        """把图像设为当前预览图，并触发一次刷新。
+
+        ``raw`` 非空时保留**原始字节**——``encode_bytes`` 要拿它直接编码，
+        避免「读进来→解码→再编码」这一圈无谓的重采样。剪贴板来的图没有字节
+        形态（``raw`` 为 None），由 ``encode_image`` 现场编成 PNG。
+        """
+        self._image = image
+        self._image_raw = raw
+        self._image_source = source or "剪贴板"
+        if not fmt:
+            fmt = (getattr(image, "format", "") or "").upper() or "PNG"
+        if size is None:
+            size = image.size
+        self._image_meta = (fmt, size[0], size[1])
+        self._show_preview()
+        self._refresh()
+
+    def _adopt_decoded(self, decoded, source="Base64"):
+        """解码结果 → 预览图。**不带 raw**：字节已经过一遍 base64，重编码无损害。"""
+        self._adopt_image(decoded.image, source=source)
+
+    def _clear_image(self):
+        self._image = None
+        self._image_raw = None
+        self._image_source = ""
+        self._image_meta = None
+        self._preview_photo = None
+        # 主图缓存也必须丢：虽然它按原图 identity 自校验，但清空后原图仍被这个
+        # 元组引用着，等于「清空了还占着几 MB 内存」。显式置空才真的释放。
+        self._preview_master_img = None
+        if getattr(self, "preview", None) is not None:
+            self.preview.delete("photo")
+            self.preview.itemconfigure(self._hint_id, state="normal")
+            self._place_hint()
+
+    def _on_preview_configure(self, _event=None):
+        """预览区尺寸变化时重排：提示居中、图片重新缩放。
+
+        **这里必须便宜**：拖动窗口会让 ``<Configure>`` 密集触发，每次都要重跑
+        一遍缩放。原本直接拿 ``self._image``（原图）缩，4000×3000 的图每次
+        61 ms，一次拖动轻松累积到秒级——用户感知就是「拖窗口一卡一卡的」。
+        现在改从**预缩主图**（最长边 ≤ ``PREVIEW_MASTER_BOX``）缩，同样条件下
+        每次降到 11 ms 左右，且只在载入时付一次建主图的成本。
+        """
+        self._place_hint()
+        self._show_preview()
+
+    def _place_hint(self):
+        if getattr(self, "preview", None) is None:
+            return
+        width = max(1, self.preview.winfo_width())
+        height = max(1, self.preview.winfo_height())
+        self.preview.coords(self._hint_id, width // 2, height // 2)
+
+    def _preview_master(self):
+        """预览用的「主图」：原图缩到最长边 ``PREVIEW_MASTER_BOX`` 以内。
+
+        存在的理由是性能，不是画质。预览区通常只有四五百像素宽，把 4000×3000
+        的原图每次重缩一遍纯属浪费——先缩到一个够用的中间尺寸，之后所有
+        重缩放都从它出发。实测（4000×3000 → 420×490 区域）：
+
+        | 来源 | 每次缩放 |
+        |---|---|
+        | 原图（旧做法） | 61.1 ms |
+        | 主图 | 11.6 ms |
+
+        主图**不参与编码**：``_image_raw`` / ``_image`` 始终是原图，产物不受影响。
+        """
+        if self._image is None:
+            return None
+        cached = self._preview_master_img
+        if cached is not None and cached[0] is self._image:
+            return cached[1]
+        master = self._image
+        longest = max(master.size)
+        if longest > PREVIEW_MASTER_BOX:
+            try:
+                from PIL import Image as PILImage
+                scaled = master.copy()
+                scaled.thumbnail((PREVIEW_MASTER_BOX, PREVIEW_MASTER_BOX),
+                                 PILImage.LANCZOS)
+                master = scaled
+            except Exception:
+                master = self._image     # 缩不动就退回原图，预览不能因此不显示
+        # 连原图对象一起缓存：换了图（identity 变了）自动失效，不需要显式清理。
+        self._preview_master_img = (self._image, master)
+        return master
+
+    def _show_preview(self):
+        """把当前图像缩放贴到预览画布中央。
+
+        缩放只作用于**显示**：编码用的始终是原始字节或原始尺寸的 PIL 图像，
+        预览被缩小不影响产物。``PhotoImage`` 必须挂在实例上，否则被 GC 掉后
+        画布上就是一片空白——这是 Tk 最经典的坑。
+        """
+        if getattr(self, "preview", None) is None or self._image is None:
+            return
+        try:
+            from PIL import ImageTk
+        except Exception:
+            return
+        area_w = max(1, self.preview.winfo_width() - 24)
+        area_h = max(1, self.preview.winfo_height() - 24)
+        source = self._preview_master() or self._image
+        width, height = source.size
+        scale = min(1.0, area_w / width, area_h / height)
+        shown = source
+        if scale < 1.0:
+            from PIL import Image as PILImage
+            shown = source.resize(
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                PILImage.LANCZOS)
+        self._preview_photo = ImageTk.PhotoImage(shown)
+        self.preview.delete("photo")
+        self.preview.create_image(
+            self.preview.winfo_width() // 2, self.preview.winfo_height() // 2,
+            image=self._preview_photo, anchor="center", tags="photo")
+        self.preview.itemconfigure(self._hint_id, state="hidden")
+        self.preview.tag_lower("photo")
+        # 图像比预览区小时，空出来的地方由标签兜底成空态提示之外的中性色。
+        self.preview.configure(bg=self.T["card_bg"])
+
+    @property
+    def clipboard_api(self):
+        """延迟导入：``clipboard_api`` 在导入期就要 ctypes 打桩 user32，
+        工具窗口的纯 UI 测试不该为此付出代价。"""
+        from . import clipboard_api
+        return clipboard_api
 
     def _make_text(self, parent, editable, edge):
         """返回 Text 控件；其 ``master`` 是带边框与滚动条的容器 Frame。
@@ -995,6 +1398,21 @@ class _ToolWindow:
         return self.input.get("1.0", "end-1c")
 
     def _set_output(self, text):
+        """整体替换结果栏文本。
+
+        ``delete`` + ``insert`` 是不可避免的一对：Tk 没有「替换全部内容」的
+        原子操作，而临时解掉 ``disabled`` 才能写入。
+
+        真正让大文本变快的是**先折行**（见 ``ImageToBase64Window``）：折过行
+        之后 Tk 不必再为几百万字符的一行逐字符找折行点。这里不做额外优化——
+        实测瓶颈从头到尾都在折行计算上，改这里只是掩盖问题。
+
+        右栏是图片面板的工具（Base64 转图片）没有 ``self.output``，
+        ``_analyze`` 返回的结果文本无处可写，直接跳过——状态栏已经把
+        格式/尺寸/体积说完了。
+        """
+        if getattr(self, "output", None) is None:
+            return
         self.output.configure(state="normal")
         self.output.delete("1.0", "end")
         if text:
@@ -1032,34 +1450,122 @@ class _ToolWindow:
         if self._closed:
             return
         raw = self._get_input()
-        if not raw.strip():
+        # 图片类工具的输入有两条：Text 里的文本与已载入的图像。文本为空但图
+        # 还在时（图片转 Base64：图本身就是输入）不能清结果；而「Base64 转图
+        # 片」的图是**文本解码出的产物**，文本没了它就是 stale 的旧图，必须
+        # 一并清掉（``image_is_input=False``）。
+        if not raw.strip() and (self._image is None or not self.image_is_input):
+            self._clear_product()
+            if self.uses_image_pane and not self.image_is_input:
+                self._clear_image()
             self._set_output("")
             self._set_status(self.placeholder or "等待输入")
             return
         try:
             text, status, kind = self._analyze(raw)
         except Exception as exc:  # 工具窗口不应把异常抛给用户
+            # 解码失败时旧图同样是 stale 的（上一段文本留下的），一起清。
+            self._clear_product()
+            if self.uses_image_pane and not self.image_is_input:
+                self._clear_image()
             self._set_output("")
             self._set_status(str(exc) or type(exc).__name__, "error")
             return
         self._set_output(text)
         self._set_status(status, kind)
 
+    def _clear_product(self):
+        """丢掉产物缓冲。**两条「没有结果可看」的路径都必须调它**（输入为空、
+        解析报错），否则清空左栏后点「导出」会把上一次的旧内容又存出去一遍。
+
+        基类实现同时清 buffer 与折行文本；文字类工具不设这两个缓冲，
+        清成空串是无害的。
+        """
+        self._payload = ""
+        self._displayed = ""
+
     def _analyze(self, raw):
-        """返回 ``(结果文本, 状态文本, 状态类型)``。子类实现。"""
+        """返回 ``(结果文本, 状态文本, 状态类型)``。子类实现。
+
+        ``raw`` 是左栏文本。图片类工具的左栏可能为空（用户贴的是图），
+        所以它们可以读 ``self._image`` 补足输入——这是有意的例外。
+        """
         raise NotImplementedError
 
     def _copy_output(self):
+        """复制结果栏内容。``_copy_content`` 可覆写成「显示与复制不同」。
+
+        文本类工具两者一致，原样照抄。右栏是图片面板的工具没有文字结果，
+        「复制」动作就是复制图片本身（``_copy_image``）。
+        """
+        if getattr(self, "output", None) is None:
+            self._copy_image()
+            return
         try:
             content = self.output.get("1.0", "end-1c")
+            payload = self._copy_content(content)
             self.win.clipboard_clear()
-            self.win.clipboard_append(content)
-            self._set_status(f"已复制 {len(content)} 字符", "ok")
+            self.win.clipboard_append(payload)
+            if len(payload) != len(content):
+                # 差异来自折行：说出来，否则用户会以为自己复制到了别的东西。
+                self._set_status(
+                    f"已复制 {len(payload):,} 字符（去掉了折行）", "ok")
+            else:
+                self._set_status(f"已复制 {len(payload)} 字符", "ok")
         except TclError as exc:
             self._set_status(f"复制失败：{exc}", "error")
 
+    def _copy_content(self, displayed):
+        """结果栏里显示的文本 → 真正写进剪贴板的文本。默认原样。
+
+        **只有「显示被改写过」的工具才需要覆写它**，典型是 base64：结果栏里
+        按 76 字符折行显示（见 ``ImageToBase64Window._analyze``），但用户复制
+        出去多半是要贴进数据库字段或接口参数，带换行会直接坏掉。
+        """
+        return displayed
+
+    def _copy_image(self):
+        """把当前图像以 DIB 形式放进剪贴板，可直接粘进聊天窗口 / 画图 / Word。
+
+        **不用 Tk 的 ``clipboard_append``**：那条路只能放文本，Windows 上丢图
+        是必然的。必须走 ``SetClipboardData(CF_DIB)``——``clipboard_api`` 里
+        已有实现，与拿图那条对称。
+
+        剪贴板图不带 alpha（``CF_DIB`` 是 32 位 BGRX，第 4 字节被忽略），所以
+        透明区域会变成黑色。src 图有 alpha 时先铺白底，避免用户看到一块黑。
+        """
+        if self._image is None:
+            self._set_status("还没有图片可复制", "error")
+            return
+        try:
+            image = self._image
+            if image.mode in ("RGBA", "LA", "P"):
+                from PIL import Image as PILImage
+                rgba = image.convert("RGBA")
+                canvas = PILImage.new("RGB", rgba.size, (255, 255, 255))
+                canvas.paste(rgba, mask=rgba.getchannel("A"))
+                image = canvas
+            dib = media.image_to_dib(image)
+            if not self.clipboard_api.set_clipboard_dib(dib):
+                self._set_status("剪贴板被其他程序占用，复制失败", "error")
+                return
+        except Exception as exc:
+            self._set_status(f"复制图片失败：{exc}", "error")
+            return
+        self._set_status(f"已复制图片 · {image.width} × {image.height}", "ok")
+
+    def export(self):
+        """导出按钮的默认实现：没有导出动作的工具不该走这里。"""
+        self._set_status("这个工具没有导出动作", "error")
+
     def _clear(self):
+        # **不在这里清 ``_payload`` / ``_displayed``**：``_refresh`` 会走到
+        # 「输入为空」那条早退分支，而那条已经调了 ``_clear_product()``。
+        # 再写一遍是冗余（变异验证确认：删掉后全套测试仍全绿，因为早退分支
+        # 已经覆盖了）。清空职责只留一个出口，将来改早退条件也不会漏清。
         self.input.delete("1.0", "end")
+        if self.uses_image_pane:
+            self._clear_image()
         self._refresh()
 
     def close(self):
@@ -1270,10 +1776,207 @@ class JwtWindow(_ToolWindow):
         return "", "normal"
 
 
+class ImageToBase64Window(_ToolWindow):
+    """图片转 Base64：左栏是图片预览与取图入口，右栏是 Base64 文本。
+
+    **左栏不再是文本框**——图片没法「键入」。输入有三条途径，都落在同一个
+    ``self._image`` 上：Ctrl+V 粘贴图片、点「从剪贴板取图」、点「选择图片文件…」。
+    右栏仍是纯文本，于是「复制结果」原样可用。
+
+    产物是**完整 Data URI**：``data:image/png;base64,iVBORw0…``（用户明确要求
+    「图片转成的 base64 前面添加 data:image/png;base64,」）。这样贴进浏览器
+    地址栏、``<img src>``、Markdown 都能直接显示，不用再手工拼前缀。
+    MIME 跟着**实际格式**走：PNG 得到的就是用户要的那个前缀，JPEG 是
+    ``image/jpeg``——写死 ``image/png`` 会让浏览器按 PNG 解析 JPEG 字节而失败。
+    ``Base64 转图片`` 一侧的解析本来就去前缀，所以两条路仍能往返。
+    """
+
+    title = "图片转 Base64"
+    placeholder = "粘贴图片，或选择图片文件"
+    uses_image_pane = True
+    # 按钮文案。**不要说「导出图片」**——导出的是 .txt，很容易被理解成
+    # 「把图另存出来」。说清格式，省一次点错。
+    export_label = "导出为 .txt"
+
+    def _preview_hint_text(self):
+        return "按 Ctrl+V 粘贴图片\n也可以选择图片文件"
+
+    def _analyze(self, raw):
+        if self._image is None:
+            # 没有图却调到了这里：说明用户把两个工具弄混了，直接指路。
+            raise image_b64.ImageB64Error(
+                "左栏还没有图片。按 Ctrl+V 粘贴图片，或点「选择图片文件…」；"
+                "若要把 Base64 还原成图片，请用「Base64 转图片」。")
+        if self._image_raw is not None:
+            result = image_b64.encode_bytes(self._image_raw, data_uri=True)
+        else:
+            result = image_b64.encode_image(self._image, data_uri=True)
+        # **缓冲产物，别在下游重新拼**。Text 是唯一真值，换行只是显示形态：
+        #   ``self._payload``    单行原串（含 ``data:`` 前缀）—— 复制走它，
+        #                        贴进代码/接口不会被换行截断
+        #   ``self._displayed``  76 字符折行 —— 结果栏显示与导出走它
+        #   结果栏的 get() 不再被当数据源读，见 ``_copy_content`` / ``export``。
+        #
+        # 折行是为了**性能**：平铺单行 + ``wrap="char"`` 实测让 Tk 重排 310 秒，
+        # 折行后 18.4 ms（纯粹是布置给 Tk 的工作被我们提前做完了）。
+        # 完整推导见 ``image_b64.wrap_text``。
+        self._payload = result.text
+        self._displayed = image_b64.wrap_text(result.text)
+        status = (f"{result.format} · {result.width} × {result.height} · "
+                  f"{image_b64.human_size(result.raw_bytes)} · "
+                  f"{len(result.text):,} 字符")
+        return self._displayed, status, "ok"
+
+    def _copy_content(self, displayed):
+        """复制**不带换行**的完整 Data URI（含前缀），不是结果栏里那份折行文本。
+
+        这是本工具唯一「显示 ≠ 复制」的地方，必须覆盖：用户点「复制结果」的
+        去处（``<img src>``、CSS ``url()``、浏览器地址栏）几乎都受不了正文里
+        夹换行。
+
+        兜底分支**必须走 ``compact`` 而不是原样返回 ``displayed``**：
+        缓冲为空只可能出现在「读显示文本」这条路上，而显示文本是折行的，
+        直接返回就把折行一起复制出去了——正是这个方法要防的事。
+        也**不能**用 ``unwrap_text``：那个会连 ``data:`` 前缀一起剥掉，
+        复制出来的串就与缓冲里那份不一致了（少了前缀，``<img src>`` 直接坏）。
+        """
+        return self._payload or image_b64.compact(displayed)
+
+    def export(self):
+        """把 Base64 文本存成 .txt。
+
+        **导出的是折行版**（与结果栏所见一致），且带尾换行。注意产物现在是
+        完整 Data URI：可以直接当 ``<img src>`` 用，但**不能**直接喂给
+        ``base64 -d``——那需要先去前缀（复制结果后自己删掉，或让「Base64
+        转图片」解析它）。
+        """
+        content = self._displayed or ""
+        if not content:
+            self._set_status("还没有 Base64 可导出", "error")
+            return
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            parent=self.win, title="导出 Base64", defaultextension=".txt",
+            initialfile="image_base64.txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            # newline="\n"：固定 LF，各平台写出一致内容，也才符合 ``base64 -d`` 的预期。
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(content + "\n")
+        except OSError as exc:
+            self._set_status(f"导出失败：{exc}", "error")
+            return
+        self._set_status(f"已导出 {os.path.basename(path)}", "ok")
+
+
+class Base64ToImageWindow(_ToolWindow):
+    """Base64 转图片：**左栏贴 Base64 文本，右栏展示还原出的图片**。
+
+    布局与「图片转 Base64」正好是镜像（用户明确要求：左侧贴进去是 Base64，
+    右侧展示图片）——左栏是普通可编辑 Text，右栏才是图片面板。因此：
+
+    - ``image_pane_side = "right"``：图片面板建在右栏，不建隐藏 Text。
+    - ``image_is_input = False``：右栏的图是**解码产物**。左栏文本被清空或
+      解码报错时，旧图就是 stale 的，必须跟着清（见 ``_refresh``）。
+    - ``paste_prefers_image = False``：输入只认 Base64 文本，粘一张图没有
+      意义，面板上的 Ctrl+V 一律按文本处理、塞进左栏输入框。
+    - ``copy_label = "复制图片"``：右栏没有文字结果，「复制」的就是图；
+      「保存图片…」仍在底栏，扩展名按实际格式走（见 ``export``）。
+    """
+
+    title = "Base64 转图片"
+    placeholder = "左侧粘贴 Base64（可带 data:image/png;base64, 前缀）"
+    uses_image_pane = True
+    image_pane_side = "right"
+    image_is_input = False
+    paste_prefers_image = False
+    copy_label = "复制图片"
+    export_label = "保存图片…"
+
+    def _preview_hint_text(self):
+        return ("左侧粘贴 Base64 文本\n"
+                "带不带 data:image/png;base64, 前缀都可以\n"
+                "还原出的图片会显示在这里")
+
+    def pane_actions(self):
+        """右栏图片面板下方不放按钮：复制/保存都在底栏，别摆两份。
+
+        「复制图片」在底栏（``copy_label``），「保存图片…」也在底栏（
+        ``export_label``）。面板按钮行只服务「左图右文」方向的取图入口，
+        这里方向相反、动作又在底栏，空着最干净。
+        """
+        return []
+
+    def _analyze(self, raw):
+        payload = raw.strip()
+        if not payload:
+            raise image_b64.ImageB64Error("左栏还没有 Base64 内容。")
+        # **避免重复解码**：``_refresh`` 会因粘贴、防抖、预览重建被多次调到，
+        # 每次都 decode 一张大图纯属浪费。按载荷文本做缓存，内容变了才重解。
+        if self._decoded_for != payload:
+            decoded = image_b64.decode_base64(payload)
+            self._decoded_for = payload
+            self._decoded = decoded
+            # 解码结果同时成为右栏预览图。存下来「复制图片」「保存图片」
+            # 才有图可用。
+            self._image = decoded.image
+            self._image_raw = None
+            self._image_source = "Base64"
+            self._image_meta = (decoded.format, decoded.width, decoded.height)
+            self._show_preview()
+        decoded = self._decoded
+        # 右栏是图片面板，没有文字结果可写（``_set_output`` 会跳过）。
+        # 格式 / 尺寸 / 体积都进状态栏：PNG · 100 × 100 · 1.2 KB。
+        # **前缀可选**：``strip_payload`` 会吃掉 ``data:image/png;base64,``
+        # ——带与不带都能解，这正是「两个工具能互相往返」的基础。
+        status = (f"{decoded.format} · {decoded.width} × {decoded.height} · "
+                  f"{image_b64.human_size(decoded.raw_bytes)}")
+        return "", status, "ok"
+
+    def _clear_image(self):
+        """清空时连解码缓存一起丢，否则再粘贴同一段文本会命中旧缓存。"""
+        self._decoded_for = None
+        self._decoded = None
+        super()._clear_image()
+
+    def export(self):
+        """保存解码出的图片。扩展名跟着**实际格式**走，不一律写 .png。
+
+        ``MPO`` 是相机产出的多图 JPEG（PIL 能读但**不能写**），落盘时按 JPEG
+        处理；写失败再退回 PNG，宁可换格式也不让用户拿到一个 0 字节文件。
+        """
+        if self._image is None:
+            self._set_status("还没有图片可保存", "error")
+            return
+        from tkinter import filedialog
+        fmt = (self._image_meta or ("PNG",))[0] or "PNG"
+        write_fmt = image_b64.writable_format(fmt)
+        suffix = image_b64.save_suffix(fmt)
+        path = filedialog.asksaveasfilename(
+            parent=self.win, title="保存图片", defaultextension=suffix,
+            initialfile=f"image{suffix}",
+            filetypes=[(f"{write_fmt} 图片", f"*{suffix}"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            self._image.save(path, write_fmt)
+        except (OSError, ValueError) as exc:
+            try:
+                self._image.save(path, "PNG")
+            except OSError:
+                self._set_status(f"保存失败：{exc}", "error")
+                return
+        self._set_status(f"已保存 {os.path.basename(path)}", "ok")
+
+
 # 工具注册表：顶栏下拉与测试都遍历它，新增工具只改这里。
 TOOLS = (
     ("json", "JSON 格式化", JsonParamWindow),
     ("jwt", "JWT 解密", JwtWindow),
+    ("img2b64", "图片转 Base64", ImageToBase64Window),
+    ("b642img", "Base64 转图片", Base64ToImageWindow),
 )
 
 
