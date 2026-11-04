@@ -4,6 +4,7 @@
 """
 import base64
 import ctypes
+import itertools
 import os
 import random
 import sys
@@ -29,6 +30,7 @@ from lumina.tool_window import (  # noqa: E402
     WS_MINIMIZEBOX,
     WS_SYSMENU,
     Base64ToImageWindow,
+    DateTimeWindow,
     ImageToBase64Window,
     JsonParamWindow,
     JwtWindow,
@@ -421,6 +423,60 @@ class ToolWindowTests(unittest.TestCase):
         self.assertIsNone(hit_name(w // 2, h // 2), '窗口中心被热区盖住了')
         self.assertIsNone(hit_name(w // 2, 20), '顶栏被热区盖住了')
         silence(window.win)      # 用完立刻压回透明，后面的用例照旧不闪
+
+    # ---------- 默认尺寸：四个工具必须统一 ----------
+    def test_all_tools_share_one_default_size(self):
+        """四个工具窗口的默认尺寸必须**完全一致**。
+
+        用户原话：「剪贴板中工具的弹框现在有点小，**统一**调整大一点」。
+        尺寸定义在 ``_ToolWindow`` 这一层、子类都不覆盖，所以想让它们不一致
+        反而需要额外写代码——这个用例守的就是「别做那件事」。
+
+        **断言的是「四者相等」而不是「等于 1120x780」**：具体数值是观感偏好，
+        用户随时可能再让调大一点，钉死数值只会让下次调整多改一处。真正有
+        价值的不变量是统一性，以及「比旧的 920x640 大」这个方向。
+        """
+        sizes = {}
+        for _key, label, cls in TOOLS:
+            window = self._open(cls)
+            window.win.update()
+            sizes[label] = (window.win.winfo_width(),
+                            window.win.winfo_height())
+        distinct = set(sizes.values())
+        self.assertEqual(len(distinct), 1,
+                         f'四个工具默认尺寸不一致：{sizes}')
+
+        width, height = distinct.pop()
+        self.assertGreater(width, 920, f'弹框没有被调大：{width}')
+        self.assertGreater(height, 640, f'弹框没有被调高：{height}')
+
+    def test_center_clamps_an_oversized_default_to_fit_the_screen(self):
+        """默认尺寸比屏幕还大时，``_center`` 必须把它收窄到屏幕内。
+
+        这条守的是**小屏兜底**：默认尺寸调大（1120x780）之后，在 1366x768
+        这类小屏上就超过工作区了，必须靠 ``_center`` 里的 ``min(...)`` 收住，
+        否则窗口会顶到屏幕边缘、右下角的缩放抓手甚至跑到屏幕外。
+
+        **不能用「读当前窗口尺寸再和屏幕比」来写**——那是恒真断言：
+        ``winfo_width()`` 读的是**收窄后**的值，无论 ``_center`` 里的
+        ``min(...)`` 在不在，它永远都装得进屏幕。实测把这个用例写成那种形式
+        后，把默认尺寸改成 3000x2000（远超屏幕）仍然全绿——完全测不到东西。
+        所以这里**主动改大实例的声明值再重摆一次**，逼 ``_center`` 真正执行
+        收窄逻辑，断言才有判别力。
+        """
+        window = self._open(JsonParamWindow)
+        sw = window.win.winfo_screenwidth()
+        sh = window.win.winfo_screenheight()
+
+        window.width = sw + 500
+        window.height = sh + 500
+        window._center()
+        window.win.update()
+
+        self.assertLessEqual(window.win.winfo_width(), max(MIN_W, sw - 80),
+                             '超宽默认值没有被收窄，窗口会探出屏幕')
+        self.assertLessEqual(window.win.winfo_height(), max(MIN_H, sh - 120),
+                             '超高默认值没有被收窄，窗口会探出屏幕')
 
     def _drag_edge(self, window, name, dx, dy):
         """模拟从某条边/角拖拽，返回窗口几何的实际变化量。"""
@@ -894,14 +950,32 @@ class ToolWindowTests(unittest.TestCase):
 
     # ---------- 通用骨架 ----------
     def test_tool_registry_keys_and_order(self):
-        """注册表顺序即下拉顺序。图片两个工具排在两个文本工具之后。
+        """注册表顺序即下拉顺序。图片两个工具排在三个文本工具之后。
 
-        这是**有意的分组**：JSON / JWT 是「文本转换」，图片两个是「二进制
-        转换」，中间那条界线让用户不必在一次扫视里比较两类东西。加新工具时
-        想插队就要改这条，逼着人想一下分组是否还成立。
+        这是**有意的分组**：JSON / JWT / 日期转换是「文本转换」，图片两个是
+        「二进制转换」，中间那条界线让用户不必在一次扫视里比较两类东西。加新
+        工具时想插队就要改这条，逼着人想一下分组是否还成立。
         """
         keys = [key for key, _label, _cls in TOOLS]
-        self.assertEqual(keys, ['json', 'jwt', 'img2b64', 'b642img'])
+        self.assertEqual(keys,
+                         ['json', 'jwt', 'datetime', 'img2b64', 'b642img'])
+
+    def test_text_tools_come_before_binary_tools(self):
+        """分组界线必须仍然成立：文本类在前、图片类在后。
+
+        上面那条钉的是**具体顺序**，这条钉的是**分组依据**。两者不重复：
+        把新工具插到末尾（`json/jwt/img2b64/b642img/datetime`）会让上面那条
+        失败，但失败信息只说「顺序不对」，看不出真正的问题是「一个文本工具
+        混进了图片组」。这条给出的是语义层面的诊断。
+        """
+        kinds = [(key, cls.uses_image_pane) for key, _l, cls in TOOLS]
+        first_binary = next(i for i, (_k, is_img) in enumerate(kinds) if is_img)
+        for key, is_img in kinds[first_binary:]:
+            self.assertTrue(is_img,
+                            f'{key} 是文本工具却排在了图片工具之后')
+        for key, is_img in kinds[:first_binary]:
+            self.assertFalse(is_img,
+                             f'{key} 是图片工具却排在了文本工具之前')
 
     def test_registry_label_matches_window_title(self):
         """注册表里的下拉文案必须与窗口标题一致。
@@ -1606,6 +1680,981 @@ class ToolWindowTests(unittest.TestCase):
         window = self._open(JwtWindow)
         self._type(window, f'{enc({"alg": "none"})}.{enc({"sub": "1"})}')
         self.assertIn('alg=none', window.output.get('1.0', 'end-1c'))
+
+    # ---------- 日期转换（三栏并排版式） ----------
+    def _fill_field(self, window, key, text):
+        """往某一栏的输入框里填值并立即刷新（跳过 180ms 防抖）。"""
+        entry = window.rows[key]['entry']
+        window._hide_placeholder(entry)
+        entry.delete(0, 'end')
+        if text:
+            entry.insert(0, text)
+        window._on_field_input(key)
+        window._refresh()
+
+    def _field_result(self, window, key):
+        """某一栏结果区的**主值**。"""
+        return window.rows[key]['result'].cget('text')
+
+    def _field_sub(self, window, key):
+        """某一栏结果区的**副行**（灰字那一行，可能为空）。"""
+        return window.rows[key]['sub'].cget('text')
+
+    def _field_fg(self, window, key):
+        return window.rows[key]['result'].cget('fg').upper()
+
+    def _clock_card(self, window):
+        """时钟条那张卡。三列的父链是 Label→cell(Frame)→card。"""
+        return window._clock_cells['beijing'].master.master
+
+    def _deck_cards(self, window):
+        """三栏卡片，按左右顺序。"""
+        return [window.rows[c[0]]['card'] for c in window.COLUMNS]
+
+    def _meta_row_of(self, label):
+        """一个说明文字 Label 所在的那一行容器（``_make_meta_row`` 的返回值）。"""
+        return label.master
+
+    def _row_dots(self, label):
+        """说明行里的绿点画布，按 pack 顺序。``[点, 文字]`` 表示点在文字左边。"""
+        return [c for c in self._meta_row_of(label).winfo_children()
+                if c.winfo_class() == 'Canvas']
+
+    def _widgets_with_text(self, root, text, kind=None):
+        """递归找文字里含 ``text`` 的控件（可限定类名）。"""
+        out = []
+        for widget in self._descendants(root):
+            if kind is not None and widget.winfo_class() != kind:
+                continue
+            try:
+                value = str(widget.cget('text'))
+            except tk.TclError:
+                continue
+            if text in value:
+                out.append(widget)
+        return out
+
+    # ---- 注册与整体结构 ----
+    def test_datetime_window_is_reachable_from_the_registry(self):
+        """新工具必须真能从注册表打开——只加类不加注册表等于没做。
+
+        走 ``open_tool`` 而不是直接 ``cls(panel)``：注册表的 key→类的映射
+        正是在这里被真正使用的。
+        """
+        window = open_tool(self.panel, 'datetime')
+        self.created.append(window)
+        window.win.update()
+        self.assertIsInstance(window, DateTimeWindow)
+        self.assertEqual(window.title, '日期转换')
+
+    def test_datetime_has_exactly_three_columns(self):
+        """三栏，顺序与用户要求一致：时间戳→日期、日期→时间戳、北京→美东。
+
+        顺序是用户明确指定的（「时间戳-》日期时间、日期时间-》时间戳、
+        北京时间-》美东时间」），所以连顺序一起钉住，不能只断言条数。
+        """
+        window = self._open(DateTimeWindow)
+        self.assertEqual([c[0] for c in window.COLUMNS],
+                         ['stamp', 'date', 'zone'])
+        self.assertEqual(list(window.rows), ['stamp', 'date', 'zone'])
+        titles = [c[1] for c in window.COLUMNS]
+        self.assertEqual(titles, ['时间戳 → 日期时间', '日期时间 → 时间戳',
+                                  '北京时间 → 美东时间'])
+
+    def test_datetime_every_column_is_wired_to_a_converter(self):
+        """每栏都必须真的接上换算函数——漏一处就是一个永远空白的结果块。
+
+        遍历 ``COLUMNS`` 断言而不是逐个点名：将来加第四栏时这条会一起覆盖到。
+        """
+        window = self._open(DateTimeWindow)
+        for spec in window.COLUMNS:
+            self.assertTrue(callable(spec[4]),
+                            f'{spec[0]} 那栏没有接换算函数')
+        self.assertEqual(
+            [spec[4] for spec in window.COLUMNS],
+            [TW.datetime_tools.timestamp_to_zone, TW.datetime_tools.to_timestamp,
+             TW.datetime_tools.convert_zone])
+
+    def test_datetime_columns_sit_side_by_side_on_one_row(self):
+        """三栏必须**并排**在同一行上，而不是上下叠。
+
+        用屏幕坐标实测：三栏的 ``winfo_rooty()`` 相等才算真的同一行；只读
+        grid 的 ``row=`` 是意图，不是用户看到的结果。左右顺序也要对。
+        """
+        window = self._open(DateTimeWindow)
+        cards = self._deck_cards(window)
+        tops = [c.winfo_rooty() for c in cards]
+        self.assertEqual(len(set(tops)), 1,
+                         f'三栏不在同一行，各自的顶边是 {tops}')
+        lefts = [c.winfo_rootx() for c in cards]
+        self.assertEqual(lefts, sorted(lefts), f'三栏左右顺序不对：{lefts}')
+
+    def test_datetime_columns_do_not_overlap(self):
+        """相邻两栏必须有间隙，不能贴到一起或重叠。"""
+        window = self._open(DateTimeWindow)
+        for left, right in itertools.pairwise(self._deck_cards(window)):
+            gap = right.winfo_rootx() - (left.winfo_rootx() + left.winfo_width())
+            self.assertGreaterEqual(gap, 4,
+                                    f'两栏贴死了，间隙只有 {gap}px')
+
+    def test_datetime_columns_share_the_same_width(self):
+        """三栏等宽——三栏装着结构相同的元素，宽度不齐会让按钮右缘参差不齐。"""
+        window = self._open(DateTimeWindow)
+        widths = [c.winfo_width() for c in self._deck_cards(window)]
+        self.assertLessEqual(max(widths) - min(widths), 2,
+                             f'三栏宽度不齐：{widths}')
+
+    def test_datetime_clock_sits_above_the_three_columns(self):
+        """时钟条在**三栏上方**（用户确认的三个设计决策之一：保留、放三栏上方）。"""
+        window = self._open(DateTimeWindow)
+        clock = self._clock_card(window)
+        for card in self._deck_cards(window):
+            self.assertLess(clock.winfo_rooty() + clock.winfo_height(),
+                            card.winfo_rooty() + 1,
+                            '时钟条没在三栏上方')
+        # 时钟条要横跨整个正文宽度，而不是只占左边一栏。
+        self.assertGreater(clock.winfo_width(),
+                           self._deck_cards(window)[0].winfo_width() * 2,
+                           '时钟条没有横跨三栏')
+
+    def test_datetime_has_no_footer_at_all(self):
+        """**底栏整个去掉**（用户明确要求）。
+
+        钉两条：类属性关掉，以及真的一个 Button 都没建出来——只改开关而
+        忘了 ``_build`` 里的条件，界面上会冒出一条半残的底栏。
+        """
+        window = self._open(DateTimeWindow)
+        self.assertFalse(window.has_footer, 'has_footer 没关掉')
+        self.assertFalse(hasattr(window, '_body_footer'))
+        # 底栏的招牌控件：状态灯与状态文字。它们不该存在。
+        self.assertFalse(hasattr(window, '_lamp'), '底栏的状态灯还在')
+        self.assertFalse(hasattr(window, 'status'), '底栏的状态文字还在')
+
+    def test_datetime_body_uses_the_space_freed_by_the_footer(self):
+        """去掉底栏后正文区要**吃掉**那 35px，而不是在底部留一条空白。
+
+        只把 ``_build_footer`` 跳掉、不同步改高度偏移量，正文区的下缘会停在
+        「本该有底栏」的位置——截图上看就是窗口底部一条与底色不同的空白带。
+
+        **反证用另一条**：造一个 ``has_footer = True`` 的同版式子类，同一个
+        窗口高度下它的正文区必须**矮掉整整 ``FOOT_HEIGHT + 1``**。这比
+        「差值小于某个常数」可靠得多——那个常数既包含 ``CONTENT_INSET``，
+        又随窗口边框变化，实测差 1px 就会误报，而 1px 完全不是缺陷。
+        """
+        window = self._open(DateTimeWindow)
+        shell_bottom = window.win.winfo_rooty() + window.win.winfo_height()
+        body_bottom = window._body.winfo_rooty() + window._body.winfo_height()
+        self.assertLessEqual(shell_bottom - body_bottom,
+                             TW.FOOT_HEIGHT + 1 + 8,
+                             '正文区下缘离窗口底太远，底栏的位置留了空白')
+
+        class WithFooter(DateTimeWindow):
+            has_footer = True
+
+        other = self._open(WithFooter)
+        other.win.geometry(f'{window.win.winfo_width()}'
+                           f'x{window.win.winfo_height()}')
+        other.win.update()
+        other.win.update_idletasks()
+        self.assertEqual(
+            window._body.winfo_height() - other._body.winfo_height(),
+            TW.FOOT_HEIGHT + 1,
+            '关掉底栏后正文区没有正好长高 FOOT_HEIGHT+1')
+
+    # ---- 单栏内部元素顺序 ----
+    def test_datetime_each_column_stacks_elements_in_the_shot_order(self):
+        """每栏的元素顺序：输入框 → 下拉 → 下拉 → 主按钮 → 结果块。
+
+        这是截图里那套版式的核心结构，必须逐栏实测。用 ``winfo_rooty()``
+        而不是 grid ``row=``：后者是意图，前者才是用户看到的位置。
+        """
+        window = self._open(DateTimeWindow)
+        for key in ('stamp', 'date', 'zone'):
+            row = window.rows[key]
+            names = list(row['drops'])
+            chain = [
+                ('输入框', row['entry'].master),
+                (f'下拉{names[0]}', row['drops'][names[0]].box),
+                (f'下拉{names[1]}', row['drops'][names[1]].box),
+                ('主按钮', row['button']),
+                ('结果块', row['result'].master.master),
+            ]
+            tops = [w.winfo_rooty() for _, w in chain]
+            self.assertEqual(tops, sorted(tops),
+                             f'{key} 那栏的元素顺序不对：'
+                             f'{[(n, y) for (n, _), y in zip(chain, tops)]}')
+            self.assertEqual(len(set(tops)), len(tops),
+                             f'{key} 那栏有两个元素顶边相同，说明叠在了一起')
+
+    def test_datetime_each_column_has_title_subtitle_and_input(self):
+        """每栏顶部是标题 + 副标题 + 输入框，三者按这个顺序排。"""
+        window = self._open(DateTimeWindow)
+        for key, title, subtitle, _hint, _f, _g in window.COLUMNS:
+            card = window.rows[key]['card']
+            heads = self._widgets_with_text(card, title, 'Label')
+            self.assertEqual(len(heads), 1, f'{key} 那栏找不到标题 {title!r}')
+            subs = self._widgets_with_text(card, subtitle, 'Label')
+            self.assertEqual(len(subs), 1, f'{key} 那栏找不到副标题')
+            self.assertLess(heads[0].winfo_rooty(), subs[0].winfo_rooty(),
+                            f'{key} 那栏标题没在副标题上面')
+            self.assertLess(subs[0].winfo_rooty(),
+                            window.rows[key]['entry'].master.winfo_rooty(),
+                            f'{key} 那栏副标题没在输入框上面')
+
+    def test_datetime_buttons_are_inside_their_own_column(self):
+        """每个主按钮必须在**自己那一栏**里，left/right 都落在栏内。
+
+        三栏并排时把按钮挂错父容器，视觉上可能仍「看着像在这一栏下面」，
+        实则是全局的一个按钮——点哪一栏都是同一栏的结果。
+        """
+        window = self._open(DateTimeWindow)
+        for key in ('stamp', 'date', 'zone'):
+            card = window.rows[key]['card']
+            button = window.rows[key]['button']
+            self.assertIs(button.master, card,
+                          f'{key} 那栏的主按钮不是这张卡的孩子')
+            self.assertGreaterEqual(button.winfo_rootx(), card.winfo_rootx())
+            self.assertLessEqual(button.winfo_rootx() + button.winfo_width(),
+                                 card.winfo_rootx() + card.winfo_width())
+
+    def test_datetime_action_button_spans_the_column(self):
+        """主按钮是**通栏**的——左右各留一点内边距，但不该缩成一小块。
+
+        截图里那颗绿按钮几乎占满整栏宽度；它同时也是这一栏最显眼的可点元素，
+        缩窄会让人以为它只是个图标。
+        """
+        window = self._open(DateTimeWindow)
+        for key in ('stamp', 'date', 'zone'):
+            card = window.rows[key]['card']
+            button = window.rows[key]['button']
+            self.assertGreater(button.winfo_width(),
+                               card.winfo_width() * 0.7,
+                               f'{key} 那栏的主按钮不够宽，不像通栏按钮')
+
+    def test_datetime_action_buttons_share_the_same_width(self):
+        """三栏的按钮等宽——三栏等宽 + 同样的内边距，按钮自然该齐。
+
+        这条抓的是「某一栏忘了设 padx 或 grid 参数写歪」这类错位。
+        """
+        window = self._open(DateTimeWindow)
+        widths = [window.rows[k]['button'].winfo_width()
+                  for k in ('stamp', 'date', 'zone')]
+        self.assertLessEqual(max(widths) - min(widths), 2,
+                             f'三栏按钮宽度不齐：{widths}')
+
+    # ---- 主按钮与复制 ----
+    def test_datetime_action_button_is_green(self):
+        """主按钮是绿色实心（截图里那颗通栏按钮）。"""
+        window = self._open(DateTimeWindow)
+        expected = window.P['button'].upper()
+        for key in ('stamp', 'date', 'zone'):
+            button = window.rows[key]['button']
+            self.assertEqual(button.cget('bg').upper(), expected,
+                             f'{key} 那栏的按钮底色不是绿色')
+            label = button.label_widget
+            self.assertEqual(label.cget('bg').upper(), expected)
+            self.assertEqual(label.cget('fg').upper(),
+                             window.P['button_fg'].upper())
+
+    def test_datetime_action_button_label_is_translate(self):
+        """按钮文案是「转换」，且三栏一致。"""
+        window = self._open(DateTimeWindow)
+        for key in ('stamp', 'date', 'zone'):
+            text = window.rows[key]['button'].label_widget.cget('text')
+            self.assertEqual(text, window.ACTION_LABEL)
+
+    def test_datetime_action_button_recomputes_immediately(self):
+        """按主按钮要**立刻**出结果，不等 180ms 防抖。
+
+        防抖只服务于「打字」那条路径；按钮是用户主动按下的，等 180ms 才出
+        结果会让人怀疑「是不是没按到」。
+        """
+        window = self._open(DateTimeWindow)
+        entry = window.rows['stamp']['entry']
+        window._hide_placeholder(entry)
+        entry.insert(0, '1793777553681')     # 故意不触发 _on_field_input
+        window.rows['stamp']['button'].label_widget.event_generate(
+            '<ButtonPress-1>', x=5, y=5)
+        self.assertEqual(self._field_result(window, 'stamp'),
+                         '2026-11-04 15:32:33',
+                         '按了按钮但没有立刻出结果')
+
+    def test_datetime_each_column_has_its_own_copy(self):
+        """每栏结果区里都有一个「复制」，且复制的是**那一栏**的结果。
+
+        三份结果同时在屏幕上，复制哪一份必须有确定答案——点哪栏的复制就是
+        哪栏的，不能全都复制同一份。
+        """
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553681')
+        self._fill_field(window, 'zone', '2026-11-04 15:32:33')
+        window.rows['zone']['copy'].event_generate('<Button-1>', x=2, y=2)
+        copied = window.win.clipboard_get()
+        self.assertIn('2026-11-04 02:32:33', copied)
+        self.assertIn('EST', copied, '美东那栏的副行没被一起复制')
+
+    def test_datetime_copy_without_result_reports_instead_of_crashing(self):
+        """没结果时点复制要给出提示，而不是静默无反应或报错。"""
+        window = self._open(DateTimeWindow)
+        window._copy_column('stamp')
+        head = window.rows['stamp']['head_label'].cget('text')
+        self.assertIn('没有结果', head)
+
+    def test_datetime_toast_is_per_column(self):
+        """提示只出现在**被点那一栏**，不串到别的栏。"""
+        window = self._open(DateTimeWindow)
+        window._copy_column('date')
+        self.assertIn('没有结果',
+                      window.rows['date']['head_label'].cget('text'))
+        self.assertEqual(window.rows['stamp']['head_label'].cget('text'),
+                         '转换结果', '提示串到别的栏去了')
+
+    # ---- 下拉 ----
+    def test_datetime_every_column_has_the_dropdowns_from_the_spec(self):
+        """``COLUMNS`` 里声明了几个下拉，界面上就得真建出几个。
+
+        「照图片全做」是用户明确的答复；漏建一个下拉不会报错，只会让某一栏
+        少一个选项——没有任何断言拦得住，所以这里遍历声明去比对。
+        """
+        window = self._open(DateTimeWindow)
+        for key, _t, _s, _h, _f, groups in window.COLUMNS:
+            drops = window.rows[key]['drops']
+            self.assertEqual(list(drops), [g[0] for g in groups],
+                             f'{key} 那栏的下拉与声明不符')
+            for gkey, _glabel, choices, default in groups:
+                drop = drops[gkey]
+                self.assertEqual(list(drop.order), [c[0] for c in choices],
+                                 f'{key}.{gkey} 的选项不对')
+                self.assertEqual(drop.value, default,
+                                 f'{key}.{gkey} 的默认值不对')
+                self.assertEqual(drop.label,
+                                 dict(choices)[default],
+                                 f'{key}.{gkey} 的展示名不对')
+
+    def test_datetime_dropdown_labels_match_the_shot(self):
+        """下拉的标签文字照截图：自动识别 / 目标时区 / 时间基准 / 输出单位。
+
+        这些字写在输入框下面，用户靠它们判断「这个框是干什么的」。
+        """
+        window = self._open(DateTimeWindow)
+        expected = {
+            'stamp': ['自动识别', '目标时区'],
+            'date': ['时间基准', '输出单位'],
+            'zone': ['时间基准', '结果时区'],
+        }
+        for key, labels in expected.items():
+            card = window.rows[key]['card']
+            for label in labels:
+                found = self._widgets_with_text(card, label, 'Label')
+                self.assertTrue(found, f'{key} 那栏找不到标签 {label!r}')
+
+    def test_datetime_dropdown_shows_option_label_not_key(self):
+        """下拉显示的必须是**选项的展示名**，不是内部 key。
+
+        显示 ``beijing`` 而不是「北京时间 (UTC+08:00)」，用户根本不知道那是
+        哪个时区。
+        """
+        window = self._open(DateTimeWindow)
+        for key in ('stamp', 'date', 'zone'):
+            for drop in window.rows[key]['drops'].values():
+                self.assertIn(drop.value, dict(drop.choices))
+                self.assertNotEqual(drop.label, drop.value,
+                                    f'{key} 的下拉显示了内部 key')
+                self.assertEqual(drop.label_widget.cget('text'), drop.label)
+
+    def test_datetime_dropdown_click_opens_a_popup_and_selects(self):
+        """点下拉要弹出选项，选中后要**立刻**按新选项重算。
+
+        只断言 ``set()`` 会漏掉「点了没反应」——那正是自绘下拉最容易出的问题
+        （事件没绑到真正被点的那个小控件上）。
+        """
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553681')
+        self.assertEqual(self._field_result(window, 'stamp'),
+                         '2026-11-04 15:32:33')     # 目标时区默认北京
+        drop = window.rows['stamp']['drops']['zone']
+        drop.label_widget.event_generate('<Button-1>', x=2, y=2)
+        window.win.update()
+        self.assertIsNotNone(window._popup, '点了下拉但没有弹出选项')
+        window._close_popup()
+        drop.set('eastern')
+        self.assertEqual(self._field_result(window, 'stamp'),
+                         '2026-11-04 02:32:33',
+                         '切换目标时区后没有重算')
+
+    def test_datetime_no_footer_dropdown_remains(self):
+        """底栏的下拉入口（如果有）要随底栏一起消失。"""
+        window = self._open(DateTimeWindow)
+        self.assertFalse(hasattr(window, '_json_anchor'))
+
+    # ---- 结果区 ----
+    def test_datetime_results_are_dark_green_on_a_soft_green_block(self):
+        """结果区是「浅绿底 + 深绿字」（截图配色）。
+
+        用**实测像素**而不是只读 ``cget``：``cget`` 只说明控件被配置成什么，
+        而浅绿底是由内外两个 Frame 叠出来的，很容易配对了外层漏了内层。
+        """
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553681')
+        for key in ('stamp', 'date', 'zone'):
+            row = window.rows[key]
+            value, inner = row['result'], row['result'].master
+            self.assertEqual(value.cget('bg').upper(),
+                             window.P['soft'].upper(),
+                             f'{key} 结果文字不在浅绿底上')
+            self.assertEqual(inner.cget('bg').upper(),
+                             window.P['soft'].upper(),
+                             f'{key} 结果块内层不是浅绿')
+            self.assertEqual(
+                inner.master.cget('bg').upper(),
+                window.P['soft_border'].upper(),
+                f'{key} 结果块外圈描边色不对')
+            self.assertEqual(value.cget('fg').upper(),
+                             window.P['value_fg'].upper(),
+                             f'{key} 结果文字不是深绿')
+
+    def test_datetime_result_head_sits_above_the_value(self):
+        """结果块的「转换结果」标题在结果值**上面**，复制在标题同一行右侧。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553681')
+        row = window.rows['stamp']
+        head, value = row['head_label'], row['result']
+        self.assertLess(head.winfo_rooty(), value.winfo_rooty(),
+                        '「转换结果」没在结果值上面')
+        copy = row['copy']
+        self.assertLessEqual(
+            abs(copy.winfo_rooty() - head.winfo_rooty()), 6,
+            '复制按钮没和「转换结果」在同一行')
+        self.assertGreater(copy.winfo_rootx(), head.winfo_rootx(),
+                           '复制按钮跑到标题左边了')
+
+    def test_datetime_error_result_turns_red(self):
+        """报错用红字——与深绿的正常结果区分开。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '不是时间戳')
+        self.assertIn('不是时间戳', self._field_result(window, 'stamp'))
+        self.assertEqual(self._field_fg(window, 'stamp'), '#FF453A')
+
+    def test_datetime_result_box_grows_with_the_window(self):
+        """结果块要吃掉栏内多余高度，而不是留一段空白在栏底。
+
+        三栏并排后纵向空间只有原来的一半，结果块不长高的话整栏下半部分就是
+        一片与卡片同色的空白——看起来像内容没建完。
+        """
+        window = self._open(DateTimeWindow)
+        window.win.geometry('1120x620')
+        window.win.update()
+        window.win.update_idletasks()
+        small = window.rows['stamp']['result'].master.master.winfo_height()
+        window.win.geometry('1120x800')
+        window.win.update()
+        window.win.update_idletasks()
+        big = window.rows['stamp']['result'].master.master.winfo_height()
+        self.assertGreater(big, small + 40,
+                           f'窗口变高结果块没跟着长：{small} → {big}')
+
+    # ---- 换算正确性 ----
+    def test_datetime_stamp_column_converts_to_beijing_by_default(self):
+        """第 1 栏：时间戳 → 日期时间，目标时区默认北京时间。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553681')
+        self.assertEqual(self._field_result(window, 'stamp'),
+                         '2026-11-04 15:32:33')
+
+    def test_datetime_stamp_column_follows_the_target_zone(self):
+        """第 1 栏切目标时区要真的换一个结果（含夏令时分支）。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553681')
+        window.rows['stamp']['drops']['zone'].set('eastern')
+        self.assertEqual(self._field_result(window, 'stamp'),
+                         '2026-11-04 02:32:33')          # 11 月 EST
+        window.rows['stamp']['drops']['zone'].set('utc')
+        self.assertEqual(self._field_result(window, 'stamp'),
+                         '2026-11-04 07:32:33')
+
+    def test_datetime_stamp_column_follows_the_input_unit(self):
+        """第 1 栏的输入单位下拉要能覆盖位数判定。
+
+        **拿 10 位数字验**：它默认按「秒」解释（位数规则），显式选「毫秒」后
+        会变成 1000 倍——两个结果必然不同，而且都落在可表示范围内。
+
+        早先这里用 13 位数字选「秒」，期望它变成 2286 年，实际是**溢出**：
+        13 位当秒就是 55000 年，超出 ``datetime`` 的上限，函数按设计报
+        「数值太大」。那是正确的行为，是断言挑错了样本。
+        """
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553')     # 10 位 = 秒
+        auto = self._field_result(window, 'stamp')
+        self.assertEqual(auto, '2026-11-04 15:32:33')
+        window.rows['stamp']['drops']['unit'].set('millis')
+        forced = self._field_result(window, 'stamp')
+        self.assertNotEqual(auto, forced,
+                            '显式选了「毫秒」但结果没变，说明单位没生效')
+        # 按毫秒解释 = 1970-01-21 前后（1793777553 ms ≈ 20.8 天）
+        self.assertIn('1970-01', forced)
+
+    def test_datetime_date_column_converts_to_millis_by_default(self):
+        """第 2 栏：日期时间 → 时间戳，输出单位默认毫秒。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'date', '2026-11-04 15:32:33')
+        self.assertEqual(self._field_result(window, 'date'), '1793777553000')
+
+    def test_datetime_date_column_follows_the_output_unit(self):
+        """第 2 栏的「秒 / 毫秒」下拉。秒的时间戳是毫秒的 1/1000。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'date', '2026-11-04 15:32:33')
+        millis = int(self._field_result(window, 'date'))
+        window.rows['date']['drops']['unit'].set('seconds')
+        seconds = int(self._field_result(window, 'date'))
+        self.assertEqual(millis, seconds * 1000,
+                         '秒与毫秒的换算关系不对')
+
+    def test_datetime_date_column_follows_the_time_base(self):
+        """同一串「15:32:33」按不同基准解释，得到的时间戳必须不同。
+
+        **方向要算对**：北京 = UTC+8。同一串「15:32:33」当成 UTC（= 15:32
+        UTC）比当成北京（= 07:32 UTC）**晚** 8 小时，所以差值应当是 ``+8``。
+        这条第一版把符号写反了，实测才纠正过来——方向性断言不能凭直觉写。
+        """
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'date', '2026-11-04 15:32:33')
+        beijing = int(self._field_result(window, 'date'))
+        window.rows['date']['drops']['zone'].set('utc')
+        utc = int(self._field_result(window, 'date'))
+        delta_hours = (utc - beijing) / 1000 / 3600
+        self.assertAlmostEqual(delta_hours, 8, places=3,
+                               msg='同一串数字按 UTC 解释应比按北京解释晚 8 小时')
+
+    def test_datetime_zone_column_converts_beijing_to_eastern(self):
+        """第 3 栏：北京时间 → 美东时间（用户点名的功能）。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'zone', '2026-11-04 15:32:33')
+        self.assertEqual(self._field_result(window, 'zone'),
+                         '2026-11-04 02:32:33')
+        self.assertIn('EST', self._field_sub(window, 'zone'))
+        self.assertIn('UTC-5', self._field_sub(window, 'zone'))
+
+    def test_datetime_zone_column_uses_dst_in_summer(self):
+        """夏天要走 EDT（UTC-4）。只测冬天会漏掉整个夏令时分支。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'zone', '2026-07-01 20:00:00')
+        self.assertEqual(self._field_result(window, 'zone'),
+                         '2026-07-01 08:00:00')          # 20:00 - 12h
+        self.assertIn('EDT', self._field_sub(window, 'zone'))
+
+    def test_datetime_zone_column_can_go_the_other_way(self):
+        """第 3 栏的两个下拉可以反过来：美东 → 北京。"""
+        window = self._open(DateTimeWindow)
+        row = window.rows['zone']
+        row['drops']['source'].set('eastern')
+        row['drops']['target'].set('beijing')
+        self._fill_field(window, 'zone', '2026-11-04 02:32:33')
+        self.assertEqual(self._field_result(window, 'zone'),
+                         '2026-11-04 15:32:33')
+
+    def test_datetime_zone_column_round_trips(self):
+        """北京 → 美东 → 北京 必须回到原值。方向性 bug 单跑一边抓不到。"""
+        window = self._open(DateTimeWindow)
+        for text in ('2026-11-04 15:32:33', '2026-07-01 20:00:00'):
+            # **每一轮都要把两个下拉复位**：上一轮结束时它们是「美东 → 北京」，
+            # 直接进下一轮会把北京时间的输入当成美东来解析，往返自然对不上。
+            row = window.rows['zone']
+            row['drops']['source'].set('beijing')
+            row['drops']['target'].set('eastern')
+            self._fill_field(window, 'zone', text)
+            eastern = self._field_result(window, 'zone')
+            row['drops']['source'].set('eastern')
+            row['drops']['target'].set('beijing')
+            self._fill_field(window, 'zone', eastern)
+            self.assertEqual(self._field_result(window, 'zone'), text,
+                             f'{text} 往返后对不上')
+
+    def test_datetime_columns_are_independent(self):
+        """三栏各自算各自的，互不干扰。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553681')
+        self._fill_field(window, 'date', '2026-11-04 15:32:33')
+        self._fill_field(window, 'zone', '2026-11-04 15:32:33')
+        self.assertEqual(self._field_result(window, 'stamp'),
+                         '2026-11-04 15:32:33')
+        self.assertEqual(self._field_result(window, 'date'), '1793777553000')
+        self.assertEqual(self._field_result(window, 'zone'),
+                         '2026-11-04 02:32:33')
+
+    def test_datetime_garbage_only_affects_its_own_column(self):
+        """一栏填错不该把另外两栏的结果清掉。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553681')
+        self._fill_field(window, 'zone', '2026-11-04 15:32:33')
+        good_stamp = self._field_result(window, 'stamp')
+        good_zone = self._field_result(window, 'zone')
+        self._fill_field(window, 'date', '不是时间')
+        self.assertEqual(self._field_result(window, 'stamp'), good_stamp)
+        self.assertEqual(self._field_result(window, 'zone'), good_zone)
+        self.assertIn('认不出', self._field_result(window, 'date'))
+
+    def test_datetime_cross_column_hint_points_at_the_right_column(self):
+        """填错栏时要说清该用哪一栏，而不是干巴巴一句「认不出」。"""
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'date', '1793777553681')
+        self.assertIn('时间戳', self._field_result(window, 'date'))
+        self._fill_field(window, 'zone', '1793777553681')
+        self.assertIn('时间戳', self._field_result(window, 'zone'))
+
+    def test_datetime_clear_empties_all_entries_but_keeps_the_clock(self):
+        """清空只清用户输入；顶部时钟**不该被清掉**。
+
+        它们是实时值而非用户输入。一并清空会让窗口看起来坏了（顶部突然空白）。
+        """
+        window = self._open(DateTimeWindow)
+        self._fill_field(window, 'stamp', '1793777553681')
+        self._fill_field(window, 'date', '2026-11-04 15:32:33')
+        self._fill_field(window, 'zone', '2026-11-04 15:32:33')
+        clock_before = window._clock_cells['beijing'].cget('text')
+        eastern_before = window._clock_cells['eastern'].cget('text')
+
+        window._clear()
+        window.win.update()
+        for key in ('stamp', 'date', 'zone'):
+            self.assertEqual(
+                window._entry_value(window.rows[key]['entry']), '',
+                f'{key} 输入框没清干净')
+            self.assertEqual(self._field_result(window, key), '')
+            self.assertEqual(self._field_sub(window, key), '')
+        self.assertEqual(window._clock_cells['beijing'].cget('text'),
+                         clock_before)
+        self.assertEqual(window._clock_cells['eastern'].cget('text'),
+                         eastern_before)
+
+    def test_datetime_entries_are_single_line(self):
+        """三栏的输入框都是单行 ``Entry``——输入就是一行时间串。"""
+        window = self._open(DateTimeWindow)
+        for key in ('stamp', 'date', 'zone'):
+            entry = window.rows[key]['entry']
+            self.assertIsInstance(entry, tk.Entry)
+            self.assertEqual(str(entry.cget('state')), 'normal')
+
+    def test_datetime_placeholder_disappears_when_typing(self):
+        """占位示例文字不是输入内容：填了真值后 ``_entry_value`` 必须是真值。"""
+        window = self._open(DateTimeWindow)
+        entry = window.rows['stamp']['entry']
+        self.assertTrue(entry.get(), '空态应显示示例文字')
+        self.assertEqual(window._entry_value(entry), '',
+                         '占位示例不能被当成输入')
+        self._fill_field(window, 'stamp', '1793777553681')
+        self.assertEqual(window._entry_value(entry), '1793777553681')
+
+    def test_datetime_placeholder_stays_hidden_after_losing_focus(self):
+        """用户照着示例打了一遍，失去焦点后不能被当成「还空着」。
+
+        **这是占位符实现里最容易错的一处**：若用「文字是否等于示例」来判断，
+        用户真输入了同样的内容时就会被清掉、并被当成空输入。
+        """
+        window = self._open(DateTimeWindow)
+        entry = window.rows['stamp']['entry']
+        hint = entry._placeholder_text
+        self._fill_field(window, 'stamp', hint)
+        window._sync_placeholder(entry)
+        self.assertEqual(window._entry_value(entry), hint,
+                         '照着示例输入的内容被误当成占位符')
+
+    # ---- 时钟条（沿用，未受改版影响） ----
+    def test_datetime_clock_shows_beijing_and_timestamp(self):
+        """顶部时钟条：当前北京时间与当前时间戳，两者是同一时刻的两种表示。"""
+        window = self._open(DateTimeWindow)
+        beijing = window._clock_cells['beijing'].cget('text')
+        millis = window._clock_cells['millis'].cget('text')
+        self.assertRegex(beijing, r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
+        self.assertTrue(millis.isdigit(), f'时间戳不是数字：{millis!r}')
+
+        from datetime import datetime, timedelta
+        as_beijing = (datetime(1970, 1, 1)
+                      + timedelta(milliseconds=int(millis))
+                      + timedelta(hours=8))
+        self.assertEqual(
+            as_beijing.strftime('%Y-%m-%d %H:%M:%S'), beijing,
+            '时钟条两栏对不上——它们是同一时刻的两种表示，必须一致')
+
+    def test_datetime_clock_third_column_is_eastern_date(self):
+        """第 3 列是当前美东日期，带 EST/EDT 标记。"""
+        window = self._open(DateTimeWindow)
+        eastern = window._clock_cells['eastern'].cget('text')
+        self.assertRegex(eastern, r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
+        tag = window._clock_cells['eastern_sub'].cget('text')
+        self.assertTrue('EST' in tag or 'EDT' in tag,
+                        f'美东那格没标出标准时/夏令时：{tag!r}')
+
+    def test_datetime_clock_columns_share_one_row_in_order(self):
+        """三列必须在**同一行**上，顺序为 北京时间 → 时间戳 → 美东日期。
+
+        用屏幕坐标实测：三格的 ``winfo_rooty()`` 相等才算真的同一行；只读
+        grid 的 ``row=`` 是意图，不是用户看到的结果。
+        """
+        window = self._open(DateTimeWindow)
+        labels = [window._clock_cells[k] for k in
+                  ('beijing', 'millis', 'eastern')]
+        tops = [w.winfo_rooty() for w in labels]
+        self.assertEqual(len(set(tops)), 1,
+                         f'三列不在同一行，各自的顶边是 {tops}')
+        lefts = [w.winfo_rootx() for w in labels]
+        self.assertEqual(lefts, sorted(lefts), f'三列左右顺序不对：{lefts}')
+
+    def test_datetime_clock_columns_are_separated_by_vertical_rules(self):
+        """相邻两列之间有一条**竖**的分隔线，且真的可见。
+
+        找线的方式是「夹在两列之间的那条窄 Frame」而不是「``width == 1`` 的
+        Frame」：后者把线宽写死在断言里，将来把线调成 2px 只为更好看，测试却
+        会红，那是**断言错对象**——用户要的是「有竖线」，不是「线正好 1px」。
+        宽度只留一个「够窄才算分隔线」的上限。
+        """
+        window = self._open(DateTimeWindow)
+        card = self._clock_card(window)
+        beijing = window._clock_cells['beijing']
+        millis = window._clock_cells['millis']
+        eastern = window._clock_cells['eastern']
+
+        def between(left, right):
+            out = []
+            for child in card.winfo_children():
+                if child.winfo_class() != 'Frame':
+                    continue
+                if child.winfo_width() > 4:
+                    continue        # 格与底行都是宽 Frame，排除掉
+                cx = child.winfo_rootx()
+                if (left.winfo_rootx() + left.winfo_width() <= cx
+                        <= right.winfo_rootx()):
+                    out.append(child)
+            return out
+
+        for left, right, where in ((beijing, millis, '北京时间|时间戳'),
+                                   (millis, eastern, '时间戳|美东日期')):
+            rules = between(left, right)
+            self.assertEqual(len(rules), 1,
+                             f'{where} 之间应有 1 条竖线，实际 {len(rules)} 条')
+            rule = rules[0]
+            self.assertGreaterEqual(rule.winfo_width(), 1,
+                                    f'{where} 的竖线宽度为 0，屏幕上看不见')
+            self.assertLess(rule.winfo_width(), 6,
+                            f'{where} 的分隔物太宽，不像一条线')
+            self.assertGreater(rule.winfo_height(), 20,
+                               f'{where} 的竖线高度不足，不像分隔线')
+            self.assertGreater(rule.winfo_height(), rule.winfo_width() * 5,
+                               f'{where} 的分隔物是横的不是竖的')
+
+    def test_datetime_clock_columns_share_the_same_width(self):
+        """三列等宽——三列装的是三样结构相同的值，宽度不齐会显得歪。"""
+        window = self._open(DateTimeWindow)
+        widths = [window._clock_cells[k].master.winfo_width()
+                  for k in ('beijing', 'millis', 'eastern')]
+        self.assertLessEqual(max(widths) - min(widths), 2,
+                             f'三列宽度不齐：{widths}')
+
+    def test_datetime_clock_values_are_all_green(self):
+        """三列的时间值统一用绿色——用户明确要求「时间都是用绿色」。"""
+        window = self._open(DateTimeWindow)
+        green = window._sys('green').upper()
+        for key in ('beijing', 'millis', 'eastern'):
+            self.assertEqual(window._clock_cells[key].cget('fg').upper(), green,
+                             f'{key} 那一格的时间不是绿色')
+
+    def _dot_in_row(self, label):
+        """说明行里那个绿点画布；没有则返回 ``None``。"""
+        dots = self._row_dots(label)
+        return dots[0] if dots else None
+
+    def _assert_green_dot_left_of(self, window, label, where):
+        """断言 ``label`` 那行有绿点、是绿的、且在文字**左边**。"""
+        dot = self._dot_in_row(label)
+        self.assertIsNotNone(dot, f'{where} 那行没有小绿点')
+        ovals = dot.find_all()
+        self.assertEqual(len(ovals), 1, f'{where} 的绿点不是单个圆')
+        self.assertEqual(dot.itemcget(ovals[0], 'fill').upper(),
+                         window._sys('green').upper(),
+                         f'{where} 的绿点不是绿色')
+        self.assertLess(dot.winfo_rootx(), label.winfo_rootx(),
+                        f'{where} 的绿点跑到文字右边了')
+
+    def test_datetime_live_line_has_a_green_dot(self):
+        """「实时更新中」前面有绿点——这是刷新还活着的可见凭据。"""
+        window = self._open(DateTimeWindow)
+        card = self._clock_card(window)
+        live = [w for w in self._descendants(card)
+                if isinstance(w, tk.Label) and '实时更新中' in str(w.cget('text'))]
+        self.assertEqual(len(live), 1, '找不到「实时更新中」那一行')
+        self._assert_green_dot_left_of(window, live[0], '实时更新中')
+
+    def test_datetime_zone_line_has_a_green_dot(self):
+        """「本地时区」前面加绿点（用户明确点名的一处）。"""
+        window = self._open(DateTimeWindow)
+        self._assert_green_dot_left_of(
+            window, window._clock_zone, '本地时区')
+
+    def test_datetime_zone_line_sits_under_the_eastern_column(self):
+        """「本地时区」要在**当前美东日期那一列**下面，并与该列左对齐。
+
+        用户明确要求「当前美东日期下面的本地时区靠当前列左边」。这条必须用
+        几何实测、且**逐个宽度验**：靠 pack 到整宽底行再 ``side='right'`` 的
+        写法在默认宽度下看着也「在右边」，窗口一变宽就飘走。
+        """
+        window = self._open(DateTimeWindow)
+        eastern_sub = window._clock_cells['eastern_sub']
+        zone = window._clock_zone
+
+        for width in (1000, 1120, 1300, 1500):
+            window.win.geometry(f'{width}x720')
+            window.win.update()
+            window.win.update_idletasks()
+            # 比的是**行左缘**而不是文字左缘：两行的结构不同（时区那行前面有
+            # 绿点、美东那行没有），拿两侧文字 x 比会差出一个绿点的宽度。
+            zone_edge = zone.master.winfo_rootx()
+            east_edge = eastern_sub.master.winfo_rootx()
+            self.assertEqual(
+                zone_edge, east_edge,
+                f'窗口 {width} 时「本地时区」没和美东那一列左对齐：'
+                f'时区行={zone_edge} 美东行={east_edge}')
+            self.assertGreater(
+                zone.master.winfo_rooty(), eastern_sub.master.winfo_rooty(),
+                f'窗口 {width} 时「本地时区」没在美东那行下面')
+
+    def test_datetime_live_line_stays_at_the_left_edge(self):
+        """「实时更新中」仍在时钟卡最左边——它不该被时区那行挤动。"""
+        window = self._open(DateTimeWindow)
+        card = self._clock_card(window)
+        live = [w for w in self._descendants(card)
+                if isinstance(w, tk.Label) and '实时更新中' in str(w.cget('text'))]
+        self.assertEqual(len(live), 1, '找不到「实时更新中」那一行')
+        live_edge = live[0].master.winfo_rootx()
+        first_cell = window._clock_cells['beijing'].master
+        self.assertLessEqual(
+            abs(live_edge - first_cell.winfo_rootx()), 1,
+            '「实时更新中」没贴在左边，'
+            f'行左缘={live_edge} 第一列左缘={first_cell.winfo_rootx()}')
+
+    def test_datetime_live_and_zone_lines_never_overlap(self):
+        """底行两段**不许重叠**——「实时更新中」跨前几列、「本地时区」占最后一列。
+
+        跨列跨度（``columnspan``）是算出来的（``len(columns)*2 - 2``），列数一
+        变化或跨度写错，两段就会叠在一起：文字互相压字，界面上看是「乱码」。
+        **逐个宽度验**：默认宽度下余量大、重叠不一定显形，窄到 1000 才暴露。
+        """
+        window = self._open(DateTimeWindow)
+        card = self._clock_card(window)
+        live = [w for w in self._descendants(card)
+                if isinstance(w, tk.Label) and '实时更新中' in str(w.cget('text'))]
+        self.assertEqual(len(live), 1)
+        live, zone = live[0], window._clock_zone
+
+        for width in (1000, 1120, 1300, 1500):
+            window.win.geometry(f'{width}x720')
+            window.win.update()
+            window.win.update_idletasks()
+            live_right = live.winfo_rootx() + live.winfo_width()
+            zone_left = zone.master.winfo_rootx()
+            self.assertLess(
+                live_right, zone_left,
+                f'窗口 {width} 时两段重叠了：'
+                f'实时更新中右缘={live_right} 本地时区左缘={zone_left}')
+
+    def test_datetime_no_clock_cell_sub_line_has_a_dot(self):
+        """**三格的说明行都不带绿点**——绿点只在底行两处。
+
+        美东那格曾按用户要求加过点，随后被要求「周三前面的绿点去掉」。这条把
+        「三格都不带点」钉住，避免哪天又顺手加回去。
+        """
+        window = self._open(DateTimeWindow)
+        for key in ('beijing_sub', 'millis_sub', 'eastern_sub'):
+            self.assertEqual(
+                self._row_dots(window._clock_cells[key]), [],
+                f'{key} 那格不该有绿点')
+            label = window._clock_cells[key]
+            self.assertEqual(
+                label.winfo_rootx(), label.master.winfo_rootx(),
+                f'{key} 那格的文字没顶到行首——绿点去掉了，缩进还在')
+
+    def test_datetime_clock_timer_is_cancelled_on_close(self):
+        """定时器必须在关闭时取消。
+
+        漏掉这一步，窗口销毁后下一次 tick 会让 Tk 报
+        ``invalid command name``——控制台刷屏，用户看到的是「关不干净」。
+        """
+        window = self._open(DateTimeWindow)
+        self.assertIsNotNone(window._clock_id, '时钟定时器没有启动')
+        window.close()
+        self.assertIsNone(window._clock_id, '关闭后定时器句柄没清')
+        self.panel.win.update()
+
+    def test_datetime_clock_timer_is_separate_from_the_debounce_timer(self):
+        """时钟与输入防抖用两个独立句柄，不能共用一个。
+
+        共用会让「敲键盘」取消掉时钟（``_on_input`` 会 cancel ``_after_id``），
+        时钟在用户输入的那一刻停掉——正好是最容易被误解成「界面卡住」的时机。
+        """
+        window = self._open(DateTimeWindow)
+        window._on_input()
+        self.assertIsNotNone(window._after_id)
+        self.assertIsNotNone(window._clock_id)
+        self.assertNotEqual(window._after_id, window._clock_id,
+                            '时钟与防抖共用了同一个句柄')
+
+    def test_datetime_min_size_keeps_the_three_columns_usable(self):
+        """最小尺寸下三栏都要还能用：下拉文字不被裁、结果块还有高度。
+
+        **断言的是结果块高度而不是输入框**：输入框是单行 ``Entry``，高度恒为
+        20px，无论怎么压都不会变——第一版就是这么写的，变异验证里把
+        ``min_height`` 降到 440 也照样通过，属于**断言错了对象**。
+        """
+        window = self._open(DateTimeWindow)
+        window.win.geometry(f'{window.min_width}x{window.min_height}')
+        window.win.update()
+        window.win.update_idletasks()
+        for key in ('stamp', 'date', 'zone'):
+            block = window.rows[key]['result'].master.master
+            self.assertGreaterEqual(
+                block.winfo_height(), 60,
+                f'{key} 结果块被压扁了：{block.winfo_height()}px')
+            drops = window.rows[key]['drops']
+            drop = drops[next(iter(drops))]
+            # 下拉文字没被裁（Label 实测宽度不显著小于请求宽度）
+            self.assertGreaterEqual(
+                drop.label_widget.winfo_width() + 4,
+                drop.label_widget.winfo_reqwidth(),
+                f'{key} 那栏的下拉文字被裁了，用户会看到断掉的选项')
+
+    def test_datetime_min_width_keeps_the_dropdown_text_whole(self):
+        """最小宽度必须够宽，让三个下拉的完整文案都放得下。
+
+        **宽度也要调高**（与别的工具不同）：三栏并排，每栏至少要放得下
+        「北京时间 (UTC+08:00)」（实测约 185px）。这条把那个下限钉住——把
+        ``min_width`` 退回 660 时每栏只剩 ~205px，文案会被裁成
+        「北京时间 (UTC+08:0」。
+        """
+        window = self._open(DateTimeWindow)
+        self.assertGreater(window.min_width, TW.MIN_W,
+                           '三栏版式需要比默认更宽的下限')
+        window.win.geometry(f'{window.min_width}x{window.min_height}')
+        window.win.update()
+        window.win.update_idletasks()
+        card = window.rows['stamp']['card']
+        # 「北京时间 (UTC+08:00)」在整个窗口最小宽度下必须完整可见。
+        longest = '北京时间 (UTC+08:00)'
+        label = window.rows['stamp']['drops']['zone'].label_widget
+        self.assertEqual(label.cget('text'), longest)
+        self.assertGreaterEqual(label.winfo_width() + 4,
+                                label.winfo_reqwidth(),
+                                '最小宽度下最长的下拉文案被裁掉了')
+        self.assertGreater(card.winfo_width(), 240,
+                           '每栏太窄，装不下完整的下拉文案')
+
+    def test_datetime_default_size_shows_everything(self):
+        """默认尺寸下三栏的**结果块**都在正文区内完整可见（不被裁掉底部）。"""
+        window = self._open(DateTimeWindow)
+        window.win.update()
+        for key in ('stamp', 'date', 'zone'):
+            block = window.rows[key]['result'].master.master
+            bottom = (block.winfo_rooty() - window._body.winfo_rooty()
+                      + block.winfo_height())
+            self.assertLessEqual(bottom, window._body.winfo_height() + 2,
+                                 f'{key} 的结果块超出了正文区')
 
 
 def _png_bytes(size=(40, 30), color=(220, 60, 60)):

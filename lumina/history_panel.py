@@ -144,10 +144,11 @@ class HistoryPanel:
     # **不要**为了「更精确」把 ``IMG`` 换成 ``▣`` 之类的手势符：那种字符缩到
     # 6px 就是个方框，和外层圆角框叠在一起几乎看不出内容。
     #
-    # 配色按语义分：橙=结构文本、紫=凭据、青=图片、绿=还原。
+    # 配色按语义分：橙=结构文本、紫=凭据、青=图片、绿=还原、蓝=时间。
     TOOL_ICONS: ClassVar[dict] = {
         "json": ("{}", "orange"),
         "jwt": ("JWT", "purple"),
+        "datetime": ("DAT", "blue"),
         "img2b64": ("IMG", "teal"),
         "b642img": ("B64", "green"),
     }

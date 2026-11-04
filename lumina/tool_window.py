@@ -1,13 +1,13 @@
-"""顶栏「工具」下拉里的独立小工具窗口：JSON 格式化 / JWT 解密 / 图片 Base64。
+"""顶栏「工具」下拉里的独立小工具窗口：JSON 格式化 / JWT 解密 / 日期转换 / 图片 Base64。
 
-三个工具共用同一套无边框外壳（左侧输入、右侧结果、实时解析、一键复制），
+五个工具共用同一套无边框外壳（左侧输入、右侧结果、实时解析、一键复制），
 只替换「如何解析」。新增工具只需实现一个 ``_analyze``。
 
 **图片 Base64 两个工具是外壳的例外**：图片不是文本，既没法「粘贴进左栏」，
 也没法「把结果当文字看」。它们因此在左栏位置放**图片预览与取图入口**，右栏
 仍是纯文本结果（base64 字符串 / 图片信息），底栏在通用「清空 + 复制结果」
 之外多一个「导出」——因为 base64 解出来的图必须落到磁盘或剪贴板才有用。
-这条分支由 ``_IMAGE_TOOLS`` 里的类名特征 ``uses_image_pane = True`` 打开，
+这条分支由 ``uses_image_pane = True`` 这个**类属性**打开，
 **不是**按 key 判断：``TOOLS`` 注册表不应知道自己被哪套布局消费。
 
 设计取舍：
@@ -42,8 +42,9 @@ import ctypes
 import io
 import os
 from tkinter import TclError
+from typing import ClassVar
 
-from . import image_b64, jwt_tools, media, taskbar
+from . import datetime_tools, image_b64, jwt_tools, media, taskbar
 from .json_modes import ESCAPE_JAVA_NOTICE, MODE_LABELS, build_menu_items
 from .json_tools import transform_json
 
@@ -210,8 +211,25 @@ class _ToolWindow:
     title = "工具"
     # 输入为空时的提示，替代原来写在标题栏下方的那行说明文字。
     placeholder = ""
-    width = 920
-    height = 640
+    # 默认窗口尺寸。**四个工具共用这一对类属性**（子类都不覆盖），
+    # 所以改这里就是「统一调整」，不存在漏改某个工具的可能。
+    #
+    # 2026-11-04 用户要求「弹框有点小，统一调整大一点」：920x640 → 1120x780。
+    # 取这个值而不是直接拉到主面板的 1360x840，是为了保住主次关系——工具窗
+    # 是从主面板里点开的**子级**，同尺寸会显得是两个平级窗口。1120x780 在
+    # 本机 1920x1032 工作区里占 58%x76%，两栏各约 527px，折行后一屏能多看
+    # 好几行 JSON，同时仍明显小于主面板。
+    # 小屏兜底不用管：``_center`` 里的 ``min(...)`` 会按屏幕自动收窄
+    # （1366x768 上自动变成 1120x648）。
+    width = 1120
+    height = 780
+
+    # 允许缩到的最小尺寸。默认与模块常量一致；**纵向堆叠版式的子类要调高它**
+    # （见 ``DateTimeWindow.min_height``）：横向两栏压扁是「变窄」，纵向多段
+    # 压扁是「变矮」，而后者会把中间的输入框挤成一条线——实测窗口 660x440 时
+    # 输入框只剩 9px 高（正常 20px），连自己填了什么字都看不见。
+    min_width = MIN_W
+    min_height = MIN_H
 
     # ---------- 图片类工具的开关 ----------
     # True 时其中一栏换成图片面板（预览 + 取图入口），底栏多一个导出按钮。
@@ -231,6 +249,12 @@ class _ToolWindow:
     copy_label = "复制结果"
     # 导出按钮的文案；空字符串表示这个工具没有导出动作。
     export_label = ""
+    # 是否建底栏（状态灯 / 状态文字 / 复制·清空按钮组）。
+    #
+    # 「日期转换」改成三栏并排后**每栏自带主按钮与「复制」**，底栏整个去掉
+    # （用户要求「底栏整个去掉」），故它覆写成 False。
+    # **默认 True**：其他四个工具的底栏是它们唯一的操作入口，不能跟着消失。
+    has_footer = True
 
     def __init__(self, panel):
         self.panel = panel
@@ -279,14 +303,25 @@ class _ToolWindow:
         # 不在 close() 的取消范围内，Tk 会在销毁后报 invalid command name。
         self._after_id = self.win.after(30, self._refresh)
         self.win.focus_force()
-        # 焦点给「真正接输入的那个控件」：图片面板在左栏时它自己处理
-        # Ctrl+V，焦点给它；面板在右栏（Base64 转图片）时左侧是可见的
-        # Base64 文本框，焦点必须给它——否则按键落进看不见的地方。
+        # 焦点给「真正接输入的那个控件」——具体是谁由子类通过
+        # ``_initial_focus_target`` 决定（默认两栏布局的规则写在那个方法里）。
+        target = self._initial_focus_target()
+        if target is not None:
+            target.focus_set()
+
+    def _initial_focus_target(self):
+        """开窗后焦点落在哪个控件上。返回 ``None`` 表示不指定。
+
+        默认规则：图片面板在左栏时它自己处理 Ctrl+V，焦点给它；面板在右栏
+        （Base64 转图片）时左侧是可见的 Base64 文本框，焦点必须给它——否则
+        按键落进看不见的地方。文字工具则是左栏输入框。
+
+        **自制布局的子类必须覆写它**：默认实现读 ``self.input``，而那个属性
+        只由默认两栏布局创建，自定义布局下不存在。
+        """
         if self.uses_image_pane and self.image_pane_side == "left":
-            target = self.preview
-        else:
-            target = self.input
-        target.focus_set()
+            return self.preview
+        return self.input
 
     # ---------- 外壳 ----------
     def _build_shell(self):
@@ -384,8 +419,8 @@ class _ToolWindow:
         """
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
-        w = min(self.width, max(MIN_W, sw - 80))
-        h = min(self.height, max(MIN_H, sh - 120))
+        w = min(self.width, max(self.min_width, sw - 80))
+        h = min(self.height, max(self.min_height, sh - 120))
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 3)
         self.win.geometry(f"{w}x{h}+{x}+{y}")
@@ -846,16 +881,16 @@ class _ToolWindow:
 
         w, h, x, y = w0, h0, x0, y0
         if "e" in name:
-            w = max(MIN_W, w0 + dx)
+            w = max(self.min_width, w0 + dx)
         if "w" in name:
-            w = max(MIN_W, w0 - dx)
+            w = max(self.min_width, w0 - dx)
             # 夹紧后原点要跟着「实际改掉的宽度」走，不能直接用 dx，
             # 否则缩到下限后继续往右拖，窗口会开始往左漂。
             x = x0 + (w0 - w)
         if "s" in name:
-            h = max(MIN_H, h0 + dy)
+            h = max(self.min_height, h0 + dy)
         if "n" in name:
-            h = max(MIN_H, h0 - dy)
+            h = max(self.min_height, h0 - dy)
             y = y0 + (h0 - h)
         self.win.geometry(f"{w}x{h}+{x}+{y}")
 
@@ -890,12 +925,45 @@ class _ToolWindow:
         return (MONO_FAMILY, size, weight)
 
     def _build(self):
-        T, tk = self.T, self.tk
-        body_h = -(CONTENT_INSET * 2 + RAIL_HEIGHT + FOOT_HEIGHT + 1 + 8)
-        body = tk.Frame(self.shell, bg=T["window_bg"])
+        """建「正文 + 底栏」，并把正文区交给 ``_build_panes`` 填充。
+
+        **正文区的建法是一个可覆写钩子**，因为「日期转换」工具要的是纵向多段
+        堆叠，而不是默认的左输入 / 右输出两栏——两种版式除了「都在 body 里」
+        之外没有共同结构，硬塞进同一个方法只会让两边都难读。
+
+        拆出 ``_build_panes`` 而不是让子类整个重写 ``_build``：底栏（状态灯、
+        状态文字、复制/清空/下拉按钮）是**每个工具都一样的**，让子类重写整个
+        ``_build`` 就得把那段抄一遍，将来改底栏会漏掉自定义布局的工具。现在
+        子类只换正文，底栏永远跟着基类走。
+
+        ``has_footer = False`` 的工具（日期转换）整块跳过底栏，**正文区因此
+        多分到 ``FOOT_HEIGHT + 1`` 像素**——高度偏移量必须按同一个条件算，
+        否则正文区的下缘会停在「本该有底栏」的位置，多出一段空白。
+        """
+        tk = self.tk
+        foot_h = FOOT_HEIGHT + 1 if self.has_footer else 0
+        body_h = -(CONTENT_INSET * 2 + RAIL_HEIGHT + foot_h + 8)
+        self._body = body = tk.Frame(self.shell, bg=self.T["window_bg"])
         body.place(x=CONTENT_INSET, y=CONTENT_INSET + RAIL_HEIGHT,
                    relwidth=1.0, relheight=1.0,
                    width=-CONTENT_INSET * 2, height=body_h)
+        self._build_panes(body)
+        if self.has_footer:
+            self._build_footer()
+        self._after_build()
+
+    def _after_build(self):
+        """正文与底栏都建好之后的收尾钩子。默认什么都不做。
+
+        留给需要「布局建完再按最终几何调整」的子类——例如按实际宽度算列宽、
+        或者把某些控件对齐到别人身上。
+        """
+
+    def _build_panes(self, body):
+        """默认正文版式：左输入 / 右结果两栏，等宽。
+
+        自定义布局的子类**覆写本方法即可**，不必碰 ``_build``（底栏在那边）。
+        """
         body.columnconfigure(0, weight=1, uniform="col")
         body.columnconfigure(1, weight=1, uniform="col")
         body.rowconfigure(0, weight=1)
@@ -928,6 +996,9 @@ class _ToolWindow:
             self.output.master.grid(row=0, column=1, sticky="nsew",
                                     padx=(GAP // 2, 0))
 
+    def _build_footer(self):
+        """底栏：状态灯 + 状态文字 + 右侧按钮组。所有工具共用。"""
+        T, tk = self.T, self.tk
         foot = tk.Frame(self.shell, bg=T["hairline"])
         foot.place(x=CONTENT_INSET, rely=1.0, y=-CONTENT_INSET,
                    relwidth=1.0, width=-CONTENT_INSET * 2,
@@ -1918,6 +1989,891 @@ class JwtWindow(_ToolWindow):
         return "", "normal"
 
 
+class _ChoiceField:
+    """自绘下拉选择框。
+
+    **不能用 ``tk.OptionMenu``**：它在 Windows 下由系统主题绘制，``bg`` 与
+    ``fg`` 基本不生效（实测会突兀地冒出一块灰底），而且打开时用的是 Tk 原生
+    ``menu.post``——那在 Windows 上会进模态跟踪循环把 UI 线程卡死（主面板
+    早已为此付过代价，见 ``JsonPopup`` 的说明）。
+
+    这里自绘外观 + 复用 ``JsonPopup`` 做浮层：外观与卡片其他控件一致，浮层
+    的关闭/键盘/外部点击处理全部沿用已经验证过的那一套。
+
+    对外暴露 ``value``（当前选项 key）与 ``label``（当前选项展示名）。
+    """
+
+    def __init__(self, window, parent, column_key, group_key, choices, default):
+        self.window = window
+        self.column_key = column_key
+        self.group_key = group_key
+        self.choices = tuple(choices)
+        self.order = [key for key, _label in self.choices]
+        if default not in self.order:
+            # 静默换成第一项会让界面上显示一个与代码意图无关的值。
+            raise ValueError(f"默认值 {default!r} 不在选项中：{self.order}")
+        self.value = default
+
+        C = window.P
+        tk = window.tk
+        self.box = tk.Frame(parent, bg=C["card"], highlightthickness=1,
+                            highlightbackground=C["input_border"],
+                            cursor="hand2")
+        row = tk.Frame(self.box, bg=C["card"])
+        row.pack(fill="x", padx=(10, 8), pady=6)
+        self.label_widget = tk.Label(
+            row, text="", bg=C["card"], fg=C["title"],
+            font=(window.panel.FONT_FAMILY, 9), anchor="w")
+        self.label_widget.pack(side="left")
+        self.arrow = tk.Canvas(row, width=11, height=11, bg=C["card"],
+                               highlightthickness=0, bd=0, cursor="hand2")
+        self.arrow.create_line(1, 3, 5.5, 7.5, 10, 3, fill=C["muted"],
+                               width=1.6, capstyle="round", joinstyle="round")
+        self.arrow.pack(side="right")
+        self._paint()
+
+        # 整块可点：点在文字上、箭头上、或中间的空白都该打开菜单。
+        for widget in (self.box, row, self.label_widget, self.arrow):
+            widget.bind("<Button-1>", self._toggle)
+
+    # ``grid`` / ``cget`` 之类直接转发给外框，调用点不必知道内部结构。
+    def grid(self, *args, **kwargs):
+        return self.box.grid(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.box, name)
+
+    def _paint(self):
+        self.label_widget.configure(text=self.label)
+
+    @property
+    def label(self):
+        """当前选项的展示名。查不到返回空串而不是炸——界面上少一行字，
+        总好过整个窗口建不起来。"""
+        for key, text in self.choices:
+            if key == self.value:
+                return text
+        return ""
+
+    def _toggle(self, _event=None):
+        """点击：已开着就收起，否则打开（与 JSON 那个下拉同款手势）。"""
+        window = self.window
+        if window._popup is not None and window._popup_owner is self:
+            window._close_popup()
+            return "break"
+        window._close_popup()
+
+        from .json_popup import JsonPopup
+        items = [{"label": text, "kind": None, "selected": key == self.value,
+                  "command": (lambda k=key: self.set(k))}
+                 for key, text in self.choices]
+        # 宽度取外框实测宽度：下拉要与它下面的控件**等宽**，而
+        # 「北京时间 (UTC+08:00)」在默认 200px 里放不下（``create_text``
+        # 不折行，会直接溢出菜单背景）。
+        width = max(self.box.winfo_width(), 120)
+        popup = JsonPopup(self.window.tk, self.window.win, items,
+                          self.window.T, dpi=self.window._dpi(),
+                          icon=False, width=width)
+        self.window._popup = popup
+        self.window._popup_owner = self
+        popup.popup(self.box, on_close=self.window._popup_closed)
+        return "break"
+
+    def set(self, key, notify=True):
+        """切换选项。``notify=False`` 供测试/初始化改值而不触发重算。
+
+        **立刻重算，不走 180ms 防抖**（``_recompute_now``）：切换下拉是一个
+        离散动作，用户点完就盯着结果看。等 180ms 才更新会让「点了没反应」
+        与「选项没生效」两种感觉混在一起。防抖只服务于「打字」那条路径。
+        """
+        if key not in self.order:
+            raise ValueError(f"未知选项：{key}")
+        if self.value == key:
+            return
+        self.value = key
+        self._paint()
+        if notify:
+            self.window._activate_column(self.column_key)
+
+
+class DateTimeWindow(_ToolWindow):
+    """日期转换：顶部实时时钟 + 三栏并排的换算工具。
+
+    **版式**（按用户给的截图复刻，用户原话「按照图片样式重新设计」）：
+
+    1. 顶部**实时时钟条**——一行三列：当前北京时间 ｜ 当前时间戳 ｜ 当前美东
+       日期，列间以 1px 竖线分隔。时间值一律绿色；小绿点只在「实时更新中」与
+       「本地时区」两处。
+    2. 下面**三栏并排**，每栏自带输入、下拉与主按钮：
+
+       =========  ==================  ==================================
+       栏         标题                这一栏的输入 → 下拉组合
+       =========  ==================  ==================================
+       1          时间戳 → 日期时间   时间戳；输入单位 + 目标时区
+       2          日期时间 → 时间戳   日期时间；时间基准 + 输出单位
+       3          北京时间 → 美东时间 日期时间；时间基准 + 结果时区
+       =========  ==================  ==================================
+
+    每栏的元素顺序固定为：标题 → 副标题 → 输入框 → 标签+下拉 ×2 →
+    **绿色通栏主按钮** → 结果块（块内首行是「转换结果」+ 绿色「复制」小字，
+    下面才是淡绿底上的深绿结果值）。
+
+    **为什么第三栏是「北京时间 → 美东时间」而不是截图里的偏移计算**：截图的
+    第三栏是「当前时间 + 偏移计算」，而用户对这一栏的要求写得很明确——
+    「北京时间-》美东时间」。图片提供的是一套**样式模板**（三栏并排 + 每栏
+    「标题/输入/下拉/绿色按钮/结果」的元素结构），功能以用户指定的为准。
+    于是前两栏照截图做，第三栏用同一套元素结构装时区换算。
+
+    **为什么拆成三栏**：原来那种「一个输入框接所有形态」的做法，用户得先想清楚
+    「我现在要算什么」再决定往里贴什么；拆成三个带标题的专属栏之后，用途写在
+    输入框上面，粘贴即出结果，不用记规则。代价是自动识别（``convert``）那条路
+    不再是主入口，只在 ``_analyze`` 里为基类契约保留着。
+
+    **底栏整个去掉**（用户要求）：每栏自带主按钮与「复制」，再留一条全局底栏
+    就是两套操作入口抢同一件事。代价是「清空」也没有了——每栏的输入框可以
+    自己选中删掉，而一个全局清空按钮在三栏布局下很容易让人误以为「清空」
+    只作用于某一栏。
+
+    **顶部时钟每秒重画**：这是这个窗口唯一需要定时器的地方。定时器句柄单独存
+    （``_clock_id``），不复用 ``_after_id``——那个是输入防抖用的，两者生命周期
+    不同，混用会让「敲键盘」把时钟停掉。``close()`` 里必须显式取消，否则窗口
+    销毁后回调触发 Tk 的 ``invalid command name``。
+    """
+
+    title = "日期转换"
+    placeholder = "在输入框里填一个时间"
+    # 时钟刷新间隔。做成类属性是为了测试能调大它，避免定时器在断言中途插进来。
+    clock_interval_ms = 1000
+
+    # 三栏并排后，纵向只剩时钟条 + 一栏内容。620 是「时钟条 ~110px + 标题与
+    # 副标题 ~50px + 输入框 36px + 两组下拉各 ~62px + 按钮 40px + 结果块
+    # ~120px」的位置，留了一点余量。**不再是 640**：那个值是为「两个换算卡
+    # 上下叠」算的，现在横过来了，照搬会留一大段空白。
+    min_height = 620
+
+    # **最小宽度比别的工具大**。三栏并排，每栏至少要放得下
+    # 「北京时间 (UTC+08:00)」那一串下拉文字（实测约 185px）加上左右内边距。
+    # 660 时每栏只有 ~205px，下拉文字会被裁掉——用户看到的是
+    # 「北京时间 (UTC+08:0」这种断掉的选项，比不给下拉还糟。
+    min_width = 1000
+
+    # 底栏整个不建（见类文档）。基类 ``_build`` 会跳过 ``_build_footer``，
+    # 并把底栏那 35px 让给正文区。
+    has_footer = False
+
+    # 三栏定义：``(key, 标题, 副标题, 输入占位, 换算函数, 下拉组)``。
+    #
+    # **换算函数与下拉组都放类属性而不是写死在建栏代码里**：测试可以直接
+    # 遍历它，断言「每栏都真的接上了换算函数」「每栏的下拉都真的建出来了」。
+    # 藏进循环体的话，将来加了栏忘接线只会得到一个永远空白的结果块。
+    #
+    # ``groups`` 里每项是 ``(下拉 key, 标签文字, 选项表, 默认值)``，顺序即
+    # 从上到下的顺序。下拉 key 是**栏内局部**的（两栏都有 ``zone``），访问时
+    # 走 ``rows[栏 key]['drops'][下拉 key]``。
+    COLUMNS = (
+        ("stamp", "时间戳 → 日期时间", "请输入时间戳（支持秒 / 毫秒）",
+         "如 1793777553681", datetime_tools.timestamp_to_zone,
+         (("unit", "自动识别", datetime_tools.INPUT_UNIT_CHOICES, "auto"),
+          ("zone", "目标时区", datetime_tools.ZONE_CHOICES, "beijing"))),
+        ("date", "日期时间 → 时间戳", "选择日期时间",
+         "如 2026-11-04 15:32:33", datetime_tools.to_timestamp,
+         (("zone", "时间基准", datetime_tools.ZONE_CHOICES, "beijing"),
+          ("unit", "输出单位", datetime_tools.OUTPUT_UNIT_CHOICES, "millis"))),
+        ("zone", "北京时间 → 美东时间", "输入北京时间，换算到目标时区",
+         "如 2026-11-04 15:32:33", datetime_tools.convert_zone,
+         (("source", "时间基准", datetime_tools.ZONE_CHOICES, "beijing"),
+          ("target", "结果时区", datetime_tools.ZONE_CHOICES, "eastern"))),
+    )
+
+    # 主按钮文案。三栏都是「把输入换个表示」，统一用「转换」。
+    ACTION_LABEL = "转换"
+
+    # 结果区里那个小按钮的文案（截图里是绿色的「复制」）。
+    COPY_LABEL = "复制"
+
+    def __init__(self, panel):
+        # 定时器句柄要在 ``_build`` 之前就有值：``_after_build`` 会启动时钟，
+        # 而 ``close()`` 可能在任何一个环节之后被调用。
+        self._clock_id = None
+        self._last_ok = ""
+        # 自绘下拉的浮层与它的属主控件。属主用来判断「再点一次收起」。
+        self._popup = None
+        self._popup_owner = None
+        super().__init__(panel)
+
+    # ---------- 设计令牌 ----------
+    # 截图里用的是一套独立的绿色系（主按钮 #1BB253、结果块底 #F0FDF4、
+    # 结果文字 #15803D、标题 #1F2937、次级 #6B7280、描边 #E5E7EB），
+    # 这几个值都是从截图逐像素采出来的。
+    #
+    # **不复用 ``panel._sys()`` 那套 Apple 色**：SYS_COLORS 里没有这几种绿，
+    # 硬拿 ``green``(#34C759) 当按钮色会比截图亮一档，而且它没有配套的
+    # 「浅绿底 + 深绿字」组合。做成本地常量是为了**改一处就整体协调**。
+    # 深色主题走另一组值，否则浅绿底压在深色卡片上会刺眼。
+    LIGHT_PALETTE: ClassVar[dict] = {
+        "card": "#FFFFFF",
+        "border": "#E5E7EB",
+        "input_border": "#E5E7EB",
+        "title": "#1F2937",
+        "muted": "#6B7280",
+        "button": "#1BB253",
+        "button_hot": "#17A24A",
+        "button_fg": "#FFFFFF",
+        "soft": "#F0FDF4",
+        "soft_border": "#DCFCE7",
+        "value_fg": "#15803D",
+        "copy_fg": "#22C55E",
+    }
+    DARK_PALETTE: ClassVar[dict] = {
+        "card": "#1F1F22",
+        "border": "#3A3A3E",
+        "input_border": "#3A3A3E",
+        "title": "#F2F2F5",
+        "muted": "#9A9AA2",
+        "button": "#22A65A",
+        "button_hot": "#2BB768",
+        "button_fg": "#FFFFFF",
+        "soft": "#16281C",
+        "soft_border": "#1F3A28",
+        "value_fg": "#66E39B",
+        "copy_fg": "#4ADE80",
+    }
+
+    @property
+    def P(self):
+        """当前主题下的一套色。
+
+        用属性而不是在 ``__init__`` 里定一次：``self.dark`` 由基类在
+        ``__init__`` 里赋值，而这个属性可能在赋值完成前的某个钩子里被读到。
+        """
+        return self.DARK_PALETTE if self.dark else self.LIGHT_PALETTE
+
+    # ---------- 版式 ----------
+    def _build_panes(self, body):
+        """时钟条在上，三栏并排在下。
+
+        **三栏等宽**（``uniform="pane"``）：三栏装着结构相同的元素（输入框、
+        两个下拉、按钮、结果块），宽度不齐会让三栏的按钮右缘参差不齐，扫一眼
+        就是歪的。
+
+        **纵向：时钟条固定、三栏吃掉剩余高度**。给三栏 ``weight=1`` 而不是
+        让它们按内容高度撑：三栏里的结果块需要一块能被拉高的浅绿底，按内容
+        撑的话窗口拉大时多出来的空间会平均分给「时钟条下面的空白」，而不是
+        给结果块。
+        """
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=0)      # 时钟条：固定高
+        body.rowconfigure(1, weight=1)      # 三栏
+
+        self._build_clock(body).grid(row=0, column=0, sticky="ew")
+
+        deck = self.tk.Frame(body, bg=self.T["window_bg"])
+        deck.grid(row=1, column=0, sticky="nsew", pady=(GAP, 0))
+        deck.rowconfigure(0, weight=1)
+        self._deck = deck
+
+        last = len(self.COLUMNS) - 1
+        self.rows = {}
+        for index, spec in enumerate(self.COLUMNS):
+            key = spec[0]
+            deck.columnconfigure(index, weight=1, uniform="pane")
+            # **三栏的 padx 必须对称**（每侧 GAP//2）。早先写成「首栏左侧 0、
+            # 末栏右侧 0」，以为省下两个半缝隙能让整体更宽——实际效果是
+            # 首尾两栏各多占 5px 绘制宽度（实测 403/398/403），三栏不再等宽，
+            # 三颗按钮的右缘因此错开 5px。缝隙该由 `uniform` 列均分，
+            # 不该由 padx 找补。
+            pane = self._build_column(deck, *spec)
+            pane["card"].grid(row=0, column=index, sticky="nsew",
+                              padx=GAP // 2)
+            self.rows[key] = pane
+        del last
+
+        # 兜底：``_copy_output`` 无参调用时复制哪一栏。
+        self._active = self.COLUMNS[0][0]
+
+    def _make_card(self, parent):
+        """带 1px 描边的卡片。时钟条与三栏共用同一副外观。"""
+        return self.tk.Frame(parent, bg=self.P["card"], highlightthickness=1,
+                             highlightbackground=self.P["border"])
+
+    def _make_caption(self, parent, text, color=None, size=9):
+        """小号说明文字。``color`` 默认次级文字色。"""
+        return self.tk.Label(parent, text=text, bg=self.P["card"],
+                             fg=color or self.P["muted"],
+                             font=(self.panel.FONT_FAMILY, size), anchor="w")
+
+    def _make_dot(self, parent):
+        """小绿点：8×8 画布上的实心圆。
+
+        「实时更新中」前面那个绿点是**「真的在跳」的可见凭据**——只写一行文字，
+        用户没法确认它是否还活着。现在两处都要用（实时更新中 / 本地时区），
+        抽成一个方法；复制两遍迟早会有某处颜色或半径写得不一样。
+        """
+        dot = self.tk.Canvas(parent, width=8, height=8, bg=self.P["card"],
+                             highlightthickness=0, bd=0)
+        dot.create_oval(0, 0, 7, 7, fill=self._sys("green"), outline="")
+        return dot
+
+    def _make_meta_row(self, parent, dot=False):
+        """返回 ``(行容器, 文字 Label)``，供「小绿点 + 说明文字」这类一行用。
+
+        ``dot=True`` 时在文字前放一个绿点。绿点用 ``side="left"`` 先 pack，
+        保证它在文字左边——反过来 pack 会得到「文字在左、绿点在右」，
+        与「实时更新中」那行的样式对不上。
+        """
+        row = self.tk.Frame(parent, bg=self.P["card"])
+        if dot:
+            self._make_dot(row).pack(side="left", padx=(0, 5))
+        label = self._make_caption(row, "")
+        label.pack(side="left")
+        return row, label
+
+    def _build_clock(self, parent):
+        """第 1 段：实时时钟条。**三列等宽**——北京时间 | 时间戳 | 美东日期。
+
+        三列之间各插一条 1px 竖线做视觉分隔（用户要求「中间用竖线隔离开」）。
+        竖线用 ``grid`` 单独占一列：**没有 ``weight`` 的列按控件请求宽度**（1px）
+        参与布局，不会被相邻的等宽列吃掉——实测 660/800/900/1120/1400 五种宽度下
+        两条竖线都是 1px 可见（逐像素采样确认是 ``hairline`` 色而非卡片底色）。
+        那行 ``minsize=1`` 是**防御性**的：它不改变任何实测结果，留着是为了让
+        「这一列至少 1px」这个约束写在代码里，将来有人给竖线列加 ``weight``
+        时不会顺手被压没。
+        """
+        T, tk = self.T, self.tk
+        card = self._make_card(parent)
+
+        columns = (("beijing", "当前北京时间"), ("millis", "当前时间戳"),
+                   ("eastern", "当前美东日期"))
+        self._clock_cells = {}
+        for index, (key, title) in enumerate(columns):
+            if index:
+                # 第 1、3 列放竖线（0 基下标的 1 与 3）。
+                separator = tk.Frame(card, bg=T["hairline"], width=1)
+                separator.grid(row=0, column=index * 2 - 1, sticky="ns",
+                               pady=(11, 0))
+                card.columnconfigure(index * 2 - 1, minsize=1)
+            card.columnconfigure(index * 2, weight=1, uniform="clock")
+
+            cell = tk.Frame(card, bg=self.P["card"])
+            cell.grid(row=0, column=index * 2, sticky="ew", padx=12,
+                      pady=(11, 0))
+            self._make_caption(cell, title, self.P["muted"]).pack(fill="x")
+            # **三个时间值统一用绿色**（用户要求）。底色卡片上绿色是这套主题里
+            # 的「活数据」色，与状态灯的 ok 色同源，读起来是一类东西。
+            value = tk.Label(cell, text="", bg=self.P["card"],
+                             fg=self._sys("green"),
+                             font=self._mono(15, "bold"), anchor="w")
+            value.pack(fill="x", pady=(3, 0))
+            # **三格的说明行都不带绿点**：美东那格原本按用户要求加过，后又要求
+            # 「周三前面的绿点去掉」。现在绿点只在底行两处（实时更新中 / 本地时区）。
+            sub_row, sub = self._make_meta_row(cell)
+            sub_row.pack(fill="x")
+            self._clock_cells[key] = value
+            self._clock_cells[key + "_sub"] = sub
+
+        # 底行分两处，都**直接 grid 到 card 自己的列**上：
+        # 「实时更新中」贴整卡左边，「本地时区」跟在**美东那一列**的下面、与
+        # 美东日期左对齐（用户要求「当前美东日期下面的本地时区靠当前列左边」）。
+        #
+        # **不用一个跨全宽的 foot 再 pack 进去**：foot 是独立容器，列宽与 card
+        # 无关，里面的东西没法对齐到某一列的左边缘——只能写死像素偏移，窗口
+        # 一变宽就错位。grid 到列上则天然跟着列走。
+        live_row, _live = self._make_meta_row(card, dot=True)
+        live_row.grid(row=1, column=0, columnspan=len(columns) * 2 - 2,
+                      sticky="w", padx=(12, 0), pady=(9, 11))
+        _live.configure(text=f"实时更新中，每 {self.clock_interval_ms // 1000} "
+                             "秒自动刷新")
+        zone_row, self._clock_zone = self._make_meta_row(card, dot=True)
+        zone_row.grid(row=1, column=len(columns) * 2 - 2, sticky="w",
+                      padx=(12, 0), pady=(9, 11))
+        return card
+
+    # ---------- 单栏 ----------
+    def _build_column(self, parent, key, title, subtitle, hint, func, groups):
+        """一栏：标题 → 副标题 → 输入框 → 标签+下拉 × N → 主按钮 → 结果块。
+
+        **纵向用 ``grid`` 而不是 ``pack``**：结果块要 ``weight=1`` 吃掉栏内
+        多余高度，而 ``pack`` 的 ``expand`` 是「谁先 pack 谁先分」，几个不该
+        长大的控件（标签、下拉）会跟着一起被撑开。grid 的 ``weight`` 是逐行
+        生效的，只有结果块那一行会变高。
+
+        ``rows`` 的键名保持 ``result`` / ``outcome`` / ``ok`` 与旧版一致——
+        ``_refresh`` 的通用部分、以及测试里读 ``rows[key]['result']`` 的写法
+        不必跟着版式一起改。
+        """
+        C = self.P
+        tk = self.tk
+        card = self._make_card(parent)
+        card.columnconfigure(0, weight=1)
+
+        # ---- 标题行：左侧一个小折线标记，与截图的标题前缀同款 ----
+        head = tk.Frame(card, bg=C["card"])
+        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 0))
+        self._make_mark(head).pack(side="left", padx=(0, 7))
+        tk.Label(head, text=title, bg=C["card"], fg=C["title"],
+                 font=(self.panel.FONT_FAMILY, 10, "bold"),
+                 anchor="w").pack(side="left")
+
+        # ---- 副标题 ----
+        self._make_caption(card, subtitle, C["muted"]).grid(
+            row=1, column=0, sticky="ew", padx=18, pady=(4, 0))
+
+        # ---- 输入框。先摆描边外框，再把 Entry 放进去 ----
+        edge = tk.Frame(card, bg=C["card"], highlightthickness=1,
+                        highlightbackground=C["border"])
+        edge.grid(row=2, column=0, sticky="ew", padx=18, pady=(9, 0))
+        entry = tk.Entry(edge, bd=0, highlightthickness=0, bg=C["card"],
+                         fg=C["title"], insertbackground=C["button"],
+                         font=self._mono(11), width=1)
+        entry.pack(fill="x", padx=10, pady=7)
+
+        # ---- 标签 + 下拉 ----
+        drops = {}
+        row_index = 3
+        for gkey, glabel, choices, default in groups:
+            self._make_caption(card, glabel, C["muted"]).grid(
+                row=row_index, column=0, sticky="ew", padx=18, pady=(11, 0))
+            row_index += 1
+            drop = _ChoiceField(self, card, key, gkey, choices, default)
+            drop.grid(row=row_index, column=0, sticky="ew", padx=18, pady=(4, 0))
+            row_index += 1
+            drops[gkey] = drop
+
+        # ---- 主按钮：绿色通栏 ----
+        button = self._make_action_button(card, key)
+        button.grid(row=row_index, column=0, sticky="ew", padx=18, pady=(14, 0))
+        row_index += 1
+
+        # ---- 结果块：浅绿底，块内首行是「转换结果」+ 绿色「复制」----
+        #
+        # **结果标题行放在块里面**（截图就是这样）：它描述的是「这块底下的
+        # 东西是什么」。放在块外面的话，浅绿底就从标题下面才开始，那块绿色
+        # 与上面的白色卡片之间会多出一条突兀的边界。
+        box = tk.Frame(card, bg=C["soft_border"])
+        box.grid(row=row_index, column=0, sticky="nsew", padx=18, pady=(14, 16))
+        card.rowconfigure(row_index, weight=1)
+        inner = tk.Frame(box, bg=C["soft"])
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        # **``pack_propagate(False)`` 是这里的关键，不是可选项。**
+        #
+        # 下面两个 Label 的 ``wraplength`` 要按内块**实测宽度**回填，而 Tk 里
+        # Label 的请求宽度**包含 wraplength**。于是形成正反馈：
+        # wraplength ← 容器实测宽 → 容器请求宽 ← Label 请求宽 = wraplength。
+        # 实测这个环会把每栏从 ~220px 一路吹到 403px，三栏合计超出窗口，
+        # 整个 deck 往右溢出（第一栏左缘跑到了窗口内 360px 处）。
+        #
+        # 关掉传播后内块不再从子控件算请求大小，链就断在 ``inner`` 这里：
+        # 它的尺寸完全由 ``box``（→ 卡片列）分配，而卡片列宽由**标题、下拉、
+        # 按钮**这些正常控件决定。结果块因此既不会撑大卡片，又能靠
+        # ``rowconfigure(weight=1)`` 吃掉剩余高度。
+        inner.pack_propagate(False)
+
+        result_head = tk.Frame(inner, bg=C["soft"])
+        result_head.pack(fill="x", padx=11, pady=(9, 0))
+        head_label = self._make_caption(result_head, "转换结果", C["muted"])
+        head_label.pack(side="left")
+        copy_btn = self._make_copy_button(result_head, key)
+        copy_btn.pack(side="right")
+
+        value = tk.Label(inner, text="", bg=C["soft"], fg=C["value_fg"],
+                         font=self._mono(12, "bold"), anchor="nw",
+                         justify="left")
+        value.pack(fill="x", padx=11, pady=(6, 0))
+        sub = tk.Label(inner, text="", bg=C["soft"], fg=C["muted"],
+                       font=(self.panel.FONT_FAMILY, 9), anchor="nw",
+                       justify="left")
+        sub.pack(fill="x", padx=11, pady=(2, 10))
+
+        # 结果可能是一句较长的报错（「这是时间戳，请用左边「时间戳 → 日期时间」
+        # 那一栏：1793777553681」），必须折行——否则它会冲出那块浅绿底，压在
+        # 卡片边界上。``wraplength`` 不能在 pack 时写死：它要用**内块的实测
+        # 宽度**减去左右内边距，而那个宽度要等布局算完才知道。
+        self._bind_wrap(inner, (value, sub), horizontal=22)
+
+        self._install_placeholder(entry, hint)
+        entry._field_key = key
+        entry.bind("<KeyRelease>", lambda _e, k=key: self._on_field_input(k))
+        entry.bind("<FocusIn>", lambda _e, k=key: self._on_field_input(k),
+                   add="+")
+        entry.bind("<<Paste>>", self._on_paste_into_entry)
+        return {"card": card, "entry": entry, "result": value, "sub": sub,
+                "drops": drops, "button": button, "copy": copy_btn,
+                "head_label": head_label,
+                "outcome": "", "sub_text": "", "ok": False}
+
+    def _bind_wrap(self, container, labels, horizontal):
+        """让若干 Label 的 ``wraplength`` 跟着 ``container`` 的实测宽度走。"""
+        def resize(_event=None):
+            width = container.winfo_width() - horizontal
+            if width < 40:
+                # 布局还没算完（或窗口被压到极窄）。给个下限而不是把
+                # wraplength 设成 0 或负数——0 在 Tk 里表示「不折行」，
+                # 那正好是反效果：长文本会直接冲出卡片。
+                width = 40
+            for label in labels:
+                label.configure(wraplength=width)
+
+        container.bind("<Configure>", resize)
+
+    def _make_mark(self, parent):
+        """标题前的小折线标记：一段「>」+ 一段下划线，与截图同款。
+
+        用 ``Canvas`` 画而不是打字符：截图里那个标记是**几何图形**（一条折线
+        加一条横线），用文字符号（``>``、``»``）拼出来的形状与间距都不一样，
+        还会随字体变化。画布只要三个坐标，换来的是与截图一致。
+        """
+        C = self.P
+        mark = self.tk.Canvas(parent, width=13, height=13, bg=C["card"],
+                              highlightthickness=0, bd=0)
+        mark.create_line(3, 2, 8, 6, 3, 10, fill=C["title"], width=2,
+                         capstyle="round", joinstyle="round")
+        mark.create_line(7, 11, 12, 11, fill=C["title"], width=2,
+                         capstyle="round")
+        return mark
+
+    def _make_action_button(self, parent, key):
+        """绿色通栏主按钮。
+
+        **用 ``Frame`` + ``Label`` 拼而不是 ``tk.Button``**：Windows 上
+        ``tk.Button`` 的 ``bg`` 会因为原生主题（``vista``/``winnative``）
+        在按下与获得焦点时被系统改色——那颗按钮会突然变成系统灰。自绘之后
+        颜色完全可控。
+
+        ``click`` 走 ``<ButtonPress-1>`` 而不是 ``<Button-1>``：三栏的主按钮
+        都是**动作**，按下去就该有反应；等松开才响应会让人觉得迟钝。松开时
+        恢复常态色。
+        """
+        C = self.P
+        tk = self.tk
+        box = tk.Frame(parent, bg=C["button"], cursor="hand2")
+        label = tk.Label(box, text=self.ACTION_LABEL, bg=C["button"],
+                         fg=C["button_fg"],
+                         font=(self.panel.FONT_FAMILY, 10, "bold"))
+        label.pack(fill="x", pady=9)
+
+        def press(_event):
+            box.configure(bg=C["button_hot"])
+            label.configure(bg=C["button_hot"])
+            self._activate_column(key)
+            return "break"
+
+        def release(_event):
+            box.configure(bg=C["button"])
+            label.configure(bg=C["button"])
+
+        for widget in (box, label):
+            widget.bind("<ButtonPress-1>", press)
+            widget.bind("<ButtonRelease-1>", release)
+        box.label_widget = label
+        return box
+
+    def _make_copy_button(self, parent, key):
+        """结果区首行右侧的「复制」——绿色小字 + 手型光标。"""
+        C = self.P
+        label = self.tk.Label(parent, text=self.COPY_LABEL, bg=C["soft"],
+                              fg=C["copy_fg"],
+                              font=(self.panel.FONT_FAMILY, 9), cursor="hand2")
+        label.bind("<Button-1>", lambda _e, k=key: self._copy_column(k))
+        label.bind("<Enter>",
+                   lambda _e: label.configure(fg=self.P["button"]))
+        label.bind("<Leave>",
+                   lambda _e: label.configure(fg=self.P["copy_fg"]))
+        return label
+
+    def _activate_column(self, key):
+        """主按钮：切到这一栏并立刻按当前下拉选项重算。
+
+        **立刻重算而不是等防抖**：按钮是用户主动按下的，等 180ms 才出结果
+        会让人怀疑「是不是没按到」。防抖只服务于「打字」那条路径。
+        """
+        self._active = key
+        if self._after_id is not None:
+            try:
+                self.win.after_cancel(self._after_id)
+            except TclError:
+                pass
+            self._after_id = None
+        self._refresh()
+
+    def _close_popup(self):
+        """收起自绘下拉（若有）。幂等，可被最小化/关闭路径无条件调用。"""
+        popup, self._popup = self._popup, None
+        self._popup_owner = None
+        if popup is not None:
+            try:
+                popup.close()
+            except Exception:
+                # 收菜单是尽力而为：这里失败也不能连累主流程（最小化/关闭）。
+                pass
+
+    def _popup_closed(self):
+        """浮层自己关掉时（点外部、按 ESC）把引用清干净。"""
+        self._popup = None
+        self._popup_owner = None
+
+    def _dpi(self):
+        """取主面板的缩放系数；替身面板（测试）没有这个属性时退回 1.0。"""
+        value = getattr(self.panel, "_dpi", 1.0)
+        try:
+            return max(0.5, min(3.0, float(value)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _copy_column(self, key):
+        """复制这一栏的结果（主值 + 副行）。空结果时给一句提示。"""
+        row = self.rows.get(key)
+        if row is None or not row["outcome"]:
+            self._toast(key, "还没有结果可复制")
+            return
+        payload = row["outcome"]
+        if row.get("sub_text"):
+            payload = f"{payload}\n{row['sub_text']}"
+        try:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(payload)
+        except TclError as exc:
+            self._toast(key, f"复制失败：{exc}")
+            return
+        self._toast(key, f"已复制 {len(payload)} 字符")
+
+    def _toast(self, key, text):
+        """把一句话显示在**指定栏**结果区首行的位置上，1.6 秒后恢复。
+
+        没有底栏了，报错与「已复制」这类反馈得有地方去。挂在结果区首行是
+        最合适的位置：它就在结果块里，用户的视线本来就在那儿。
+
+        **``key`` 是必填的**：早先这个函数按 ``self._active`` 找栏，于是点
+        A 栏的复制、如果 ``_active`` 还停在 B 栏，提示就跑到 B 栏去了。触发
+        动作的那一栏是确定的，不该再从别处推断。
+
+        **不能直接改「转换结果」那个 Label 的持久文案**：那是这一块的标题，
+        改掉就再也回不来。这里临时借用它，定时器到点改回去。
+        """
+        row = self.rows.get(key)
+        if row is None:
+            return
+        head = row.get("head_label")
+        if head is None:
+            return
+        head.configure(text=text, fg=self.P["value_fg"])
+        token = getattr(self, "_toast_token", 0) + 1
+        self._toast_token = token
+
+        def restore():
+            if getattr(self, "_toast_token", None) != token or self._closed:
+                return
+            head.configure(text="转换结果", fg=self.P["muted"])
+
+        try:
+            self.win.after(1600, restore)
+        except TclError:
+            pass
+
+    # ---------- 占位提示 ----------
+    def _install_placeholder(self, entry, hint):
+        """给单行输入框加灰色示例文字（Tk 的 Entry 没有原生 placeholder）。
+
+        **占位状态必须记在控件上**（``entry._placeholder_on``）：只靠「文字刚好
+        等于示例」来判断，用户真照着示例打一遍就会被当成还空着。
+        """
+        entry._placeholder_on = False
+        entry._placeholder_text = hint
+        entry.bind("<FocusIn>", lambda _e: self._hide_placeholder(entry), add="+")
+        entry.bind("<FocusOut>", lambda _e: self._sync_placeholder(entry), add="+")
+        self._sync_placeholder(entry)
+
+    def _hide_placeholder(self, entry):
+        if getattr(entry, "_placeholder_on", False):
+            entry.delete(0, "end")
+            entry.configure(fg=self.P["title"])
+            entry._placeholder_on = False
+
+    def _sync_placeholder(self, entry):
+        """空且无焦点时显示示例；其余情况一律不显示。"""
+        try:
+            focused = entry.focus_get() is entry
+        except TclError:
+            focused = False
+        if focused:
+            self._hide_placeholder(entry)
+        elif not entry.get() and not getattr(entry, "_placeholder_on", False):
+            entry.insert(0, entry._placeholder_text)
+            entry.configure(fg=self.P["muted"])
+            entry._placeholder_on = True
+
+    def _entry_value(self, entry):
+        """输入框里的**真实**内容（占位示例不算输入）。"""
+        if getattr(entry, "_placeholder_on", False):
+            return ""
+        return entry.get().strip()
+
+    def _reset_entry(self, entry):
+        entry.delete(0, "end")
+        entry.configure(fg=self.P["title"])
+        entry._placeholder_on = False
+        self._sync_placeholder(entry)
+
+    def _on_paste_into_entry(self, event):
+        """把剪贴板文本**压成一行**再填进去。
+
+        用户多半是从别处整段复制过来的，末尾常带换行。直接塞进 Entry 会插进
+        不可见字符，界面看起来「明明填了却报错」。这里只取一行。
+        """
+        entry = event.widget
+        try:
+            text = self.win.clipboard_get()
+        except TclError:
+            return "break"
+        flat = " ".join((text or "").split())
+        if not flat:
+            return "break"
+        self._hide_placeholder(entry)
+        entry.delete(0, "end")
+        entry.insert(0, flat)
+        self._on_field_input(getattr(entry, "_field_key", self._active))
+        return "break"
+
+    # ---------- 行为 ----------
+    def _initial_focus_target(self):
+        return self.rows[self.COLUMNS[0][0]]["entry"]
+
+    def _after_build(self):
+        self._paint_clock()
+        self._tick_clock()
+
+    def _on_field_input(self, key):
+        self._active = key
+        self._on_input()
+
+    def _paint_clock(self, now_utc=None):
+        """把「此刻」画进时钟条的三列。``now_utc`` 仅测试注入。
+
+        三列同在一行，写入一律走 ``self._clock_cells``——**不要再引独立的
+        美东控件**：美东日期已经是第 3 列（用户要求把它挪到时间戳后面）。
+        """
+        snap = datetime_tools.clock_snapshot(now_utc)
+        self._clock_cells["beijing"].configure(text=snap["beijing"])
+        self._clock_cells["beijing_sub"].configure(
+            text=snap["beijing_weekday"])
+        millis = snap["millis"]
+        self._clock_cells["millis"].configure(text=str(millis))
+        # 位数不写死：写死 13 会在别的年份（毫秒位数变化）悄悄说错话。
+        self._clock_cells["millis_sub"].configure(
+            text=f"{len(str(millis))} 位（毫秒）")
+        self._clock_cells["eastern"].configure(text=snap["eastern"])
+        self._clock_cells["eastern_sub"].configure(
+            text=f"{snap['eastern_weekday']} · {snap['eastern_tag']}")
+        self._clock_zone.configure(text=f"本地时区: {snap['zone_name']}")
+
+    def _tick_clock(self):
+        self._clock_id = None
+        if self._closed:
+            return
+        self._paint_clock()
+        try:
+            self._clock_id = self.win.after(
+                self.clock_interval_ms, self._tick_clock)
+        except TclError:
+            # 窗口在两次 tick 之间被销毁了，正常收尾。
+            self._clock_id = None
+
+    def _set_result(self, row, text, sub="", kind="normal"):
+        """写一栏的结果区：主值 + 副行 + 颜色。
+
+        **副行单独一个控件**（不是主值的一部分）：它的字号与颜色都不同
+        （模板里副行是灰色小字）。拼进同一个 Label 就得用 Text 的 tag 才能
+        分段上色，那是为两行文字引入一整套文本编辑机制。
+        """
+        row["result"].configure(text=text, fg=self._result_color(kind))
+        row["sub"].configure(text=sub)
+        row["outcome"] = text
+        row["sub_text"] = sub
+        row["ok"] = bool(text) and kind != "error"
+
+    def _result_color(self, kind):
+        """结果文字色。报错用红，正常结果用调色板里的深绿。"""
+        if kind == "error":
+            return self._sys("red")
+        return self.P["value_fg"]
+
+    def _refresh(self):
+        """三栏各自独立换算；主按钮与「复制」都按**那一栏自己的**下拉取值。"""
+        if self._after_id is not None:
+            try:
+                self.win.after_cancel(self._after_id)
+            except TclError:
+                pass
+        self._after_id = None
+        if self._closed:
+            return
+
+        last_ok = ""
+        for key, spec in zip(self.rows, self.COLUMNS):
+            row = self.rows[key]
+            func = spec[4]
+            raw = self._entry_value(row["entry"])
+            if not raw:
+                self._set_result(row, "", "", "normal")
+                continue
+            # 下拉选项按**函数签名**映射：每栏要哪几个由 ``groups`` 的 key
+            # 决定，这里只负责把 key→值 收集起来。写死参数名的话，将来某栏
+            # 换个下拉就得再改一次这里。
+            options = {name: drop.value for name, drop in row["drops"].items()}
+            try:
+                text, sub, _note, kind = func(raw, **options)
+            except datetime_tools.DateError as exc:
+                self._set_result(row, str(exc), "", "error")
+                continue
+            self._set_result(row, text, sub, kind)
+            if row["ok"]:
+                last_ok = text
+        self._last_ok = last_ok
+
+    def _analyze(self, raw):
+        """基类契约的实现（``(结果, 状态, 类型)``）。
+
+        三栏版式下 ``_refresh`` 不走这里——每栏各有自己的换算函数。保留它是
+        为了「任何工具窗口都能被同一套方式驱动」在测试与将来的复用里仍然成立，
+        也让这个类没有偷偷偏离基类的约定。
+        """
+        text = (raw or "").strip()
+        if not text:
+            raise datetime_tools.DateError("还没有输入")
+        if datetime_tools.looks_like_timestamp(text):
+            return datetime_tools.timestamp_to_date(text)
+        return datetime_tools.beijing_to_eastern(text)
+
+    def _copy_output(self):
+        """复制**最后碰过的那一栏**的结果。
+
+        每栏都有自己的「复制」，这个无参版本供基类契约与快捷键调用：三份结果
+        同时在屏幕上，说清复制哪一份比「三份都复制」有用——后者粘出去是三行
+        不相干的内容。
+        """
+        self._copy_column(self._active)
+
+    def _clear(self):
+        """清空三栏的输入框。顶部时钟**不清**——它们是实时值而非用户输入，
+        清掉反而会让窗口看起来坏了。"""
+        for row in self.rows.values():
+            self._reset_entry(row["entry"])
+        self._active = self.COLUMNS[0][0]
+        self._refresh()
+
+    def close(self):
+        # **必须显式取消时钟**：``close()`` 只会取消 ``_after_id`` 那几个句柄，
+        # 时钟不在其中。漏掉这一步，窗口销毁后下一次 tick 会让 Tk 报
+        # ``invalid command name``（在控制台里刷屏，用户看到的是「关不干净」）。
+        if self._clock_id is not None:
+            try:
+                self.win.after_cancel(self._clock_id)
+            except TclError:
+                pass
+            self._clock_id = None
+        self._close_popup()
+        super().close()
+
+
 class ImageToBase64Window(_ToolWindow):
     """图片转 Base64：左栏是图片预览与取图入口，右栏是 Base64 文本。
 
@@ -2127,6 +3083,7 @@ class Base64ToImageWindow(_ToolWindow):
 TOOLS = (
     ("json", "JSON 格式化", JsonParamWindow),
     ("jwt", "JWT 解密", JwtWindow),
+    ("datetime", "日期转换", DateTimeWindow),
     ("img2b64", "图片转 Base64", ImageToBase64Window),
     ("b642img", "Base64 转图片", Base64ToImageWindow),
 )

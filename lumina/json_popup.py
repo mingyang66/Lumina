@@ -12,9 +12,19 @@ from . import clipboard_api
 
 
 class JsonPopup:
-    """items 为操作字典列表；popup 的 anchor 为提供屏幕坐标的 Tk 控件。"""
+    """items 为操作字典列表；popup 的 anchor 为提供屏幕坐标的 Tk 控件。
 
-    def __init__(self, tk, parent_win, items, theme, dpi=1.0):
+    ``icon=False`` 时**不画左侧图标**、文字从左侧内边距起笔。给「日期转换」
+    那种「下拉选择框」用——那里的选项是纯文本，凭空插一列图标位置只会让
+    每一项左边空 28px，看着像没对齐。默认 ``True`` 保持 JSON 菜单的原样。
+
+    ``width`` 覆盖默认的 200px。下拉选择框要**与它下面的控件同宽**，而
+    「北京时间 (UTC+08:00)」这类文本在 200px 里放不下（``create_text``
+    不折行，会直接溢出菜单背景）。不给就还是 200。
+    """
+
+    def __init__(self, tk, parent_win, items, theme, dpi=1.0,
+                 icon=True, width=None):
         try:
             dpi = float(dpi)
         except (TypeError, ValueError, OverflowError):
@@ -24,6 +34,7 @@ class JsonPopup:
         self.parent_win = parent_win
         self.items = [dict(item) for item in items]
         self.theme = dict(theme)
+        self.icon = bool(icon)
         self._closed = False
         self._shown = False
         self._on_close = None
@@ -38,7 +49,8 @@ class JsonPopup:
         self._active = None
         self._above = True
         self._bounds = None
-        self._width = self._px(200)
+        self._width = self._px(width or 200)
+        self._text_x = 42 if self.icon else 14
         self._padding = self._px(4)
         self._row_height = self._px(30)
         self._tip_height = self._px(6)
@@ -251,8 +263,9 @@ class JsonPopup:
             enabled = self._enabled(i)
             color = T['label'] if enabled else T['label3']
             icon_color = T['accent'] if enabled and (i == self._active or item.get('selected')) else color
-            self._icon(item.get('kind'), self._px(22), cy, icon_color)
-            c.create_text(self._px(42), cy, text=item.get('label', ''),
+            if self.icon:
+                self._icon(item.get('kind'), self._px(22), cy, icon_color)
+            c.create_text(self._px(self._text_x), cy, text=item.get('label', ''),
                           anchor='w', fill=color,
                           font=('Microsoft YaHei UI', -self._px(13)))
             selected = item.get('selected', False)
