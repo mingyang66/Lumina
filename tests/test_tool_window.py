@@ -2009,6 +2009,47 @@ class ToolWindowTests(unittest.TestCase):
         self.assertEqual(window.rows['stamp']['head_label'].cget('text'),
                          '转换结果', '提示串到别的栏去了')
 
+    def test_datetime_close_cancels_the_pending_toast_timer(self):
+        """关窗口必须**取消**那条 1.6 秒的提示定时器。
+
+        不取消的话，定时器到点时窗口已销毁、回调命令也随 Tk 一起删掉了，
+        Tk 会往 stderr 打 ``invalid command name "...restore"``——全量测试里
+        实测刷出来过（用户看到的是「关不干净」）。
+
+        **判据是句柄被清空 + 定时器真的不再排队**，不是「有没有异常」：
+        这个错误在 Tk 的 after 队列里静默发生，Python 侧一个异常都不抛。
+        """
+        window = self._open(DateTimeWindow)
+        window._copy_column('stamp')          # 必然挂上一个待恢复的提示
+        self.assertIsNotNone(window._toast_id, '提示定时器没挂上')
+        window.close()
+        self.assertIsNone(window._toast_id,
+                          'close() 没取消提示定时器，Tk 会报 invalid command name')
+
+    def test_datetime_new_toast_replaces_the_pending_timer(self):
+        """同一条栏连着两次提示，只留最后一个定时器，不堆积。
+
+        堆积本身不会报错，但窗口连点十几次「复制」就攒下十几个待触发回调，
+        它们会在 1.6 秒后几乎同时执行、把标题来回改——表现为「标题闪一下」。
+
+        **判据必须问 Tcl「那个定时器还在不在」**，不能比较两次 ``after()``
+        的返回值：``after()`` 每次都返回一个**新的** id（``after#0``、
+        ``after#1``…），拿「新旧 id 不相等」当判据是**恒真**的——不取消旧的
+        也照样通过（第一版就这么写的，变异验证直接逃逸）。正确写法是拿旧 id
+        去问 ``after info``，被取消过的会抛 ``TclError``。
+        """
+        window = self._open(DateTimeWindow)
+        window._copy_column('stamp')
+        first = window._toast_id
+        window._copy_column('stamp')
+        self.assertIsNotNone(window._toast_id)
+
+        with self.assertRaises(tk.TclError,
+                               msg='旧定时器没被取消，两个都还在排队'):
+            window.win.tk.call('after', 'info', first)
+        # 新的那个必须还在（别把两个都取消了，提示就永远不恢复）
+        self.assertTrue(window.win.tk.call('after', 'info', window._toast_id))
+
     # ---- 下拉 ----
     def test_datetime_every_column_has_the_dropdowns_from_the_spec(self):
         """``COLUMNS`` 里声明了几个下拉，界面上就得真建出几个。
@@ -2357,6 +2398,73 @@ class ToolWindowTests(unittest.TestCase):
         window._sync_placeholder(entry)
         self.assertEqual(window._entry_value(entry), hint,
                          '照着示例输入的内容被误当成占位符')
+
+    # ---- 初始焦点：三栏都不聚焦 ----
+    def test_datetime_opens_without_focusing_any_entry(self):
+        """开窗后**没有任何一条栏的输入框拿到焦点**（用户明确要求）。
+
+        **必须三栏逐个查**，不能只看第一栏：只断言 ``stamp`` 没焦点的话，
+        把 ``_initial_focus_target`` 改成返回 ``date`` 或 ``zone`` 的输入框
+        照样全绿——而那样用户看到的是「光标鬼使神差落在第二栏」。
+        """
+        window = self._open(DateTimeWindow)
+        window.win.update()
+        for key in ('stamp', 'date', 'zone'):
+            entry = window.rows[key]['entry']
+            self.assertIsNot(
+                entry.focus_get(), entry,
+                f'{key} 那栏的输入框开窗就抢了焦点')
+
+    def test_datetime_initial_focus_target_is_none(self):
+        """``_initial_focus_target`` 返回 ``None``——这是「不指定」的契约。
+
+        用 ``focus_get()`` 单查在当前环境里**判别力有限**（测试窗口是
+        ``-alpha 0``，焦点不一定真落到控件上），所以再钉一条源码级的：
+        返回 ``None`` 才是基类文档里写明的「不指定」语义，返回别的东西
+        （哪怕是个 ``Entry``）都不该出现。
+        """
+        window = self._open(DateTimeWindow)
+        self.assertIsNone(window._initial_focus_target())
+
+    def test_datetime_window_itself_still_takes_focus(self):
+        """窗口**自己**仍要拿到焦点——否则 ESC 最小化会失灵。
+
+        「不聚焦输入框」不等于「窗口不要焦点」：``<Escape>`` 挂在窗口上，
+        没有窗口焦点就收不到按键。
+
+        **这条只能钉源码，不能钉运行时**：实测把 ``focus_force()`` 整行删掉
+        后 ``win.focus_get()`` 照样返回窗口自身（Tk 的兜底），而本会话已锁屏、
+        ``GetForegroundWindow()`` 直接返回 0，OS 层的真实前台窗口观测不到——
+        写成运行时断言就是**恒真**，变异逃逸（踩过）。所以这里扫源码：
+        ``focus_force`` 调用必须还在，且必须排在 ``_initial_focus_target``
+        之前（顺序反了会让窗口焦点覆盖掉「不聚焦控件」的效果）。
+        """
+        source = Path(TW.__file__).read_text(encoding='utf-8')
+        body = source.split('def _initial_focus_target', 1)[0]
+        self.assertIn('focus_force', body,
+                      'focus_force() 被删了，ESC 最小化会失灵')
+        force_at = source.index('self.win.focus_force()')
+        target_at = source.index('target = self._initial_focus_target()')
+        self.assertLess(force_at, target_at,
+                        '顺序反了：先给控件焦点、再 focus_force 窗口')
+
+    def test_datetime_all_three_hints_visible_on_open(self):
+        """开窗时**三栏的灰色示例都要在**——聚焦会让那一栏的提示消失。
+
+        这条是「不聚焦」的用户可见收益：焦点一落在某栏，``_hide_placeholder``
+        就把那栏的示例清掉（挂在 ``<FocusIn>`` 上），用户开窗看到的是「一栏
+        空的、两栏有字」，容易以为那一栏不用填。
+        """
+        window = self._open(DateTimeWindow)
+        window.win.update()
+        for key in ('stamp', 'date', 'zone'):
+            entry = window.rows[key]['entry']
+            self.assertTrue(
+                getattr(entry, '_placeholder_on', False),
+                f'{key} 那栏开窗时没有显示示例文字')
+            self.assertEqual(entry.get(), entry._placeholder_text)
+            self.assertEqual(window._entry_value(entry), '',
+                             '示例被当成了真实输入')
 
     # ---- 时钟条（沿用，未受改版影响） ----
     def test_datetime_clock_shows_beijing_and_timestamp(self):

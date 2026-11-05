@@ -290,6 +290,12 @@ class _ToolWindow:
         # 都有确定取值，不会因属性缺失炸在用户操作路径上。
         self._payload = ""
         self._displayed = ""
+        # 结果区那条 1.6 秒临时提示的定时器句柄（「日期转换」三栏各自用它
+        # 报「已复制」/「还没有结果可复制」）。**必须与时钟、防抖的句柄分开**，
+        # 因为它们各自的取消时机不同；也必须在构造期就有确定取值，否则
+        # ``_toast`` 第一次调用会 AttributeError。``None`` = 当前没有待恢复的提示。
+        self._toast_id = None
+        self._toast_token = 0
         theme = panel._theme()
         self.T, self.dark = theme if isinstance(theme, tuple) else (theme, False)
         self.win = self.tk.Toplevel(panel.win)
@@ -2656,18 +2662,30 @@ class DateTimeWindow(_ToolWindow):
         if head is None:
             return
         head.configure(text=text, fg=self.P["value_fg"])
-        token = getattr(self, "_toast_token", 0) + 1
+        # ``_toast_token`` 防的是「旧的 1.6 秒回调把新提示改回标题」，
+        # ``_toast_id`` 防的是「窗口都没了回调还在跑」。两者互补，都要留。
+        token = self._toast_token + 1
         self._toast_token = token
 
         def restore():
-            if getattr(self, "_toast_token", None) != token or self._closed:
+            self._toast_id = None
+            if self._toast_token != token or self._closed:
                 return
             head.configure(text="转换结果", fg=self.P["muted"])
 
+        # **句柄要留着给 ``close()`` 取消**：窗口销毁后 Tk 会把回调命令一并
+        # 删掉，定时器到点就会报 ``invalid command name "...restore"``（实测
+        # 在全量测试里刷出来过）。下面那个 token 只能防「旧提示盖新提示」，
+        # 防不了「窗口已经没了」——两种失效情形不是一回事。
+        if self._toast_id is not None:
+            try:
+                self.win.after_cancel(self._toast_id)
+            except TclError:
+                pass
         try:
-            self.win.after(1600, restore)
+            self._toast_id = self.win.after(1600, restore)
         except TclError:
-            pass
+            self._toast_id = None
 
     # ---------- 占位提示 ----------
     def _install_placeholder(self, entry, hint):
@@ -2735,7 +2753,22 @@ class DateTimeWindow(_ToolWindow):
 
     # ---------- 行为 ----------
     def _initial_focus_target(self):
-        return self.rows[self.COLUMNS[0][0]]["entry"]
+        """**三栏都不聚焦**（用户要求「打开后光标不用聚焦到任何输入框」）。
+
+        返回 ``None`` 时基类只做 ``focus_force()``，光标留在**窗口自身**上——
+        实测焦点不会掉到第一个 Entry 里，而是停在 ``.!toplevel`` 那层。这不
+        只是「视觉上不闪光标」：
+
+        - 三栏是**并列**的（时间戳 / 日期时间 / 时区互转三件事），没有哪一栏
+          比另外两栏更该先被输入。默认聚焦第一栏等于替用户做了选择，而三栏
+          的副标题与下拉本来就不一样，聚焦错了反而误导。
+        - 聚焦会让那一栏的**灰色示例文字消失**（``_hide_placeholder`` 挂在
+          ``<FocusIn>`` 上）。开窗时三栏的提示应该同时可见，好让人一眼看清各
+          自要填什么。实测不聚焦时三栏占位都在，聚焦时第一栏是空的。
+        - ``focus_force()`` 仍然保留：ESC = 最小化走的是**窗口级**绑定，没有
+          窗口焦点就收不到按键。所以是「窗口有焦点、但没有哪个控件抢焦点」。
+        """
+        return None
 
     def _after_build(self):
         self._paint_clock()
@@ -2870,9 +2903,16 @@ class DateTimeWindow(_ToolWindow):
             except TclError:
                 pass
             self._clock_id = None
+        # 结果区那条 1.6 秒的临时提示同理：不取消就会在窗口销毁后触发，
+        # 报 ``invalid command name "...restore"``（全量测试里实测出现过）。
+        if getattr(self, "_toast_id", None) is not None:
+            try:
+                self.win.after_cancel(self._toast_id)
+            except TclError:
+                pass
+            self._toast_id = None
         self._close_popup()
         super().close()
-
 
 class ImageToBase64Window(_ToolWindow):
     """图片转 Base64：左栏是图片预览与取图入口，右栏是 Base64 文本。
