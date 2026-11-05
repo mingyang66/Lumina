@@ -1343,9 +1343,13 @@ class HistoryPanel:
         状态，避免悬停展开一直生效、鼠标偶然扫过顶栏就弹出菜单。
 
         三类点击**不算「其他地方」**，必须放行：
-        ``_tools_btn`` / ``_shot_btn`` / ``_settings_btn`` 是激活本身；
-        弹窗内部是菜单自己的交互（选项、勾选、分隔线）。
+        ``_tools_btn`` / ``_shot_btn`` / ``_vault_btn`` / ``_settings_btn``
+        是激活本身；弹窗内部是菜单自己的交互（选项、勾选、分隔线）。
         否则点一下菜单项就会顺手把激活打掉，下次还得再点一次才恢复悬停。
+
+        **新增顶栏按钮必须加进下面这个元组**：漏加的话点它会被当成「点了
+        其他地方」，刚解锁的悬停立刻被打掉——表现为「点一次隐域，再悬停
+        别的按钮不弹了」。
         """
         if not self._hover_armed:
             return
@@ -1353,6 +1357,7 @@ class HistoryPanel:
             w = event.widget
             if w in (getattr(self, '_tools_btn', None),
                      getattr(self, '_shot_btn', None),
+                     getattr(self, '_vault_btn', None),
                      getattr(self, '_settings_btn', None)):
                 return
             # 点在弹窗内部：属于菜单自身交互，不算「其他地方」
@@ -1396,21 +1401,25 @@ class HistoryPanel:
         会短暂落在两者之外。所以判定时把按钮底边往下延伸到弹窗底边、
         弹窗顶边往上延伸到按钮顶边，拼成一个连续矩形，避免穿缝误收起。
 
-        **判定区必须横向覆盖全部三个菜单按钮，而不是只覆盖当前锚点那一个。**
+        **判定区必须横向覆盖全部菜单按钮，而不是只覆盖当前锚点那一个。**
         只算锚点会出「方向性 bug」：打开*设置*时合并区是 ``x[586,764]``，
         滑到左边*截图*（``x[535,584]``）就落在判定区之外 → 轮询判定「已离开」
         → ``_close_popup_menu()`` 顺带取消了截图那边排队中的 180ms 展开任务，
         于是**从右往左划不弹**；而打开*工具*时合并区 ``x[484,660]`` 恰好盖住
         截图，往右划就正常。用户实测报的就是这个不对称。
         按整条顶栏算之后，按钮之间横向移动永远不会被判离开。
+
+        **按钮列表要和 ``_on_global_click`` 里那份保持一致**：两处都漏加同一个
+        新按钮时，症状是「新按钮两边都能点开，但它和邻居之间划过去会误收起」。
         """
         try:
             zones = []
-            # 全部菜单按钮所在的横向范围（只取「工具/截图/设置」这三颗，
+            # 全部菜单按钮所在的横向范围（只取顶栏这几个功能入口，
             # 不含右侧的最小化/关闭，否则鼠标划到窗口控制区也不会收起）
             menu_btns = [btn for btn in (
                 getattr(self, '_tools_btn', None),
                 getattr(self, '_shot_btn', None),
+                getattr(self, '_vault_btn', None),
                 getattr(self, '_settings_btn', None)) if btn is not None]
             for b in menu_btns:
                 zones.append((b.winfo_rootx(), b.winfo_rooty(),
@@ -1603,7 +1612,36 @@ class HistoryPanel:
                 cursor="hand2")
             eye_button.image = eye_photo
             eye_button.pack(fill="x", padx=6, pady=(0, 4))
-        else:
+        def lock_icon(dr, s, c, w):
+            """挂锁：用于「密匣」（隐秘数据记录）。"""
+            w = int(round(w))
+            # 锁梁：上半圆环
+            dr.arc([s * 0.30, s * 0.14, s * 0.70, s * 0.54],
+                   start=180, end=360, fill=c, width=w)
+            dr.line([(s * 0.30, s * 0.34), (s * 0.30, s * 0.46)],
+                    fill=c, width=w)
+            dr.line([(s * 0.70, s * 0.34), (s * 0.70, s * 0.46)],
+                    fill=c, width=w)
+            # 锁体
+            dr.rounded_rectangle(
+                [s * 0.22, s * 0.46, s * 0.78, s * 0.84],
+                radius=s * 0.07, outline=c, width=w)
+            # 锁孔
+            dr.ellipse([s * 0.46, s * 0.58, s * 0.54, s * 0.66], fill=c)
+
+        if kind == "vault":
+            # 「隐域」下拉：隐秘数据记录的入口。目前只有「密匣」一项，
+            # 功能尚未实现——点了给一句明确提示，**不做成点了没反应**。
+            # 用 indigo 而不是 gray：这一组是「敏感数据」，与设置里的
+            # 日常操作（刷新蓝 / 清理红）在配色上要能分开。
+            lock_photo = sm_icon(lock_icon, 18, color_hex=self._sys("indigo"))
+            lock_button = tk.Button(
+                frame, text="密匣", image=lock_photo, compound="right",
+                command=lambda: self._popup_action(self._open_vault_box),
+                **btn_kw)
+            lock_button.image = lock_photo
+            lock_button.pack(fill="x", padx=4, pady=(4, 4))
+        elif kind == "settings":
             refresh_photo = sm_icon(refresh_icon, 18, color_hex=self._sys("blue"))
             refresh_button = tk.Button(
                 frame, text="刷新  (F5)", image=refresh_photo, compound="right",
@@ -1815,6 +1853,15 @@ class HistoryPanel:
     def _popup_action(self, fn):
         self._close_popup_menu()
         fn()
+
+    def _open_vault_box(self):
+        """「密匣」：隐秘数据记录。**功能尚未实现**，先给一句明确提示。
+
+        刻意不做成「点了没反应」——那会让人以为是卡了或点错了位置。
+        也刻意**不弹假的空窗口**：摆一个什么都不能干的对话框比一句提示更糟，
+        用户会以为是自己不会用。等真做的时候在这里接窗口。
+        """
+        self.status_var.set("密匣功能开发中")
 
     def _open_tool_window(self, key):
         """打开顶栏工具窗口（JSON 格式化 / JWT 解密）。
@@ -2699,17 +2746,26 @@ class HistoryPanel:
             title_bar, text="截图",
             command=lambda: self._toggle_popup_menu("shot", self._shot_btn),
             **menu_btn_kw)
+        # 「隐域」= 隐秘数据记录的入口（用户定的名）。它是顶栏的第 3 个入口，
+        # 位置被明确指定为「截图后、设置前」——放在这个位置是把「日常操作」
+        # （工具 / 截图）和「敏感操作」分开，后者紧随其后但不与设置混在一起。
+        self._vault_btn = tk.Button(
+            title_bar, text="隐域",
+            command=lambda: self._toggle_popup_menu("vault", self._vault_btn),
+            **menu_btn_kw)
         # 工具下拉放在「截图」左侧、紧邻 Lumina 标题，成为标题栏第一组功能入口。
         self._tools_btn = tk.Button(
             title_bar, text="工具",
             command=lambda: self._toggle_popup_menu("tools", self._tools_btn),
             **menu_btn_kw)
-        # pack 顺序即从左到右：工具 → 截图 → 设置
+        # pack 顺序即从左到右：工具 → 截图 → 隐域 → 设置
         self._tools_btn.pack(side="left", padx=(0, 2))
         self._shot_btn.pack(side="left", padx=(0, 2))
+        self._vault_btn.pack(side="left", padx=(0, 2))
         self._settings_btn.pack(side="left", padx=(0, 2))
         for _kind, _btn in (("tools", self._tools_btn),
                             ("shot", self._shot_btn),
+                            ("vault", self._vault_btn),
                             ("settings", self._settings_btn)):
             self._bind_hover_menu(_kind, _btn)
 
