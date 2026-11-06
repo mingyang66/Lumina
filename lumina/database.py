@@ -441,6 +441,98 @@ class Database:
                     result["data"] = stream.read()
         return result
 
+    # ---------- 密匣：银行资产 ----------
+    #
+    # 这几条刻意**不复用** ``clipboard`` 表的任何机制：密匣是另一类数据
+    # （结构化记录，不是剪贴历史），混进同一张表会被 cleanup 的保留天数
+    # 清掉、被 FTS 索引进去、被列表页当成一条剪贴记录显示出来。独立表是
+    # 唯一能保证「密匣里的东西不会被别的功能碰」的做法。
+    #
+    # 排序一律 ``ORDER BY sort_index, id``：sort_index 全为 0 时退化成按 id，
+    # 也就是插入顺序；将来接拖拽就只需重写 sort_index。
+
+    def list_vault_banks(self):
+        return self.conn.execute(
+            "SELECT id, name, sort_index FROM vault_bank "
+            "ORDER BY sort_index, id").fetchall()
+
+    def add_vault_bank(self, name, sort_index=0):
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("银行名不能为空")
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO vault_bank(name, sort_index) VALUES (?,?)",
+                (name, int(sort_index)))
+        return cur.lastrowid
+
+    def rename_vault_bank(self, bank_id, name):
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("银行名不能为空")
+        with self.conn:
+            cur = self.conn.execute(
+                "UPDATE vault_bank SET name=? WHERE id=?", (name, bank_id))
+        return cur.rowcount > 0
+
+    def delete_vault_bank(self, bank_id):
+        """删银行**连同它的存单**。两步在一个事务里，不会留下孤儿存单。"""
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute(
+                "DELETE FROM vault_deposit WHERE bank_id=?", (bank_id,))
+            cur = self.conn.execute(
+                "DELETE FROM vault_bank WHERE id=?", (bank_id,))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return cur.rowcount > 0
+
+    def list_vault_deposits(self, bank_id=None):
+        """全部存单，或某家银行下的存单。按 ``(bank_id, sort_index, id)`` 排。
+
+        ``end_date`` 是 ``YYYY-MM-DD`` 文本，字典序与时间序一致，
+        所以「按到期日排序」可以直接交给 SQL，不必取出来再排。
+        """
+        if bank_id is None:
+            return self.conn.execute(
+                "SELECT * FROM vault_deposit "
+                "ORDER BY bank_id, sort_index, id").fetchall()
+        return self.conn.execute(
+            "SELECT * FROM vault_deposit WHERE bank_id=? "
+            "ORDER BY sort_index, id", (bank_id,)).fetchall()
+
+    def add_vault_deposit(self, bank_id, name, principal, rate, months,
+                          end_date, sort_index=0):
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO vault_deposit(bank_id, name, principal, rate, "
+                "months, end_date, sort_index) VALUES (?,?,?,?,?,?,?)",
+                (int(bank_id), name, float(principal), float(rate),
+                 int(months), end_date, int(sort_index)))
+        return cur.lastrowid
+
+    def update_vault_deposit(self, deposit_id, **fields):
+        """改存单。只接受白名单里的列名，避免拼接出任意 SQL。"""
+        allowed = ("bank_id", "name", "principal", "rate", "months",
+                   "end_date", "sort_index")
+        pairs = {k: v for k, v in fields.items() if k in allowed}
+        if not pairs:
+            return False
+        assignments = ", ".join(f"{k}=?" for k in pairs)
+        with self.conn:
+            cur = self.conn.execute(
+                f"UPDATE vault_deposit SET {assignments} WHERE id=?",
+                (*pairs.values(), deposit_id))
+        return cur.rowcount > 0
+
+    def delete_vault_deposit(self, deposit_id):
+        with self.conn:
+            cur = self.conn.execute(
+                "DELETE FROM vault_deposit WHERE id=?", (deposit_id,))
+        return cur.rowcount > 0
+
     def stats(self):
         rows = self.conn.execute(
             "SELECT category AS cat, "

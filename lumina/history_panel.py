@@ -1855,13 +1855,44 @@ class HistoryPanel:
         fn()
 
     def _open_vault_box(self):
-        """「密匣」：隐秘数据记录。**功能尚未实现**，先给一句明确提示。
+        """「密匣」：隐秘数据记录。
 
-        刻意不做成「点了没反应」——那会让人以为是卡了或点错了位置。
-        也刻意**不弹假的空窗口**：摆一个什么都不能干的对话框比一句提示更糟，
-        用户会以为是自己不会用。等真做的时候在这里接窗口。
+        用户要求「点击密匣弹框」——这里开的是独立窗口，与工具窗口同一套外壳
+        （无边框 + 自绘描边 + 任务栏归属 + ESC 最小化），但**不进 ``TOOLS``
+        注册表**：那个注册表喂的是顶栏「工具」下拉，密匣的入口在「隐域」下面，
+        两者是不同的入口，混进同一个表会让工具菜单里多出一项、并且多出一个
+        谁都不会点的隐藏入口。
+
+        实例表复用 ``_tool_windows`` 但用独立的 key（``vault``）：与工具窗口
+        一样只保留一个实例，最小化后从菜单再点一次是唤回而不是开第二个。
         """
-        self.status_var.set("密匣功能开发中")
+        from .vault_window import VaultWindow
+        # **实例表是懒创建的**（``open_tool`` 里用 ``getattr`` 兜底），所以
+        # 这里不能直接 ``self._tool_windows``——这个窗口通常是用户这一天里
+        # 第一次碰的窗口，直接取属性会在「还没开过任何工具窗」时炸掉。
+        registry = getattr(self, "_tool_windows", None)
+        if registry is None:
+            registry = {}
+            self._tool_windows = registry
+        existing = registry.get("vault")
+        if existing is not None:
+            try:
+                alive = (not existing._closed
+                         and bool(existing.win.winfo_exists()))
+            except Exception:
+                alive = False
+            if alive:
+                existing.summon()
+                return existing
+            registry.pop("vault", None)
+        try:
+            window = VaultWindow(self)
+        except Exception:
+            traceback.print_exc()
+            self.status_var.set("密匣打开失败，详情见控制台")
+            return None
+        registry["vault"] = window
+        return window
 
     def _open_tool_window(self, key):
         """打开顶栏工具窗口（JSON 格式化 / JWT 解密）。

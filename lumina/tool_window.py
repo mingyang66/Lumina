@@ -123,17 +123,31 @@ class _MiniScroll:
     THICKNESS = 3          # 滑块粗细
     LANE = 10              # 轨道占位宽度（含留白）
 
-    def __init__(self, tk, parent, orient, command, theme, accent):
+    def __init__(self, tk, parent, orient, command, theme, accent,
+                 gutter=None, thumb=None):
         self.orient = orient
         self.command = command
         self._first = 0.0
         self._last = 1.0
         self._drag_from = None
         size = (self.LANE, 1) if orient == "vertical" else (1, self.LANE)
+        # ``gutter`` 是**轨道底色**，默认取基类主题的 ``card_bg``（既有行为不变）。
+        # 抽成参数是因为**换过配色的窗口不能再用它**：密匣的卡片底色走自己的
+        # ``P["card"]``，而这个 10px 轨道是独立 Canvas、不会继承父容器色——
+        # 实测深色主题下它露出一条偏冷的 ``#2C2C2E``，在暖色卡面右侧挂了
+        # 一条不搭调的竖条（浅色下 ``#FFFFFF`` 恰好与卡片同色，所以看不出来，
+        # 只有深色才暴露）。
         self.canvas = tk.Canvas(
-            parent, width=size[0], height=size[1], bg=theme["card_bg"],
+            parent, width=size[0], height=size[1],
+            bg=gutter or theme["card_bg"],
             highlightthickness=0, bd=0, cursor="hand2")
-        self._idle = theme["label3"]
+        # ``gutter`` / ``thumb`` 默认取基类主题（既有行为不变）。抽成参数是因为
+        # **换过配色的窗口不能再用它们**：密匣的卡片色走自己的 ``P["card"]``、
+        # 强调色走 ``P["link"]``，而这个轨道是独立 Canvas、不继承父容器色。
+        # 实测深色主题下基类的 ``#2C2C2E`` 轨道 + ``#6C6C72`` 滑块会在暖色卡面
+        # 右侧露出一条不搭调的冷灰竖条（浅色下 ``card_bg`` 恰好是 ``#FFFFFF``、
+        # 与卡片同色，所以看不出来，**只有深色才暴露**）。
+        self._idle = thumb or theme["label3"]
         self._hot = accent
         self.canvas.bind("<Configure>", lambda _e: self._redraw())
         self.canvas.bind("<Enter>", lambda _e: self._redraw(hot=True))
@@ -330,17 +344,31 @@ class _ToolWindow:
         return self.input
 
     # ---------- 外壳 ----------
+    def _surface_bg(self):
+        """外壳底色（窗口本体、自绘外壳、正文/底栏容器、缩放热区）。
+
+        **默认恒等于 ``T["window_bg"]``**，所以对既有的四个工具窗口，这个钩子
+        的存在不改变任何像素。抽出来只是为了给「整窗换一套暖色底」的子类
+        （密匣的招行风格）一个**单点**替换处。
+
+        为什么必须是单点：这个色散落在六七个控件的 ``bg`` 上，其中
+        ``_make_resize_edges`` 那圈热区压在窗口最外 6px、``_edge_leave`` 还会
+        把色**还原**一次。任何一处漏改，都会在外壳上留下一圈与周围不同色的
+        补丁，而且它是透明热区、不报错，只会看起来像「边缘有一道脏边」。
+        """
+        return self.T["window_bg"]
+
     def _build_shell(self):
         tk = self.tk
         self.win.overrideredirect(True)
-        self.win.configure(bg=self.T["window_bg"])
+        self.win.configure(bg=self._surface_bg())
         self._follow_topmost()
         # 任务栏归属与图标。构造期窗口还没映射，Tk 会在映射那一刻才应用
         # overrideredirect 的扩展样式并把 WS_EX_TOOLWINDOW 打上，所以构建期
         # 这里设的会被覆盖——必须等 <Map> 之后再改一次（见 _on_map_claim_taskbar）。
         self.win.bind("<Map>", self._on_map_claim_taskbar, add="+")
         self._claim_taskbar()
-        self.shell = tk.Canvas(self.win, bg=self.T["window_bg"],
+        self.shell = tk.Canvas(self.win, bg=self._surface_bg(),
                                highlightthickness=0, bd=0)
         self.shell.pack(fill="both", expand=True)
         self._paint_shell(self.width, self.height)
@@ -494,7 +522,7 @@ class _ToolWindow:
         scale = 2 if width * height <= 1_400_000 else 1
         image = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        fill = (*self._rgb(self.T["window_bg"]), 255)
+        fill = (*self._rgb(self._surface_bg()), 255)
         draw.rectangle(
             [0, 0, width * scale - 1, height * scale - 1],
             fill=fill, outline=(*self._rgb(self._edge()), 255),
@@ -521,6 +549,32 @@ class _ToolWindow:
                                 anchor="nw", tags="shell_bg")
         self.shell.tag_lower("shell_bg")
 
+    def _rail_theme(self):
+        """顶栏的一套用色：``bg`` / ``title_fg`` / ``mark_idle`` /
+        ``mark_accent`` / ``hover_bg`` / ``hover_fg`` / ``close_hover_bg`` /
+        ``close_hover_fg``。
+
+        **默认与外壳同色**（``window_bg``），也就是「顶栏不是一块独立的条，
+        而是外壳的一部分」——工具名只用次级色，不与正文抢视线。
+
+        抽成方法是为了让子类能改成**品牌色顶栏**而不必整个重写
+        ``_build_rail``：密匣按招商银行风格做成了红底白字（见 ``VaultWindow``）。
+        重写整个方法意味着把 rail 的 ``place`` 几何、拖动绑定、三个控制按钮的
+        ``pack`` 顺序抄一遍，将来基类调整这四处就会漏掉那个子类。
+        """
+        T = self.T
+        return {
+            "bg": T["window_bg"],
+            "title_fg": T["label2"],
+            "mark_idle": T["label3"],
+            "mark_accent": self._accent(),
+            "divider": T["hairline"],
+            "hover_bg": T["fill_hover"],
+            "hover_fg": self._accent(),
+            "close_hover_bg": self._sys("red"),
+            "close_hover_fg": "#FFFFFF",
+        }
+
     def _build_rail(self):
         """顶部操作条：左侧信号条 + 工具名，右侧最小化/最大化/关闭。
 
@@ -530,24 +584,33 @@ class _ToolWindow:
 
         「输入 / 结果」这类**分区小标题仍然不出现**，那两块靠左侧色条
         （输入=强调蓝、结果=青）与可编辑/只读状态区分。
+
+        所有用色走 ``_rail_theme()``，子类换掉那一个方法就能得到品牌色顶栏。
+
+        **rail 的几何留在 ``CONTENT_INSET`` 那一圈之内，不要改成通铺整宽**：
+        八向缩放热区是 ``place`` 在窗口最外圈（顶边 y=0..6、左右 x=0..6）且
+        底色取 ``window_bg`` 的。顶栏一旦通铺到边缘，那条 6px 热区和它下面
+        12x12 的角热区就会**压在顶栏上**、露出一圈与顶栏不同色的边——而热区
+        是透明的、用户只会看到「红条上有一道浅色痕」，找不到成因。
         """
-        tk, T = self.tk, self.T
-        rail = tk.Frame(self.shell, bg=T["window_bg"], height=RAIL_HEIGHT)
+        R = self._rail_theme()
+        tk = self.tk
+        rail = tk.Frame(self.shell, bg=R["bg"], height=RAIL_HEIGHT)
         rail.place(x=CONTENT_INSET, y=CONTENT_INSET,
                    width=-CONTENT_INSET * 2, relwidth=1.0, height=RAIL_HEIGHT)
-        mark = tk.Canvas(rail, width=24, height=RAIL_HEIGHT, bg=T["window_bg"],
+        mark = tk.Canvas(rail, width=24, height=RAIL_HEIGHT, bg=R["bg"],
                          highlightthickness=0, bd=0, cursor="fleur")
         mark.pack(side="left")
         self._draw_mark(mark)
 
         # 工具名。用 Label 而不是 Canvas 文字，方便测试断言与后续改文案。
         self.title_label = tk.Label(
-            rail, text=self.title, bg=T["window_bg"], fg=T["label2"],
+            rail, text=self.title, bg=R["bg"], fg=R["title_fg"],
             font=(self.panel.FONT_FAMILY, 9), anchor="w")
         self.title_label.pack(side="left", padx=(7, 0))
 
         # 标题右侧一道极短的发丝线，把标题与控件区分开，同时保持轻量
-        divider = tk.Frame(rail, bg=T["hairline"], width=1, height=11)
+        divider = tk.Frame(rail, bg=R["divider"], width=1, height=11)
         divider.pack(side="left", padx=(9, 0))
 
         for widget in (rail, mark, self.title_label):
@@ -560,20 +623,25 @@ class _ToolWindow:
 
         # pack 顺序即左右：先 pack 的在最左，所以按 关闭 → 最大化 → 最小化
         # 反向 pack，最终视觉顺序是 最小化 / 最大化 / 关闭（Windows 习惯）。
+        # 三个按钮的用色都从 rail 主题取——**不能写死 ``T["window_bg"]``**：
+        # 品牌色顶栏下按钮底色必须是顶栏色，否则按钮会变成红条上三块灰方块。
         self._close_btn = self._make_control_button(
-            rail, "close", self.close,
-            hover_bg=self._sys("red"), hover_fg="#FFFFFF")
+            rail, "close", self.close, bg=R["bg"], idle=R["mark_idle"],
+            hover_bg=R["close_hover_bg"], hover_fg=R["close_hover_fg"])
         self._max_btn = self._make_control_button(
-            rail, "maximize", self._toggle_maximize)
+            rail, "maximize", self._toggle_maximize, bg=R["bg"],
+            idle=R["mark_idle"], hover_bg=R["hover_bg"], hover_fg=R["hover_fg"])
         self._min_btn = self._make_control_button(
-            rail, "minimize", self._minimize)
+            rail, "minimize", self._minimize, bg=R["bg"],
+            idle=R["mark_idle"], hover_bg=R["hover_bg"], hover_fg=R["hover_fg"])
         for button in (self._close_btn, self._max_btn, self._min_btn):
             button.pack(side="right", padx=(2, 0))
 
     def _draw_mark(self, canvas):
         """信号条：三道递增竖条，纯几何，不表达任何文案。"""
-        accent = self._accent()
-        edge = self.T["label3"]
+        R = self._rail_theme()
+        accent = R["mark_accent"]
+        edge = R["mark_idle"]
         base = (RAIL_HEIGHT - 15) // 2
         for index, bar in enumerate((6, 10, 15)):
             x = 5 + index * 5
@@ -582,17 +650,21 @@ class _ToolWindow:
                 fill=accent if index == 2 else edge, outline="")
 
     def _make_control_button(self, parent, kind, command, hover_bg=None,
-                             hover_fg=None):
+                             hover_fg=None, bg=None, idle=None):
         """窗口控制按钮：纯线条图形（最小化=横线，最大化=方框，关闭=叉线）。
 
         与主面板标题栏保持同一套视觉语言，但这里只用 Canvas 画——无边框窗口
         的 rail 很矮，位图缩放在高 DPI 下会糊。
         默认悬停：底色转 ``fill_hover``、图形转强调色；关闭按钮覆盖为红底白叉。
+
+        ``bg`` / ``idle`` 由调用方从 ``_rail_theme()`` 传入（默认仍是外壳色，
+        与参数加入之前的行为一致）。**图形颜色与底色必须成对换**：品牌色顶栏
+        是深红底，若只换底色不换 ``idle``，深色上画深灰线条＝按钮看不见。
         """
         tk, T = self.tk, self.T
         size = 24
-        idle = T["label3"]
-        normal_bg = T["window_bg"]
+        idle = idle or T["label3"]
+        normal_bg = bg or T["window_bg"]
         canvas = tk.Canvas(parent, width=size, height=size, bg=normal_bg,
                            highlightthickness=0, bd=0, cursor="hand2")
 
@@ -780,6 +852,10 @@ class _ToolWindow:
             self.win.geometry(
                 f"+{event.x_root - self._drag_off[0]}+{event.y_root - self._drag_off[1]}")
 
+    def _resize_corner_size(self):
+        """角热区大小；品牌顶栏子类可限制到内容内边距之外。"""
+        return RESIZE_EDGE * 2
+
     def _make_resize_edges(self):
         """在窗口四边铺一圈透明的缩放热区，实现八向拖拽改尺寸。
 
@@ -802,7 +878,7 @@ class _ToolWindow:
         """
         tk = self.tk
         width = RESIZE_EDGE
-        corner = RESIZE_EDGE * 2
+        corner = self._resize_corner_size()
         # 角热区从**真正的角**起算（place 在 0,0 / 右上等位置）。四角是尖角，
         # 整块 12x12 方框都是真实存在的像素，不像圆角时那样有个被裁掉的扇形。
         edges = (
@@ -826,7 +902,7 @@ class _ToolWindow:
         )
         self._resize_edges = {}
         for name, geometry, cursor in edges:
-            zone = tk.Frame(self.shell, bg=self.T["window_bg"], cursor=cursor,
+            zone = tk.Frame(self.shell, bg=self._surface_bg(), cursor=cursor,
                             highlightthickness=0, bd=0)
             zone.place(**geometry)
             zone.bind("<Enter>", lambda _e, n=name: self._edge_enter(n))
@@ -852,7 +928,7 @@ class _ToolWindow:
     def _edge_leave(self, name):
         zone = self._resize_edges.get(name)
         if zone is not None:
-            zone.configure(bg=self.T["window_bg"])
+            zone.configure(bg=self._surface_bg())
 
     def _edge_press(self, event, name):
         """记下起点：窗口几何 + 鼠标屏幕坐标 + 拖的是哪条边/哪个角。"""
@@ -913,7 +989,10 @@ class _ToolWindow:
         """
         tk, T = self.tk, self.T
         size = 14
-        canvas = tk.Canvas(parent, width=size, height=size, bg=T["window_bg"],
+        # 抓手（``_make_grip``）画在底栏里，与底栏同色；底栏本身走
+        # ``_surface_bg()``，所以这里也跟着走，品牌色整窗换底时不会留一块灰。
+        canvas = tk.Canvas(parent, width=size, height=size,
+                           bg=self._surface_bg(),
                            highlightthickness=0, bd=0, cursor="size_nw_se")
         color = T["label3"]
         for index in range(3):
@@ -949,7 +1028,7 @@ class _ToolWindow:
         tk = self.tk
         foot_h = FOOT_HEIGHT + 1 if self.has_footer else 0
         body_h = -(CONTENT_INSET * 2 + RAIL_HEIGHT + foot_h + 8)
-        self._body = body = tk.Frame(self.shell, bg=self.T["window_bg"])
+        self._body = body = tk.Frame(self.shell, bg=self._surface_bg())
         body.place(x=CONTENT_INSET, y=CONTENT_INSET + RAIL_HEIGHT,
                    relwidth=1.0, relheight=1.0,
                    width=-CONTENT_INSET * 2, height=body_h)
