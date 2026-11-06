@@ -550,7 +550,7 @@ class VaultWindowTests(unittest.TestCase):
         self.assertEqual(
             len(set(strips.values())), 4,
             f"四张卡的色条应该四个颜色，实际 {strips}")
-        self.assertEqual(strips["principal"], "#244A68",
+        self.assertEqual(strips["principal"], "#75B5E8",
                          "本金卡色条应使用确认的主蓝")
 
     def test_matured_countdown_says_the_number(self):
@@ -1155,6 +1155,8 @@ class VaultPaletteChromeTests(unittest.TestCase):
                 {k: v[1] for k, v in _history_theme().items()}, True)
         window = VaultWindow(panel)
         self.windows.append(window)
+        if window.dark != dark:
+            window._toggle_theme()
         window._today = TODAY
         banks = {}
         for bank, name, principal, rate, months, end in rows:
@@ -1165,6 +1167,23 @@ class VaultPaletteChromeTests(unittest.TestCase):
         window._reload()
         self.root.update()
         return window
+
+    def test_new_window_defaults_to_dark_without_changing_panel(self):
+        before = self.panel._theme()
+        window = VaultWindow(self.panel)
+        self.windows.append(window)
+        self.root.update()
+        self.assertTrue(window.dark)
+        self.assertEqual(window.win.cget("bg"), VaultWindow.DARK_PALETTE["surface"])
+        self.assertEqual(window._theme_button.cget("text"), "切换浅色")
+        self.assertEqual(self.panel._theme(), before)
+        window._toggle_theme()
+        self.assertFalse(window.dark)
+        window.close()
+        reopened = VaultWindow(self.panel)
+        self.windows.append(reopened)
+        self.root.update()
+        self.assertTrue(reopened.dark)
 
     def test_theme_button_roundtrip_preserves_window_and_data(self):
         window = self.make_window()

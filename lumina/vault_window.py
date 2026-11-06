@@ -227,6 +227,12 @@ class VaultWindow(_ToolWindow):
         return self.DARK_PALETTE if self.dark else self.LIGHT_PALETTE
 
     # ---------- 整窗外壳 ----------
+    def _build_shell(self):
+        # 在首次创建控件前设为深色，避免浅色首帧或局部颜色残留。
+        # 不改 panel._theme，其他窗口仍沿用各自主题。
+        self.dark = True
+        super()._build_shell()
+
     def _surface_bg(self):
         """窗口、外壳、正文容器与缩放热区统一使用 surface。"""
         return self.P["surface"]
