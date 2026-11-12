@@ -162,60 +162,63 @@ class VaultWindow(_ToolWindow):
     # ---------- 设计令牌 ----------
     # 交互蓝与状态赭红分离；装饰色条不承担正文可读性。
     # 银行蓝灰主行、存单交替中性底；已到期（含当天）覆盖条纹，独占状态底色。
+    # 配色取自「黄金深一度」长图：深色是上半段的墨蓝 × 香槟金，
+    # 浅色是下半段的暖米白 × 墨蓝字。金色只做装饰色条，不承担正文可读性；
+    # 交互蓝与三档状态色（赭红 / 琥珀 / 青绿）保持原有色相，语义不随主题变。
     LIGHT_PALETTE: ClassVar[dict] = {
-        "surface": "#F4F6F8",
-        "card": "#FFFFFF",
-        "border": "#DCE2E8",
-        "row_border": "#EDF1F5",
-        "head_bg": "#EDF2F6",
-        "title": "#1E293B",
-        "muted": "#64748B",
-        "faint": "#64748B",
-        "matured_bg": "#FAEFED",
+        "surface": "#F7F4EA",
+        "card": "#FFFDF7",
+        "border": "#DED7C2",
+        "row_border": "#ECE6D6",
+        "head_bg": "#EFEAD9",
+        "title": "#132B39",
+        "muted": "#4F6675",
+        "faint": "#4F6675",
+        "matured_bg": "#F7E9E4",
         "matured_fg": "#A34E42",
         "urgent_fg": "#805A24",
         "ok_fg": "#237451",
         "button": "#244A68",
         "button_fg": "#FFFFFF",
         "button_hot": "#193A54",
-        "rail_bg": "#F4F6F8",
-        "rail_fg": "#1E293B",
-        "metric_bg": "#FFFFFF",
-        "metric_border": "#DCE2E8",
+        "rail_bg": "#F7F4EA",
+        "rail_fg": "#132B39",
+        "metric_bg": "#FFFDF7",
+        "metric_border": "#DED7C2",
         "strip_principal": "#244A68",
-        "strip_interest": "#9AAEC2",
-        "strip_soon": "#B89A63",
+        "strip_interest": "#B9AE8F",
+        "strip_soon": "#C9A24C",
         "strip_matured": "#A34E42",
-        "row_bank_bg": "#E3EBF3",
-        "row_alt": "#F5F8FB",
+        "row_bank_bg": "#E8E9DC",
+        "row_alt": "#FBF8EF",
         "link": "#244A68",
     }
     DARK_PALETTE: ClassVar[dict] = {
-        "surface": "#111923",
-        "card": "#1B2735",
-        "border": "#334155",
-        "row_border": "#263548",
-        "head_bg": "#223143",
-        "title": "#E6EDF5",
-        "muted": "#9AAEC2",
-        "faint": "#9AAEC2",
-        "matured_bg": "#35272A",
+        "surface": "#0B1E2A",
+        "card": "#142C3A",
+        "border": "#2C4B59",
+        "row_border": "#22404E",
+        "head_bg": "#1B3644",
+        "title": "#E8F0F4",
+        "muted": "#A9BEC9",
+        "faint": "#A9BEC9",
+        "matured_bg": "#3A2628",
         "matured_fg": "#E4A094",
         "urgent_fg": "#D6B77F",
         "ok_fg": "#75C9AB",
         "button": "#75B5E8",
-        "button_fg": "#111923",
+        "button_fg": "#0B1E2A",
         "button_hot": "#9ACAF0",
-        "rail_bg": "#111923",
-        "rail_fg": "#E6EDF5",
-        "metric_bg": "#1B2735",
-        "metric_border": "#334155",
+        "rail_bg": "#0B1E2A",
+        "rail_fg": "#E8F0F4",
+        "metric_bg": "#142C3A",
+        "metric_border": "#2C4B59",
         "strip_principal": "#75B5E8",
         "strip_interest": "#59728B",
-        "strip_soon": "#C8AC78",
+        "strip_soon": "#D8A64A",
         "strip_matured": "#E4A094",
-        "row_bank_bg": "#293D53",
-        "row_alt": "#202E3E",
+        "row_bank_bg": "#1E3A48",
+        "row_alt": "#17303E",
         "link": "#75B5E8",
     }
 
@@ -228,9 +231,9 @@ class VaultWindow(_ToolWindow):
 
     # ---------- 整窗外壳 ----------
     def _build_shell(self):
-        # 在首次创建控件前设为深色，避免浅色首帧或局部颜色残留。
-        # 不改 panel._theme，其他窗口仍沿用各自主题。
-        self.dark = True
+        # 首次创建控件前默认浅色，不跟随系统或主面板，避免首帧残色。
+        # 子类可独立声明 DEFAULT_DARK；切换只影响本窗。
+        self.dark = getattr(type(self), "DEFAULT_DARK", False)
         super()._build_shell()
 
     def _surface_bg(self):
@@ -275,12 +278,117 @@ class VaultWindow(_ToolWindow):
         # Tk 回调里，表现为「窗口没出来」而不是一行能定位的堆栈。
         self._collapsed = set()          # 折叠起来的银行 id
         self._groups = []                # 渲染用的分组数据
-        self._data = vault_tools.summarize([], dt.date.today())
+        self._data = {}
+        self._privacy_visible = False
+        self._authenticating = False
+        self._auth_seen = bool(getattr(panel, "_vault_authenticated", False))
+        self._deposit_dialog = None
+        self._session_lock_monitor = None
         self._metric_widgets = {}        # 四张指标卡的控件（与 _data 分开！）
         self._load_error = ""
         self._today = None               # 测试注入的基准日
         self._last_deposit_bank_id = None  # 仅记住本窗口成功写入的银行
         super().__init__(panel)
+        self.win.bind("<Unmap>", self._on_unmap, add="+")
+        from .vault_auth import SessionLockMonitor
+        self._session_lock_monitor = SessionLockMonitor(self.win, self.lock_privacy)
+
+    def _can_edit(self):
+        return not self._closed
+
+    def _write_token(self):
+        self._sync_auth_revocation()
+        return getattr(self.panel, "_vault_write_generation", 0)
+
+    def _can_write(self, token):
+        return self._can_edit() and token == self._write_token()
+
+    def _sync_auth_revocation(self):
+        authenticated = bool(getattr(self.panel, "_vault_authenticated", False))
+        if self._auth_seen and not authenticated:
+            self.lock_privacy()
+        self._auth_seen = authenticated
+
+    def _can_access(self):
+        return (not self._closed and self._privacy_visible
+                and bool(getattr(self.panel, "_vault_authenticated", False)))
+
+    def _clear_sensitive_data(self):
+        self._groups = []
+        self._data = {}
+        self._collapsed.clear()
+        self._last_deposit_bank_id = None
+        self._load_error = ""
+
+    def _hide_privacy(self):
+        self._privacy_visible = False
+        self._clear_sensitive_data()
+        dialog = self._deposit_dialog
+        if dialog is not None:
+            self._deposit_dialog = None
+            if dialog.win.winfo_exists():
+                dialog._cancel()
+        from tkinter import simpledialog
+        for child in self.win.winfo_children():
+            if isinstance(child, simpledialog.Dialog):
+                child.cancel()
+        if not self._closed:
+            self._render()
+
+    def lock_privacy(self):
+        self.panel._vault_authenticated = False
+        self.panel._vault_write_generation = getattr(self.panel, "_vault_write_generation", 0) + 1
+        windows = [self, *getattr(self.panel, "_tool_windows", {}).values()]
+        for window in set(windows):
+            if isinstance(window, VaultWindow) and not window._closed:
+                window._auth_seen = False
+                window._hide_privacy()
+
+    def _toggle_privacy(self, _event=None):
+        if self._closed or self._authenticating:
+            return "break"
+        self._sync_auth_revocation()
+        if self._privacy_visible:
+            self._hide_privacy()
+            return "break"
+        token = self._write_token()
+        if not getattr(self.panel, "_vault_authenticated", False):
+            self._authenticating = True
+            try:
+                authenticated = self.panel._authenticate_vault(parent=self.win)
+            finally:
+                self._authenticating = False
+            if not authenticated or not getattr(self.panel, "_vault_authenticated", False):
+                return "break"
+        if self._can_write(token):
+            for window in [self, *getattr(self.panel, "_tool_windows", {}).values()]:
+                if isinstance(window, VaultWindow):
+                    window._auth_seen = True
+            self._privacy_visible = True
+            self._reload()
+        return "break"
+
+    def _minimize(self):
+        if self._closed:
+            return
+        self.lock_privacy()
+        self.win.update_idletasks()
+        super()._minimize()
+
+    def _on_unmap(self, event):
+        if (event.widget is self.win and not self._closed
+                and (self.win.state() == "iconic" or self.is_minimized())):
+            self.lock_privacy()
+
+    def summon(self):
+        if self._closed:
+            return False
+        self._sync_auth_revocation()
+        if not self._can_access():
+            self._privacy_visible = False
+            self._clear_sensitive_data()
+            self._render()
+        return super().summon()
 
     def _resize_corner_size(self):
         # 12px 方块会侵入从 8px 开始的顶栏，各盖掉一个 4×4px 角。
@@ -299,6 +407,30 @@ class VaultWindow(_ToolWindow):
             bg=self.P["head_bg"], fg=self.P["title"]))
         self._theme_button.bind("<Leave>", lambda _e: self._theme_button.configure(
             bg=self.P["rail_bg"], fg=self.P["rail_fg"]))
+
+        self._privacy_button = self.tk.Canvas(
+            rail, width=28, height=24, bg=self.P["rail_bg"],
+            bd=0, highlightthickness=1, highlightbackground=self.P["rail_bg"],
+            takefocus=1, cursor="hand2")
+        self._privacy_button.pack(side="right", padx=4)
+        for sequence in ("<Button-1>", "<space>", "<Return>"):
+            self._privacy_button.bind(sequence, self._toggle_privacy)
+        self._privacy_button.bind("<FocusIn>", lambda _e: self._privacy_button.configure(
+            highlightbackground=self.P["link"]))
+        self._privacy_button.bind("<FocusOut>", lambda _e: self._privacy_button.configure(
+            highlightbackground=self.P["rail_bg"]))
+        self._paint_privacy_eye()
+
+    def _paint_privacy_eye(self):
+        eye = self._privacy_button
+        eye.delete("all")
+        color = self.P["muted"]
+        eye.create_line(3, 12, 8, 6, 14, 4, 20, 6, 25, 12,
+                        20, 18, 14, 20, 8, 18, 3, 12,
+                        smooth=True, fill=color, width=1.5, tags="eye")
+        eye.create_oval(10, 8, 18, 16, outline=color, width=1.5, tags="eye")
+        if not self._can_access():
+            eye.create_line(4, 3, 24, 21, fill=color, width=2, tags="slash")
 
     def _toggle_theme(self):
         """仅重建本窗控件，不换 HWND、不修改系统主题、不改数据库。"""
@@ -338,6 +470,10 @@ class VaultWindow(_ToolWindow):
         在窗口里说清「读不到」并让用户能重试，而不是把异常抛进 Tk 的回调里
         变成一行控制台堆栈。
         """
+        if not self._can_access():
+            self._privacy_visible = False
+            self._clear_sensitive_data()
+            return
         try:
             banks = [dict(row) for row in self.db.list_vault_banks()]
             deposits = [dict(row) for row in self.db.list_vault_deposits()]
@@ -371,14 +507,7 @@ class VaultWindow(_ToolWindow):
                                      pady=(METRIC_GAP, 0))
 
     def _build_metrics(self, parent):
-        """四张指标卡，**2×2 网格**。
-
-        原来是**一行四张**（1180 宽的窗口里放得下）。窗口缩窄到 600 之后，
-        一行四张每张只剩约 130px，而「¥12,345,678」这种七位数就要 120px
-        （实测，``Microsoft YaHei UI`` 15pt bold），必然截断；副行那句
-        「资金加权年化 2.92%」更是要 100px，挤到换行。
-        改成 2×2 既解决宽度，也正好用掉抬高的那部分高度。
-        """
+        """本金、预计利息、已到期三张指标卡固定同一行，保留副行。"""
         tk = self.tk
         deck = tk.Frame(parent, bg=self._surface_bg())
         deck.rowconfigure(0, weight=0)
@@ -391,16 +520,15 @@ class VaultWindow(_ToolWindow):
         specs = (
             ("principal", "本金", "", "strip_principal"),
             ("interest", "预计利息", "", "strip_interest"),
-            ("soon", "90 天内到期", "warn", "strip_soon"),
             ("matured", "已到期", "danger", "strip_matured"),
         )
         for index, (key, label, kind, strip_key) in enumerate(specs):
-            row, column = divmod(index, 2)
+            row, column = 0, index
             deck.columnconfigure(column, weight=1, uniform="metric")
             # **已到期那张卡的底色再单独深一档**（淡红 ``matured_bg``）：四张里
             # 只有它承载「需要处理」的语义，与清单里那行已到期存单的底色同色，
             # 上下两处因此能对上。其余三张统一用 ``metric_bg``。
-            card_bg = (self.P["matured_bg"] if kind == "danger"
+            card_bg = (self.P["matured_bg"] if kind == "danger" and self._can_access()
                        else self.P["metric_bg"])
             # 卡片外框：底色 + 1px 统一描边。
             card = tk.Frame(deck, bg=card_bg, height=METRIC_HEIGHT,
@@ -408,7 +536,7 @@ class VaultWindow(_ToolWindow):
                             highlightbackground=self.P["metric_border"])
             card.grid(row=row, column=column, sticky="nsew",
                       padx=(0 if column == 0 else METRIC_GAP // 2,
-                            METRIC_GAP // 2 if column == 0 else 0),
+                            0 if column == 2 else METRIC_GAP // 2),
                       pady=(0 if row == 0 else METRIC_GAP // 2,
                             METRIC_GAP // 2 if row == 0 else 0))
             # **关掉尺寸传播**：卡片高度要固定（四张等宽等高的卡），而里面的
@@ -420,7 +548,8 @@ class VaultWindow(_ToolWindow):
             # 左侧 2px 色条区分四张卡；只有已到期卡另用状态底色。
             # 用 ``place`` 钉在左侧：``pack`` 会与文字抢水平空间，而色条必须
             # 贴住卡片左缘、高度铺满（含 1px 描边内的一圈）。
-            strip = tk.Frame(card, bg=self.P[strip_key], width=2)
+            strip = tk.Frame(card, bg=self.P[strip_key] if self._can_access()
+                             else self.P["border"], width=2)
             strip.place(x=1, y=1, relheight=1.0, height=-2)
 
             caption = self._caption(card, label, self.P["muted"])
@@ -429,9 +558,13 @@ class VaultWindow(_ToolWindow):
                              fg=self._metric_color(kind),
                              font=(self.panel.FONT_FAMILY, 15, "bold"),
                              anchor="w")
-            value.pack(anchor="w", padx=13, pady=(1, 0))
+            value.configure(width=1)
+            value.pack(fill="x", padx=13, pady=(1, 0))
             sub = self._caption(card, "", self.P["faint"], size=8)
-            sub.pack(anchor="w", padx=13)
+            sub.configure(width=1)
+            sub.pack(fill="x", padx=13)
+            value.bind("<Configure>", lambda e, w=value: self._fit_metric_label(w, 15, True))
+            sub.bind("<Configure>", lambda e, w=sub: self._fit_metric_label(w, 8))
             self._metric_widgets[key] = {"card": card, "value": value,
                                          "sub": sub, "kind": kind,
                                          "caption": caption, "strip": strip}
@@ -443,8 +576,29 @@ class VaultWindow(_ToolWindow):
             item["card"].configure(height=max(METRIC_HEIGHT, required))
         return deck
 
+    def _fit_metric_label(self, label, size, bold=False):
+        from tkinter import font as tkfont
+        available = max(1, label.winfo_width() - 4)
+        font = tkfont.Font(family=self.panel.FONT_FAMILY, size=size,
+                           weight="bold" if bold else "normal")
+        lines = label.cget("text").splitlines() or [""]
+        minimum = 8 if bold else 6
+        while size > minimum and max(font.measure(line) for line in lines) > available:
+            size -= 1
+            font.configure(size=size)
+        label.configure(font=font, wraplength=0)
+        # Tk 不保留 Python Font 对象引用，绑定到控件确保字体不被回收。
+        label._metric_font = font
+        if self._metric_widgets:
+            required = max(sum(item[key].winfo_reqheight() for key in ("caption", "value", "sub"))
+                           + 18 for item in self._metric_widgets.values())
+            for item in self._metric_widgets.values():
+                item["card"].configure(height=max(METRIC_HEIGHT, required))
+
     def _metric_color(self, kind):
         """本金与利息主值用 title；临近用金棕，已到期用赭红。"""
+        if not self._can_access():
+            return self.P["muted"]
         if kind == "danger":
             return self.P["matured_fg"]
         if kind == "warn":
@@ -459,8 +613,8 @@ class VaultWindow(_ToolWindow):
         tk = self.tk
         bar = tk.Frame(parent, bg=self._surface_bg())
         self._hint = self._caption(bar, "", self.P["muted"])
-        self._text_button(bar, "新增银行", self._add_bank)
-        self._primary_button(bar, "新增存单", self._add_deposit)
+        self._add_bank_button = self._text_button(bar, "新增银行", self._add_bank)
+        self._add_deposit_button = self._primary_button(bar, "新增存单", self._add_deposit)
         self._hint.configure(width=1)
         self._hint.pack(side="left", fill="x", expand=True)
         return bar
@@ -508,6 +662,8 @@ class VaultWindow(_ToolWindow):
         label_widget.pack()
 
         def press(_event):
+            if label_widget.cget("state") == "disabled":
+                return "break"
             box.configure(bg=C["button_hot"])
             label_widget.configure(bg=C["button_hot"])
             command()
@@ -727,6 +883,8 @@ class VaultWindow(_ToolWindow):
         return cells
 
     def _clear_table(self):
+        for row in range(self._table.grid_size()[1]):
+            self._table.rowconfigure(row, minsize=0)
         for child in self._table.winfo_children():
             child.destroy()
         # 列宽必须与表头**用同一套规则**配置，否则宽窗下两者分配方式不同、
@@ -761,8 +919,25 @@ class VaultWindow(_ToolWindow):
         重建换来的是「界面永远是数据的函数」——不会出现某处改了数据但忘了
         刷某个控件造成的界面与数据不一致，那类 bug 最难查。
         """
+        if not self._can_access():
+            self._privacy_visible = False
+            self._clear_sensitive_data()
         self._clear_table()
+        self._paint_privacy_eye()
+        state = "normal" if self._can_edit() else "disabled"
+        bank_button = self._add_bank_button.winfo_children()[0]
+        self._add_bank_button.configure(bg=self.P["link"])
+        bank_button.configure(state=state, bg=self._surface_bg(), fg=self.P["link"])
+        self._add_deposit_button.configure(bg=self.P["button"])
+        self._add_deposit_button.label_widget.configure(
+            state=state, bg=self.P["button"], fg=self.P["button_fg"])
         self._render_metrics()
+        if not self._can_access():
+            self._hint.configure(text="已隐藏", fg=self.P["muted"])
+            self._footnote.configure(text="已隐藏")
+            self._render_empty("内容已隐藏，点击顶部眼睛显示")
+            self._canvas.yview_moveto(0)
+            return
         self._render_footnote()
         if self._load_error:
             self._render_empty(self._load_error)
@@ -875,21 +1050,35 @@ class VaultWindow(_ToolWindow):
         「某处把数据写进了控件字典」这类错误不会有任何报错，只会静默不住。
         """
         m = self._metric_widgets
+        visible = self._can_access()
+        for key, item in m.items():
+            bg = self.P["matured_bg"] if visible and key == "matured" else self.P["metric_bg"]
+            item["card"].configure(bg=bg)
+            item["strip"].configure(bg=self.P[f"strip_{key}"] if visible else self.P["border"])
+            for name in ("caption", "value", "sub"):
+                item[name].configure(bg=bg)
+            item["value"].configure(fg=self._metric_color(item["kind"]))
+            if not visible:
+                item["value"].configure(text="******")
+                item["sub"].configure(text="已隐藏")
+        if not visible:
+            return
         data = self._data
         m["principal"]["value"].configure(
-            text=f"¥{vault_tools.format_amount(data['principal'])}")
+            text=f"¥{vault_tools.format_amount(data['unmatured_principal'])}")
         m["principal"]["sub"].configure(
-            text=f"本息 ¥{vault_tools.format_amount(data['total'])}")
+            text=f"未到期本息 ¥{vault_tools.format_amount(data['unmatured_total'])}")
         m["interest"]["value"].configure(
-            text=f"¥{vault_tools.format_amount(data['interest'])}")
+            text=f"¥{vault_tools.format_amount(data['unmatured_interest'])}")
         m["interest"]["sub"].configure(
-            text=f"资金加权年化 {vault_tools.format_rate(data['rate'])}")
-        m["soon"]["value"].configure(text=f"{data['soon_count']} 笔")
-        m["soon"]["sub"].configure(
-            text=f"本金 ¥{vault_tools.format_amount(data['soon_principal'])}")
-        m["matured"]["value"].configure(text=f"{data['matured_count']} 笔")
+            text=f"资金加权年化 {vault_tools.format_rate(data['unmatured_rate'])}")
+        m["matured"]["value"].configure(text=f"{data['expired_count']} 笔")
         m["matured"]["sub"].configure(
-            text=f"本息 ¥{vault_tools.format_amount(data['matured_total'])}")
+            text=(f"本金 ¥{vault_tools.format_amount(data['expired_principal'])} · "
+                  f"利息 ¥{vault_tools.format_amount(data['expired_interest'])}"))
+        for item in m.values():
+            self._fit_metric_label(item["value"], 15, True)
+            self._fit_metric_label(item["sub"], 8)
 
     def _render_hint(self):
         """操作条左侧那句说明：只报计数。
@@ -911,7 +1100,7 @@ class VaultWindow(_ToolWindow):
 
     # ---------- 动作 ----------
     def _toggle_collapse(self, bank_id):
-        if bank_id is None:
+        if not self._can_access() or bank_id is None:
             return
         if bank_id in self._collapsed:
             self._collapsed.discard(bank_id)
@@ -920,9 +1109,12 @@ class VaultWindow(_ToolWindow):
         self._render()
 
     def _add_bank(self):
+        if not self._can_edit():
+            return
+        token = self._write_token()
         from tkinter import simpledialog
         name = simpledialog.askstring("新增银行", "银行名称：", parent=self.win)
-        if not name or not name.strip():
+        if not self._can_write(token) or not name or not name.strip():
             return
         try:
             self.db.add_vault_bank(name.strip())
@@ -933,6 +1125,8 @@ class VaultWindow(_ToolWindow):
 
     def _remove_bank(self, bank_id):
         """删银行：**连它的存单一起删**，所以必须先问一句、并说清会删几张。"""
+        if not self._can_access():
+            return
         group = next((g for g in self._groups
                       if g["bank"]["id"] == bank_id), None)
         if group is None:
@@ -943,6 +1137,8 @@ class VaultWindow(_ToolWindow):
         if not messagebox.askyesno(
                 "删除银行", f"删除「{group['bank']['name']}」{detail}？\n"
                             "这个操作不能撤销。", parent=self.win):
+            return
+        if not self._can_access():
             return
         try:
             self.db.delete_vault_bank(bank_id)
@@ -964,16 +1160,34 @@ class VaultWindow(_ToolWindow):
         恒为 0——银行走 ``simpledialog.askstring``，它**自带模态循环**所以能存；
         存单走自建 ``Toplevel``，少了这一句就全部丢失。
         """
-        if not self._groups:
+        if not self._can_edit():
+            return
+        token = self._write_token()
+        # 闭眼时只为主动录入读取银行，不加载存单或主页面统计。
+        banks = None
+        if not self._privacy_visible:
+            try:
+                banks = [dict(row) for row in self.db.list_vault_banks()]
+            except Exception as exc:
+                self._fail("读取银行失败", exc)
+                return
+        if not self._can_write(token):
+            return
+        if not (banks if banks is not None else self._groups):
             from tkinter import messagebox
             messagebox.showinfo("新增存单", "先建一家银行，再把存单加进去。",
                                 parent=self.win)
             self._add_bank()
             return
-        dialog = _DepositDialog(self)
-        self.win.wait_window(dialog.win)
+        dialog = (_DepositDialog(self, banks=banks) if banks is not None
+                  else _DepositDialog(self))
+        self._deposit_dialog = dialog
+        try:
+            self.win.wait_window(dialog.win)
+        finally:
+            self._deposit_dialog = None
         data = dialog.result
-        if not data:
+        if not self._can_write(token) or not data:
             return
         try:
             self.db.add_vault_deposit(**data)
@@ -984,6 +1198,8 @@ class VaultWindow(_ToolWindow):
         self._reload()
 
     def _remove_deposit(self, deposit_id):
+        if not self._can_access():
+            return
         item = None
         for group in self._groups:
             for candidate in group["deposits"]:
@@ -995,6 +1211,8 @@ class VaultWindow(_ToolWindow):
         if not messagebox.askyesno(
                 "删除存单", f"删除「{item['name']}」？\n这个操作不能撤销。",
                 parent=self.win):
+            return
+        if not self._can_access():
             return
         try:
             self.db.delete_vault_deposit(deposit_id)
@@ -1011,7 +1229,8 @@ class VaultWindow(_ToolWindow):
         """把异常显示在操作条上。不弹模态框：这类错误多半是环境问题，
         模态框会挡住用户去看控制台里的堆栈。"""
         traceback.print_exc()
-        self._hint.configure(text=f"{prefix}：{exc}")
+        if self._can_access():
+            self._hint.configure(text=f"{prefix}：{exc}")
 
     # ---------- 基类契约 ----------
     def _initial_focus_target(self):
@@ -1021,8 +1240,8 @@ class VaultWindow(_ToolWindow):
 
     def _after_build(self):
         # 基类那个 30ms 的 ``_refresh`` 会在构造期跑一次；那个钩子在本类里
-        # 被覆写成空操作，所以这里主动加载一次并渲染。
-        self._reload()
+        # 被覆写成空操作，所以这里主动渲染；只有显式开眼才加载数据。
+        self._render()
 
     def _analyze(self, raw):
         """基类契约的实现。密匣没有「一段文本进、一段结果出」这条路径，
@@ -1044,6 +1263,12 @@ class VaultWindow(_ToolWindow):
         self._after_id = None
 
     def close(self):
+        if self._closed:
+            return
+        self.lock_privacy()
+        if self._session_lock_monitor is not None:
+            self._session_lock_monitor.close()
+            self._session_lock_monitor = None
         super().close()
 
 
@@ -1155,9 +1380,14 @@ class _DepositDialog:
         ("date", "到期日", "如：2027-03-15"),
     )
 
-    def __init__(self, window):
+    def __init__(self, window, banks=None):
+        # banks 是仅含银行字段的表单快照；省略时沿用已显示的主页面分组，
+        # 保留旧调用契约。对话框自身不读取数据库。
+        if banks is None:
+            banks = [group["bank"] for group in window._groups]
         import tkinter as tk
         self.window = window
+        self._write_session = window._write_token()
         self.result = None
         self.tk = tk
         # 对话框与主窗口共用 P，避免基类系统色混入浅深主题。
@@ -1183,10 +1413,8 @@ class _DepositDialog:
                  fg=P["muted"],
                  font=(window.panel.FONT_FAMILY, 9)).grid(
             row=row, column=0, sticky="w", pady=4, **pad)
-        self.bank_names = [g["bank"]["name"] for g in window._groups
-                           if g["bank"]["id"] is not None]
-        self.bank_ids = [g["bank"]["id"] for g in window._groups
-                         if g["bank"]["id"] is not None]
+        self.bank_names = [bank["name"] for bank in banks if bank["id"] is not None]
+        self.bank_ids = [bank["id"] for bank in banks if bank["id"] is not None]
         selected = getattr(window, "_last_deposit_bank_id", None)
         index = self.bank_ids.index(selected) if selected in self.bank_ids else 0
         self.bank_var = tk.StringVar(value=self.bank_names[index]
@@ -1198,7 +1426,13 @@ class _DepositDialog:
                          highlightthickness=0, bd=0, font=(
                              window.panel.FONT_FAMILY, 9))
         option.configure(highlightthickness=1, highlightbackground=P["border"],
-                         highlightcolor=P["link"], takefocus=1)
+                         highlightcolor=P["link"], takefocus=1,
+                         indicatoron=False, relief="flat", anchor="w", padx=12, pady=7)
+        self.bank_display = tk.StringVar(value=self.bank_var.get() + "    ▾")
+        option.configure(textvariable=self.bank_display)
+        self.bank_var.trace_add("write", lambda *_: self.bank_display.set(self.bank_var.get() + "    ▾"))
+        option.bind("<Enter>", lambda _e: option.configure(highlightbackground=P["link"]))
+        option.bind("<Leave>", lambda _e: option.configure(highlightbackground=P["border"]))
         option["menu"].configure(bg=P["card"], fg=P["title"],
                                  activebackground=P["head_bg"],
                                  activeforeground=P["title"])
@@ -1209,6 +1443,7 @@ class _DepositDialog:
         self.variables = {}
         self.field_hints = {}
         self.term_buttons = {}
+        self.name_buttons = {}
         fields = (*self.FIELDS[:4],
                   ("start", "起存日", "YYYY-MM-DD；默认今天，仅用于计算到期日"),
                   self.FIELDS[4])
@@ -1235,6 +1470,17 @@ class _DepositDialog:
             helper.grid(row=row, column=1, sticky="ew", pady=(3, 2), padx=(0, 24))
             self.field_hints[key] = helper
             row += 1
+            if key == "name":
+                names = tk.Frame(self.win, bg=bg)
+                names.grid(row=row, column=1, sticky="ew", padx=(0, 24), pady=4)
+                for index, years in enumerate((1, 2, 3, 5)):
+                    names.columnconfigure(index, weight=1, uniform="name_preset")
+                    button = self._button(names, f"{years}年期存款",
+                                          lambda y=years: self._select_name_preset(y))
+                    button.configure(padx=3, font=(window.panel.FONT_FAMILY, 8))
+                    button.grid(row=0, column=index, sticky="ew", padx=(0, 3))
+                    self.name_buttons[years] = button
+                row += 1
             if key == "term":
                 shortcuts = tk.Frame(self.win, bg=bg)
                 shortcuts.grid(row=row, column=1, sticky="w", padx=(0, 24), pady=4)
@@ -1290,7 +1536,7 @@ class _DepositDialog:
         self._error_field = None
         for key, variable in self.variables.items():
             variable.trace_add("write", lambda *_args, k=key: self._on_change(k))
-        self._tab_order = [self.bank_option, self.entries["name"], self.entries["amount"],
+        self._tab_order = [self.bank_option, self.entries["name"], *self.name_buttons.values(), self.entries["amount"],
                            self.entries["rate"], self.entries["term"],
                            *self.term_buttons.values(), self.entries["start"],
                            self.calculate_button, self.entries["date"],
@@ -1331,6 +1577,11 @@ class _DepositDialog:
         button.bind("<FocusOut>", lambda _e: button.configure(
             highlightbackground=P["border"]))
         return button
+
+    def _select_name_preset(self, years):
+        self.variables["name"].set(f"{years}年期存款")
+        self.variables["term"].set(str(years * 12))
+        self.entries["amount"].focus_set()
 
     def _tab_focus(self, index):
         self._tab_order[index % len(self._tab_order)].focus_set()
@@ -1401,6 +1652,9 @@ class _DepositDialog:
         return {key: variable.get() for key, variable in self.variables.items()}
 
     def _submit(self):
+        if not self.window._can_write(self._write_session):
+            self._cancel()
+            return
         values = self._values()
         try:
             bank_id = self.bank_ids[
@@ -1428,9 +1682,13 @@ class _DepositDialog:
             # 校验失败**不关对话框**：用户填了六个字段，关掉就得重填。
             self.error.configure(text=str(exc))
             return
+        if not self.window._can_write(self._write_session):
+            self._cancel()
+            return
         self.result = record
         self.win.destroy()
 
     def _cancel(self):
         self.result = None
-        self.win.destroy()
+        if self.win.winfo_exists():
+            self.win.destroy()

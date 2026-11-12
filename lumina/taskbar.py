@@ -52,6 +52,17 @@ SW_RESTORE = 9
 FRAME_FLAGS = WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
 
 
+def _show_window(hwnd, command):
+    """异步派发显隐消息，避免从 ctypes 调用栈同步重入 Tk。"""
+    user32 = ctypes.windll.user32
+    show = user32.ShowWindowAsync
+    show.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    show.restype = ctypes.c_bool
+    # ShowWindowAsync 返回是否成功投递，不是 ShowWindow 的原先可见状态。
+    # 必须让 Tk 事件循环处理消息；PyDLL 只保留 GIL，不能建立 ENTER_TCL。
+    return bool(show(ctypes.c_void_p(hwnd), command))
+
+
 def top_level_hwnd(window):
     """沿父链找到最外层窗口句柄；非 Windows 返回 ``None``。
 
@@ -150,7 +161,7 @@ def claim_taskbar(window):
 
 
 def show_window(window, activate=True):
-    """显示窗口（走 Win32，不经过 Tk 的映射流程）。
+    """投递显示请求（走 Win32，下一轮 Tk 事件循环生效）。
 
     Tk 的 ``deiconify()`` 会重新应用 ``overrideredirect`` 对应的扩展样式，把
     ``WS_EX_TOOLWINDOW`` 打回去；``ShowWindow`` 不碰样式，故窗口的样式与图标
@@ -176,16 +187,13 @@ def show_window(window, activate=True):
         return False
     try:
         user32 = ctypes.windll.user32
-        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        user32.ShowWindow.restype = ctypes.c_bool
         # 先判最小化：IsIconic 为真时 SW_SHOW 无效，必须 SW_RESTORE。
         user32.IsIconic.argtypes = [ctypes.c_void_p]
         user32.IsIconic.restype = ctypes.c_bool
         if user32.IsIconic(ctypes.c_void_p(hwnd)):
-            ok = user32.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
+            ok = _show_window(hwnd, SW_RESTORE)
         else:
-            ok = user32.ShowWindow(ctypes.c_void_p(hwnd),
-                                   SW_SHOW if activate else 8)  # 8 = SW_SHOWNA
+            ok = _show_window(hwnd, SW_SHOW if activate else 8)  # 8 = SW_SHOWNA
         # 显示后补一次归属：万一别处翻转过 overrideredirect，这里能兜住
         claim_taskbar(window)
         return bool(ok)
@@ -194,7 +202,7 @@ def show_window(window, activate=True):
 
 
 def hide_window(window):
-    """隐藏窗口（任务栏按钮随之消失）。
+    """投递隐藏请求（下一轮 Tk 事件循环中任务栏按钮随之消失）。
 
     注意这与「最小化」语义不同：``hide`` 是彻底不显示，``minimize_window``
     是留在任务栏供用户唤回。
@@ -203,16 +211,15 @@ def hide_window(window):
     if not hwnd:
         return False
     try:
-        user32 = ctypes.windll.user32
-        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        user32.ShowWindow.restype = ctypes.c_bool
-        return bool(user32.ShowWindow(ctypes.c_void_p(hwnd), SW_HIDE))
+        return _show_window(hwnd, SW_HIDE)
     except Exception:
         return False
 
 
 def minimize_window(window):
-    """最小化到任务栏，**不翻转 overrideredirect、不重建 HWND**。
+    """投递最小化请求，**不翻转 overrideredirect、不重建 HWND**。
+
+    返回是否成功投递；最小化状态在下一轮 Tk 事件循环更新。
 
     Tk 的 ``iconify()`` 对无边框窗口抛 ``TclError``，早先靠临时取消
     ``overrideredirect`` 绕过——但那会重建 HWND，新窗口带着 Tk 重设的
@@ -225,24 +232,18 @@ def minimize_window(window):
     if not hwnd:
         return False
     try:
-        user32 = ctypes.windll.user32
-        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        user32.ShowWindow.restype = ctypes.c_bool
-        return bool(user32.ShowWindow(ctypes.c_void_p(hwnd), SW_MINIMIZE))
+        return _show_window(hwnd, SW_MINIMIZE)
     except Exception:
         return False
 
 
 def restore_window(window):
-    """从最小化还原（``SW_RESTORE``），同样不碰 ``overrideredirect``。"""
+    """投递还原请求（``SW_RESTORE``），同样不碰 ``overrideredirect``。"""
     hwnd = top_level_hwnd(window)
     if not hwnd:
         return False
     try:
-        user32 = ctypes.windll.user32
-        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        user32.ShowWindow.restype = ctypes.c_bool
-        ok = user32.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
+        ok = _show_window(hwnd, SW_RESTORE)
         claim_taskbar(window)
         return bool(ok)
     except Exception:

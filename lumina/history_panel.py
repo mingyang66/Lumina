@@ -208,6 +208,7 @@ class HistoryPanel:
         self.db = ui.db
         self.tk = tk
         self._root = root
+        self._vault_authenticated = False
         self._dark = self._is_dark_mode()
         self._prev_hwnd = None
         self._rows = {}
@@ -1630,8 +1631,7 @@ class HistoryPanel:
             dr.ellipse([s * 0.46, s * 0.58, s * 0.54, s * 0.66], fill=c)
 
         if kind == "vault":
-            # 「隐域」下拉：隐秘数据记录的入口。目前只有「密匣」一项，
-            # 功能尚未实现——点了给一句明确提示，**不做成点了没反应**。
+            # 「隐域」下拉：密匣与记账使用独立窗口，共享临时认证。
             # 用 indigo 而不是 gray：这一组是「敏感数据」，与设置里的
             # 日常操作（刷新蓝 / 清理红）在配色上要能分开。
             lock_photo = sm_icon(lock_icon, 18, color_hex=self._sys("indigo"))
@@ -1640,7 +1640,9 @@ class HistoryPanel:
                 command=lambda: self._popup_action(self._open_vault_box),
                 **btn_kw)
             lock_button.image = lock_photo
-            lock_button.pack(fill="x", padx=4, pady=(4, 4))
+            lock_button.pack(fill="x", padx=4, pady=(4, 1))
+            tk.Button(frame, text="记账", command=lambda: self._popup_action(
+                self._open_ledger), **btn_kw).pack(fill="x", padx=4, pady=(1, 4))
         elif kind == "settings":
             refresh_photo = sm_icon(refresh_icon, 18, color_hex=self._sys("blue"))
             refresh_button = tk.Button(
@@ -1854,6 +1856,17 @@ class HistoryPanel:
         self._close_popup_menu()
         fn()
 
+    def _authenticate_vault(self, parent=None):
+        if getattr(self, "_vault_authenticated", False):
+            return True
+        from .vault_auth import authenticate_vault
+        generation = getattr(self, "_vault_write_generation", 0)
+        if (authenticate_vault(self, parent=parent)
+                and generation == getattr(self, "_vault_write_generation", 0)):
+            self._vault_authenticated = True
+            return True
+        return False
+
     def _open_vault_box(self):
         """「密匣」：隐秘数据记录。
 
@@ -1892,6 +1905,43 @@ class HistoryPanel:
             self.status_var.set("密匣打开失败，详情见控制台")
             return None
         registry["vault"] = window
+        self._watch_private_window(window)
+        return window
+
+    def _watch_private_window(self, window):
+        """在 Tk 线程同步共享认证撤销，包括另一隐域窗口关闭。"""
+        job = None
+        def poll():
+            nonlocal job
+            job = None
+            if window._closed or not window.win.winfo_exists():
+                return
+            window._sync_auth_revocation()
+            job = window.win.after(50, poll)
+
+        def cleanup(event):
+            if event.widget is window.win and job is not None:
+                window.win.after_cancel(job)
+
+        window.win.bind("<Destroy>", cleanup, add="+")
+        job = window.win.after(50, poll)
+
+    def _open_ledger(self):
+        from .ledger_window import LedgerWindow
+        registry = getattr(self, "_tool_windows", None)
+        if registry is None:
+            registry = self._tool_windows = {}
+        existing = registry.get("ledger")
+        if existing is not None and not existing._closed and existing.win.winfo_exists():
+            existing.summon()
+            return existing
+        try:
+            window = LedgerWindow(self)
+        except Exception:
+            traceback.print_exc()
+            self.status_var.set("记账打开失败，详情见控制台")
+            return None
+        registry["ledger"] = window
         return window
 
     def _open_tool_window(self, key):

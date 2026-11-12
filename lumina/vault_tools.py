@@ -310,9 +310,14 @@ def summarize(deposits, today):
     """
     principal = sum(float(field(i, "principal") or 0) for i in deposits)
     total_interest = sum(deposit_interest(i) for i in deposits)
-    soon, matured = [], []
+    soon, matured, unmatured, expired = [], [], [], []
     for item in deposits:
         left = days_left(field(item, "end_date"), today)
+        # 顶部资金卡含今日到期；明细状态仍使用既有 <=0 到期口径。
+        if left >= 0:
+            unmatured.append(item)
+        else:
+            expired.append(item)
         if left > 0 and left <= SOON_DAYS:
             soon.append(item)
         elif left <= 0:
@@ -325,6 +330,16 @@ def summarize(deposits, today):
         "count": len(deposits),
         "soon_count": len(soon),
         "soon_principal": sum(float(field(i, "principal") or 0) for i in soon),
+        "unmatured_principal": sum(float(field(i, "principal") or 0) for i in unmatured),
+        "unmatured_interest": sum(deposit_interest(i) for i in unmatured),
+        "unmatured_rate": weighted_rate(unmatured),
+        "expired_count": len(expired),
+        "expired_principal": sum(float(field(i, "principal") or 0) for i in expired),
+        "expired_interest": sum(deposit_interest(i) for i in expired),
+        "unmatured_total": sum(float(field(i, "principal") or 0) + deposit_interest(i)
+                               for i in unmatured),
+        "matured_principal": sum(float(field(i, "principal") or 0) for i in matured),
+        "matured_interest": sum(deposit_interest(i) for i in matured),
         "matured_count": len(matured),
         "matured_total": sum(
             float(field(i, "principal") or 0) + deposit_interest(i)

@@ -311,6 +311,23 @@ class WeightedRateTests(unittest.TestCase):
 
 
 class SummarizeTests(unittest.TestCase):
+    def test_unmatured_and_matured_money_split_at_today(self):
+        from lumina import vault_tools
+        import datetime as dt
+        rows = [dict(principal=1000, rate=2, months=12, end_date=end)
+                for end in ("2026-11-10", "2026-11-11", "2026-11-12")]
+        data = vault_tools.summarize(rows, dt.date(2026, 11, 11))
+        self.assertEqual(data["unmatured_principal"], 2000)
+        self.assertEqual(data["unmatured_interest"], 40)
+        self.assertEqual(data["unmatured_total"], 2040)
+        self.assertEqual(data["expired_principal"], 1000)
+        self.assertEqual(data["expired_interest"], 20)
+        self.assertEqual(data["expired_count"], 1)
+        self.assertEqual(data["matured_principal"], 2000)
+        self.assertEqual(data["matured_interest"], 40)
+        self.assertEqual(data["matured_total"], 2040)
+        self.assertEqual(data["principal"], 3000)
+
     """顶部四张指标卡。"""
 
     def setUp(self):

@@ -167,10 +167,15 @@ class FakePanel:
 
     def __init__(self, root, tk_mod, db):
         self.tk = tk_mod
+        self._vault_authenticated = True
         self.db = db
         self.ui = type("U", (), {"config": {}, "db": db})()
         self.win = tk_mod.Toplevel(root)
         self.win.withdraw()
+
+    def _authenticate_vault(self, parent=None):
+        self._vault_authenticated = True
+        return True
 
     def _theme(self):
         from lumina.history_panel import HistoryPanel
@@ -209,6 +214,7 @@ class VaultWindowTests(unittest.TestCase):
     # ---------- 夹具 ----------
     def make_window(self, rows=SAMPLE):
         window = VaultWindow(self.panel)
+        window._toggle_privacy()
         self.windows.append(window)
         window._today = TODAY
         if rows:
@@ -431,6 +437,7 @@ class VaultWindowTests(unittest.TestCase):
         """**没有存单的银行也要出现在清单里**。用户刚建完银行就该看到它；
         不显示的话他会以为建失败了，接着再建一次，得到重复记录。"""
         window = VaultWindow(self.panel)
+        window._toggle_privacy()
         self.windows.append(window)
         window._today = TODAY
         self.db.add_vault_bank("空银行")
@@ -523,35 +530,43 @@ class VaultWindowTests(unittest.TestCase):
                     f"{name} 的「{label}」{fg} 在 {bg} 上对比度只有 "
                     f"{ratio:.2f}（需 ≥4.5），这行字读不清")
 
-    def test_secondary_text_contrast_documents_confirmed_palette_limit(self):
-        """指定浅色灰在非白底约 4.22–4.39，不能误报为 AA 达标。"""
-        light = VaultWindow.LIGHT_PALETTE
-        for key in ("muted", "faint"):
-            for bg in ("surface", "head_bg", "matured_bg"):
-                ratio = _contrast(light[key], light[bg])
-                self.assertGreaterEqual(ratio, 4.2)
-                self.assertLess(ratio, 4.5)
-        dark = VaultWindow.DARK_PALETTE
-        for key in ("muted", "faint"):
-            for bg in ("surface", "head_bg", "metric_bg", "matured_bg"):
-                self.assertGreaterEqual(_contrast(dark[key], dark[bg]), 4.5)
+    def test_secondary_text_meets_aa_on_every_surface(self):
+        """换肤后次要文字全面达到 AA ≥4.5（旧雾白版只有 4.2–4.4，是已知短板）。
+
+        旧断言把「不达标」当成既定事实钉住；新配色的次要灰已调深，
+        所以这里反过来要求所有底色都达标，防止以后换肤又退回去。
+        """
+        for name, palette in (("LIGHT", VaultWindow.LIGHT_PALETTE),
+                              ("DARK", VaultWindow.DARK_PALETTE)):
+            for key in ("muted", "faint"):
+                for bg in ("surface", "head_bg", "metric_bg", "matured_bg", "row_bank_bg"):
+                    ratio = _contrast(palette[key], palette[bg])
+                    self.assertGreaterEqual(
+                        ratio, 4.5,
+                        f"{name} 的 {key} 在 {bg} 上只有 {ratio:.2f}（需 ≥4.5）")
 
     def test_metric_cards_have_a_colour_strip(self):
         """四张指标卡的左侧 2px 色条真实存在，且各自有可见的颜色区分。"""
         window = self.make_window()
-        strips = {}
-        for key, item in window._metric_widgets.items():
-            strip = item["strip"]
-            self.assertTrue(strip.winfo_exists(), f"{key} 卡没有色条")
-            self.assertEqual(
-                int(strip.cget("width")), 2,
-                f"{key} 的色条不是 2px")
-            strips[key] = str(strip.cget("bg")).upper()
-        self.assertEqual(
-            len(set(strips.values())), 4,
-            f"四张卡的色条应该四个颜色，实际 {strips}")
-        self.assertEqual(strips["principal"], "#75B5E8",
-                         "本金卡色条应使用确认的主蓝")
+        for dark in (False, True):
+            with self.subTest(dark=dark):
+                if window.dark != dark:
+                    window._toggle_theme()
+                self.root.update()
+                self.assertEqual(window.dark, dark)
+                strips = {}
+                for key, item in window._metric_widgets.items():
+                    strip = item["strip"]
+                    self.assertTrue(strip.winfo_exists(), f"{key} 卡没有色条")
+                    self.assertEqual(
+                        int(strip.cget("width")), 2,
+                        f"{key} 的色条不是 2px")
+                    strips[key] = str(strip.cget("bg")).upper()
+                self.assertEqual(
+                    len(set(strips.values())), 3,
+                    f"四张卡的色条应该四个颜色，实际 {strips}")
+                self.assertEqual(strips["principal"], "#75B5E8" if dark else "#244A68",
+                                 "本金卡色条应使用当前主题确认的主蓝")
 
     def test_matured_countdown_says_the_number(self):
         """倒计时直接写「已到期 8 天」，用户不用自己减日期。"""
@@ -572,6 +587,7 @@ class VaultWindowTests(unittest.TestCase):
         只有计算层测试失败，窗口层全绿——说明窗口层实际上没覆盖这个边界。
         """
         window = VaultWindow(self.panel)
+        window._toggle_privacy()
         self.windows.append(window)
         window._today = TODAY                       # 基准日 2026-11-05
         bank_id = self.db.add_vault_bank("当天到期行")
@@ -596,11 +612,11 @@ class VaultWindowTests(unittest.TestCase):
                          "当天到期应整行铺已到期底色")
         self.assertNotEqual(cells[1].cget("bg"), normal[1].cget("bg"))
 
-        # 指标卡：计入「已到期」，不计入「90 天内到期」。
+        # 顶部卡的新口径：今日到期不计入已到期，明细状态不变。
         self.assertEqual(
-            window._metric_widgets["matured"]["value"].cget("text"), "1 笔")
-        self.assertEqual(
-            window._metric_widgets["soon"]["value"].cget("text"), "0 笔")
+            window._metric_widgets["matured"]["value"].cget("text"), "0 笔")
+        self.assertNotIn("soon", window._metric_widgets)
+        self.assertEqual(window._data["soon_count"], 0)
 
     def test_urgent_but_not_matured_uses_a_third_colour(self):
         """临近到期（非已到期）不该和已到期同色，也不该和正常同色——
@@ -648,11 +664,13 @@ class VaultWindowTests(unittest.TestCase):
         window = self.make_window()
         m = window._metric_widgets
         # 本金 85 万；本息 906187.5 退到副行（「本金」卡的副行是「本息 ¥…」）。
-        self.assertEqual(m["principal"]["value"].cget("text"), "¥850,000")
-        self.assertIn("906,188", m["principal"]["sub"].cget("text"))
-        self.assertEqual(m["interest"]["value"].cget("text"), "¥56,188")
-        self.assertIn("2.92%", m["interest"]["sub"].cget("text"))
-        self.assertEqual(m["soon"]["value"].cget("text"), "2 笔")
+        self.assertEqual(m["principal"]["value"].cget("text"), "¥750,000")
+        self.assertIn("804,088", m["principal"]["sub"].cget("text"))
+        self.assertEqual(m["matured"]["sub"].cget("text"), "本金 ¥100,000 · 利息 ¥2,100")
+        self.assertEqual(m["interest"]["value"].cget("text"), "¥54,088")
+        self.assertIn("2.96%", m["interest"]["sub"].cget("text"))
+        self.assertNotIn("soon", m)
+        self.assertEqual(window._data["soon_count"], 2)
         self.assertEqual(m["matured"]["value"].cget("text"), "1 笔")
 
     def test_metrics_are_rounded_not_raw_floats(self):
@@ -701,7 +719,7 @@ class VaultWindowTests(unittest.TestCase):
         # 子控件是左侧色条（``place`` 进去的 Frame），它没有 ``-text`` 选项，
         # 按位置取会拿到它并抛 ``unknown option "-text"``。位置会随下一次改动
         # 再变，标题的位置也不会变——所以断言要钉在**语义明确的那个控件**上。
-        self.assertEqual(len(labels), 4, f"应有四张卡的标题，实际 {labels}")
+        self.assertEqual(labels, ["本金", "预计利息", "已到期"])
 
     # ---------- 折叠 ----------
     def test_collapse_hides_exactly_that_banks_deposits(self):
@@ -768,6 +786,7 @@ class VaultWindowTests(unittest.TestCase):
         """孤儿存单（``bank_id`` 指向不存在的银行）必须仍然渲染出来。
         数据在而看不见是最难排查的一类问题。"""
         window = VaultWindow(self.panel)
+        window._toggle_privacy()
         self.windows.append(window)
         window._today = TODAY
         self.db.add_vault_bank("招商银行")
@@ -786,6 +805,7 @@ class VaultWindowTests(unittest.TestCase):
         """孤儿分组**不给折叠箭头**：它的 bank_id 是 None，点上去只会落进
         早退分支，用户看到的是一个有箭头但点不动的行。"""
         window = VaultWindow(self.panel)
+        window._toggle_privacy()
         self.windows.append(window)
         window._today = TODAY
         self.db.add_vault_bank("招商银行")
@@ -882,6 +902,7 @@ class VaultWindowTests(unittest.TestCase):
         这里把 ``list_vault_banks`` 打坏，断言窗口仍然建得起来且给出了提示。
         """
         window = VaultWindow(self.panel)
+        window._toggle_privacy()
         self.windows.append(window)
         window._today = TODAY
 
@@ -939,6 +960,7 @@ class VaultLayoutTests(unittest.TestCase):
 
     def make_window(self, rows, width=None):
         window = VaultWindow(self.panel)
+        window._toggle_privacy()
         self.windows.append(window)
         window._today = TODAY
         banks = {}
@@ -1013,6 +1035,7 @@ class VaultLayoutTests(unittest.TestCase):
             db.init_schema()
             panel = FakePanel(self.root, tk, db)
             window = VaultWindow(panel)
+            window._toggle_privacy()
             self.windows.append(window)
             window._today = TODAY
             bank_id = db.add_vault_bank(rows[0][0])
@@ -1083,20 +1106,23 @@ class VaultLayoutTests(unittest.TestCase):
                                 "min_width 不该小于 width，否则用户拖窄后"
                                 "「删除」列会被顶出可视区")
 
-    def test_metrics_are_a_two_by_two_grid(self):
-        """四张指标卡必须排成 2×2。
-
-        原来是一行四张（1180px 窗口放得下）。缩窄后一行四张每张只剩约
-        130px，而 15pt 的「¥12,345,678」就要 120px，必然截断。
-        """
+    def test_metrics_are_three_cards_in_one_row(self):
+        """三卡固定一行，主副行在660/880宽度下完整可见。"""
         window = self.make_window(SAMPLE)
         grid = {key: (int(item["card"].grid_info()["row"]),
                       int(item["card"].grid_info()["column"]))
                 for key, item in window._metric_widgets.items()}
-        self.assertEqual(len({r for r, _c in grid.values()}), 2,
-                         f"指标卡应有 2 行，实际 {grid}")
-        self.assertEqual(len({c for _r, c in grid.values()}), 2,
-                         f"指标卡应有 2 列，实际 {grid}")
+        self.assertEqual(grid, {"principal": (0, 0), "interest": (0, 1), "matured": (0, 2)})
+        from tkinter import font as tkfont
+        for width in (660, 880):
+            window.win.geometry(f"{width}x900")
+            self.root.update()
+            for item in window._metric_widgets.values():
+                for key in ("value", "sub"):
+                    label = item[key]
+                    font = tkfont.Font(font=label.cget("font"))
+                    for line in label.cget("text").splitlines():
+                        self.assertLessEqual(font.measure(line), label.winfo_width() - 4)
 
     def test_metric_sub_line_has_visible_height(self):
         """指标卡的副行（「本息 ¥…」「资金加权年化 …」）必须有可见高度。
@@ -1154,6 +1180,7 @@ class VaultPaletteChromeTests(unittest.TestCase):
             panel._theme = lambda: (
                 {k: v[1] for k, v in _history_theme().items()}, True)
         window = VaultWindow(panel)
+        window._toggle_privacy()
         self.windows.append(window)
         if window.dark != dark:
             window._toggle_theme()
@@ -1168,22 +1195,36 @@ class VaultPaletteChromeTests(unittest.TestCase):
         self.root.update()
         return window
 
-    def test_new_window_defaults_to_dark_without_changing_panel(self):
-        before = self.panel._theme()
-        window = VaultWindow(self.panel)
-        self.windows.append(window)
-        self.root.update()
-        self.assertTrue(window.dark)
-        self.assertEqual(window.win.cget("bg"), VaultWindow.DARK_PALETTE["surface"])
-        self.assertEqual(window._theme_button.cget("text"), "切换浅色")
-        self.assertEqual(self.panel._theme(), before)
-        window._toggle_theme()
-        self.assertFalse(window.dark)
-        window.close()
-        reopened = VaultWindow(self.panel)
-        self.windows.append(reopened)
-        self.root.update()
-        self.assertTrue(reopened.dark)
+    def test_new_window_defaults_to_light_without_changing_panel(self):
+        """默认暖米白，且不受主面板浅深影响；关闭重开恢复默认。"""
+        for panel_dark in (False, True):
+            with self.subTest(panel_dark=panel_dark):
+                self.panel._theme = lambda: (
+                    {k: v[int(panel_dark)] for k, v in _history_theme().items()}, panel_dark)
+                before = self.panel._theme()
+                window = VaultWindow(self.panel)
+                self.windows.append(window)
+                self.root.update()
+                self.assertFalse(window.dark)
+                self.assertEqual(window.win.cget("bg"), VaultWindow.LIGHT_PALETTE["surface"])
+                self.assertEqual(window._theme_button.cget("text"), "切换深色")
+                self.assertFalse(window._privacy_visible)
+                self.assertEqual(self.panel._theme(), before)
+                window._toggle_theme()
+                self.assertTrue(window.dark)
+                self.assertEqual(window.win.cget("bg"), VaultWindow.DARK_PALETTE["surface"])
+                self.assertEqual(window._theme_button.cget("text"), "切换浅色")
+                self.assertEqual(self.panel._theme(), before)
+                window.close()
+                reopened = VaultWindow(self.panel)
+                self.windows.append(reopened)
+                self.root.update()
+                self.assertFalse(reopened.dark)
+                self.assertEqual(reopened.win.cget("bg"), VaultWindow.LIGHT_PALETTE["surface"])
+                self.assertEqual(reopened._theme_button.cget("text"), "切换深色")
+                self.assertFalse(reopened._privacy_visible)
+                self.assertEqual(self.panel._theme(), before)
+                reopened.close()
 
     def test_theme_button_roundtrip_preserves_window_and_data(self):
         window = self.make_window()
@@ -1281,7 +1322,7 @@ class VaultPaletteChromeTests(unittest.TestCase):
     def test_rail_and_title_share_surface_in_both_themes(self):
         for dark in (False, True):
             window = self.make_window(dark=dark)
-            expected = "#111923" if dark else "#F4F6F8"
+            expected = "#0B1E2A" if dark else "#F7F4EA"
             for widget in (window.title_label.master, window.title_label,
                            window._theme_button):
                 self.assertEqual(widget.cget("bg"), expected)
@@ -1428,7 +1469,7 @@ class VaultPaletteChromeTests(unittest.TestCase):
     def test_metric_and_table_borders_match_shell_border(self):
         for dark in (False, True):
             window = self.make_window(dark=dark)
-            border = "#334155" if dark else "#DCE2E8"
+            border = "#2C4B59" if dark else "#DED7C2"
             self.assertEqual(window._edge(), border)
             self.assertEqual(window.P["metric_border"], border)
             self.assertEqual(window._table_head.master.cget("highlightbackground"), border)
@@ -1452,6 +1493,522 @@ class VaultPaletteChromeTests(unittest.TestCase):
             # 基类使用 2 倍超采样，外缘会与 surface 混合少量像素。
             self.assertLessEqual(max(abs(actual - expected)
                                      for actual, expected in zip(map(int, rgb), _rgb(border))), 3)
+
+
+@unittest.skipUnless(TK_OK, SKIP_REASON)
+class VaultPrivacyTests(unittest.TestCase):
+    def setUp(self):
+        import types
+        from unittest.mock import Mock, patch
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.db = Database(":memory:")
+        self.db.init_schema()
+        self.panel = FakePanel(self.root, tk, self.db)
+        self.monitor = Mock()
+        self.monitor_factory = Mock(return_value=self.monitor)
+        module = types.ModuleType("lumina.vault_auth")
+        module.SessionLockMonitor = self.monitor_factory
+        self.monitor_patch = patch.dict(sys.modules, {"lumina.vault_auth": module})
+        self.monitor_patch.start()
+        self.windows = []
+        bank = self.db.add_vault_bank("隐私银行")
+        self.bank_id = bank
+        self.deposit_id = self.db.add_vault_deposit(
+            bank, "隐私存单", 456789, 3.21, 36, "2026-10-01")
+
+    def tearDown(self):
+        for window in self.windows:
+            window.close()
+        self.monitor_patch.stop()
+        self.db.close()
+        self.root.destroy()
+
+    def make_window(self, visible=False):
+        window = VaultWindow(self.panel)
+        self.windows.append(window)
+        window._today = TODAY
+        if visible:
+            window._toggle_privacy()
+        self.root.update()
+        return window
+
+    def assert_hidden(self, window):
+        self.assertFalse(window._privacy_visible)
+        self.assertEqual(window._groups, [])
+        self.assertEqual(window._data, {})
+        self.assertEqual(window._collapsed, set())
+        self.assertIsNone(window._last_deposit_bank_id)
+        rows = VaultWindowTests.grid_rows(window)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0].cget("text"), "内容已隐藏，点击顶部眼睛显示")
+        self.assertEqual(window._hint.cget("text"), "已隐藏")
+        self.assertEqual(window._footnote.cget("text"), "已隐藏")
+        self.assertTrue(window._privacy_button.find_withtag("slash"))
+        for item in window._metric_widgets.values():
+            self.assertEqual(item["value"].cget("text"), "******")
+            self.assertEqual(item["sub"].cget("text"), "已隐藏")
+            self.assertEqual(item["value"].cget("fg"), window.P["muted"])
+            self.assertEqual(item["card"].cget("bg"), window.P["metric_bg"])
+            self.assertEqual(item["strip"].cget("bg"), window.P["border"])
+        state = "normal" if not window._closed else "disabled"
+        self.assertEqual(window._add_bank_button.winfo_children()[0].cget("state"), state)
+        self.assertEqual(window._add_deposit_button.label_widget.cget("state"), state)
+
+    def test_authenticated_open_is_hidden_and_never_reads_database(self):
+        from unittest.mock import patch
+        with patch.object(self.db, "list_vault_banks") as banks, patch.object(
+                self.db, "list_vault_deposits") as deposits:
+            window = self.make_window()
+            window._load()
+            window._reload()
+            banks.assert_not_called()
+            deposits.assert_not_called()
+        self.assertTrue(self.panel._vault_authenticated)
+        self.assert_hidden(window)
+        self.monitor_factory.assert_called_once_with(window.win, window.lock_privacy)
+
+    def test_hide_clears_data_rows_tooltips_and_previous_row_geometry(self):
+        window = self.make_window(visible=True)
+        window._collapsed.add(self.bank_id)
+        window._last_deposit_bank_id = self.bank_id
+        window._toggle_privacy()
+        self.root.update()
+        self.assert_hidden(window)
+        for row in range(1, window._table.grid_size()[1]):
+            self.assertEqual(window._table.rowconfigure(row)["minsize"], 0)
+        self.db.add_vault_bank("第二家隐私银行")
+        window._reload()
+        self.assert_hidden(window)
+
+    def test_eye_canvas_mouse_space_and_enter_toggle(self):
+        window = self.make_window()
+        eye = window._privacy_button
+        self.assertIsInstance(eye, tk.Canvas)
+        self.assertEqual({eye.type(item) for item in eye.find_withtag("eye")},
+                         {"line", "oval"})
+        for sequence in ("<Button-1>", "<space>", "<Return>"):
+            eye.focus_force()
+            self.root.update()
+            eye.event_generate(sequence, when="now")
+            self.root.update()
+            self.assertTrue(window._privacy_visible)
+            self.assertFalse(eye.find_withtag("slash"))
+            self.assertEqual(window._metric_widgets["principal"]["value"].cget("text"),
+                             "¥0")  # 此用例存单已到期，不计入顶部本金
+            eye.event_generate(sequence, when="now")
+            self.root.update()
+            self.assert_hidden(window)
+
+    def test_show_requires_reauthentication_and_success_before_reading(self):
+        from unittest.mock import Mock, patch
+        window = self.make_window()
+        self.panel._vault_authenticated = False
+        self.panel._authenticate_vault = Mock(return_value=False)
+        with patch.object(self.db, "list_vault_banks", wraps=self.db.list_vault_banks) as read:
+            window._toggle_privacy()
+            self.panel._authenticate_vault.assert_called_once_with(parent=window.win)
+            read.assert_not_called()
+            window._render()  # 模拟认证标志撤销后的按钮状态刷新。
+            self.assert_hidden(window)
+            def authenticate(parent):
+                self.assertIs(parent, window.win)
+                read.assert_not_called()
+                self.panel._vault_authenticated = True
+                return True
+            self.panel._authenticate_vault.side_effect = authenticate
+            window._toggle_privacy()
+            read.assert_called_once()
+            self.assertTrue(window._privacy_visible)
+
+    def test_hidden_or_unauthenticated_deletes_do_not_prompt_or_write(self):
+        from unittest.mock import patch
+        window = self.make_window(visible=True)
+        before = [dict(row) for row in self.db.list_vault_deposits()]
+        for revoke in (False, True):
+            if revoke:
+                window._privacy_visible = True
+                self.panel._vault_authenticated = False
+            else:
+                window._toggle_privacy()
+            with patch("tkinter.simpledialog.askstring") as ask, patch(
+                    "tkinter.messagebox.askyesno") as confirm, patch(
+                    "lumina.vault_window._DepositDialog") as dialog:
+                window._remove_bank(self.bank_id)
+                window._remove_deposit(self.deposit_id)
+                window._toggle_collapse(self.bank_id)
+                ask.assert_not_called()
+                confirm.assert_not_called()
+                dialog.assert_not_called()
+        self.assertEqual([dict(row) for row in self.db.list_vault_deposits()], before)
+        self.assertEqual(len(self.db.list_vault_banks()), 1)
+
+    def test_hidden_add_bank_writes_without_reading_or_revealing_data(self):
+        from unittest.mock import patch
+        self.panel._vault_authenticated = False
+        window = self.make_window()
+        with patch("tkinter.simpledialog.askstring", return_value="  新增隐私银行  "), \
+                patch.object(self.db, "list_vault_banks") as banks, \
+                patch.object(self.db, "list_vault_deposits") as deposits:
+            window._add_bank()
+            banks.assert_not_called()
+            deposits.assert_not_called()
+        self.assertEqual([row["name"] for row in self.db.list_vault_banks()],
+                         ["隐私银行", "新增隐私银行"])
+        self.assert_hidden(window)
+
+    def test_hidden_add_bank_cancel_blank_and_write_error_leave_database_unchanged(self):
+        from unittest.mock import patch
+        window = self.make_window()
+        for name in (None, "", "   "):
+            with self.subTest(name=name), patch("tkinter.simpledialog.askstring", return_value=name):
+                window._add_bank()
+                self.assert_hidden(window)
+        with patch("tkinter.simpledialog.askstring", return_value="失败银行"), \
+                patch.object(self.db, "add_vault_bank", side_effect=RuntimeError("私密错误")), \
+                patch("lumina.vault_window.traceback.print_exc") as reported:
+            window._add_bank()
+            reported.assert_called_once()
+        self.assertEqual(len(self.db.list_vault_banks()), 1)
+        self.assert_hidden(window)
+
+    def _run_hidden_deposit_dialog(self, window, action):
+        from unittest.mock import patch
+
+        from lumina.vault_window import _DepositDialog
+        errors = []
+        dialogs = []
+
+        class AutomatedDialog(_DepositDialog):
+            def __init__(self, owner, banks=None):
+                super().__init__(owner, banks=banks)
+                dialogs.append(self)
+                self.win.after(0, self.run_action)
+
+            def run_action(dialog):
+                try:
+                    action(dialog)
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    if dialog.win.winfo_exists():
+                        dialog._cancel()
+
+        with patch("lumina.vault_window._DepositDialog", AutomatedDialog):
+            window._add_deposit()
+        if errors:
+            raise errors[0]
+        return dialogs[0]
+
+    @staticmethod
+    def _fill_hidden_deposit(dialog):
+        for key, value in {"name": "新增隐藏存单", "amount": "40万", "rate": "3.10",
+                           "term": "3年", "date": "2027-03-15"}.items():
+            dialog.variables[key].set(value)
+
+    def test_hidden_add_deposit_reads_only_banks_and_writes_without_revealing(self):
+        from unittest.mock import patch
+        self.panel._vault_authenticated = False
+        window = self.make_window()
+        def submit(dialog):
+            self.assert_hidden(window)
+            self.assertEqual(dialog.bank_names, ["隐私银行"])
+            self.assertEqual(dialog.bank_ids, [self.bank_id])
+            self._fill_hidden_deposit(dialog)
+            dialog._submit()
+        statements = []
+        self.db.conn.set_trace_callback(statements.append)
+        try:
+            with patch.object(self.db, "list_vault_banks", wraps=self.db.list_vault_banks) as banks, \
+                    patch.object(self.db, "list_vault_deposits") as deposits:
+                dialog = self._run_hidden_deposit_dialog(window, submit)
+                banks.assert_called_once_with()
+                deposits.assert_not_called()
+        finally:
+            self.db.conn.set_trace_callback(None)
+        reads = [sql.lower() for sql in statements if sql.lstrip().lower().startswith("select")]
+        self.assertTrue(any("vault_bank" in sql for sql in reads))
+        self.assertFalse(any("vault_deposit" in sql for sql in reads), reads)
+        self.assertIsNotNone(dialog.result)
+        rows = [dict(row) for row in self.db.list_vault_deposits()]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1]["name"], "新增隐藏存单")
+        self.assertEqual(rows[1]["principal"], 400000)
+        self.assertEqual(rows[1]["bank_id"], self.bank_id)
+        self.assert_hidden(window)
+
+    def test_hidden_deposit_cancel_and_invalid_fields_do_not_write(self):
+        window = self.make_window()
+        def invalid(dialog):
+            self._fill_hidden_deposit(dialog)
+            dialog.variables["amount"].set("错误金额")
+            dialog._submit()
+            self.assertTrue(dialog.win.winfo_exists())
+            self.assertIsNone(dialog.result)
+            self.assertEqual(dialog._error_field, "amount")
+        for action in (lambda dialog: dialog._cancel(), invalid):
+            with self.subTest(action=action):
+                self._run_hidden_deposit_dialog(window, action)
+                self.assertEqual(len(self.db.list_vault_deposits()), 1)
+                self.assert_hidden(window)
+
+    def test_hidden_deposit_read_and_write_errors_do_not_leak_or_write(self):
+        from unittest.mock import patch
+        window = self.make_window()
+        with patch.object(self.db, "list_vault_banks", side_effect=RuntimeError("私密银行")), \
+                patch("lumina.vault_window.traceback.print_exc"), \
+                patch("lumina.vault_window._DepositDialog") as factory:
+            window._add_deposit()
+            factory.assert_not_called()
+        def submit(dialog):
+            self._fill_hidden_deposit(dialog)
+            dialog._submit()
+        with patch.object(self.db, "add_vault_deposit", side_effect=RuntimeError("私密存单")), \
+                patch("lumina.vault_window.traceback.print_exc") as reported:
+            self._run_hidden_deposit_dialog(window, submit)
+            reported.assert_called_once()
+        self.assertEqual(len(self.db.list_vault_deposits()), 1)
+        self.assert_hidden(window)
+
+    def test_hidden_bank_prompt_rechecks_authentication_after_return(self):
+        from unittest.mock import patch
+        window = self.make_window()
+        for lock in (True, False):
+            self.panel._vault_authenticated = True
+            def revoke(*_args, **_kwargs):
+                if lock:
+                    window.lock_privacy()
+                else:
+                    self.panel._vault_authenticated = False
+                return "不得写入"
+            with self.subTest(lock=lock), patch("tkinter.simpledialog.askstring", side_effect=revoke):
+                window._add_bank()
+            self.assertEqual(len(self.db.list_vault_banks()), 1)
+            window._render()
+            self.assert_hidden(window)
+
+    def test_hidden_lock_cancels_real_deposit_dialog_and_prevents_write(self):
+        self.panel._vault_authenticated = False
+        window = self.make_window()
+        def lock(dialog):
+            self._fill_hidden_deposit(dialog)
+            self.assertIs(window._deposit_dialog, dialog)
+            window.lock_privacy()
+            self.assertFalse(dialog.win.winfo_exists())
+            self.assertIsNone(dialog.result)
+        self._run_hidden_deposit_dialog(window, lock)
+        self.assertIsNone(window._deposit_dialog)
+        self.assertEqual(len(self.db.list_vault_deposits()), 1)
+        self.assert_hidden(window)
+
+    def test_initial_unverified_submit_token_blocks_lock_even_after_reauthentication(self):
+        from unittest.mock import patch
+
+        from lumina import vault_tools
+        self.panel._vault_authenticated = False
+        window = self.make_window()
+        def validate(dialog):
+            self._fill_hidden_deposit(dialog)
+            original = vault_tools.build_deposit
+            def build(*args):
+                record = original(*args)
+                window.lock_privacy()
+                self.panel._vault_authenticated = True
+                return record
+            with patch.object(vault_tools, "build_deposit", side_effect=build):
+                dialog._submit()
+            self.assertIsNone(dialog.result)
+        self._run_hidden_deposit_dialog(window, validate)
+        self.assertEqual(len(self.db.list_vault_deposits()), 1)
+        self.panel._vault_authenticated = False
+        window._auth_seen = False
+        def after_submit(dialog):
+            self._fill_hidden_deposit(dialog)
+            dialog._submit()
+            self.assertIsNotNone(dialog.result)
+            window.lock_privacy()
+            self.panel._vault_authenticated = True
+        self._run_hidden_deposit_dialog(window, after_submit)
+        self.assertEqual(len(self.db.list_vault_deposits()), 1)
+
+    def test_hidden_deposit_submit_and_modal_return_recheck_authentication(self):
+        from unittest.mock import patch
+
+        from lumina import vault_tools
+        window = self.make_window()
+        def revoke_before_submit(dialog):
+            self._fill_hidden_deposit(dialog)
+            self.panel._vault_authenticated = False
+            dialog._submit()
+            self.assertIsNone(dialog.result)
+        def revoke_during_validation(dialog):
+            self._fill_hidden_deposit(dialog)
+            original = vault_tools.build_deposit
+            def build(*args):
+                record = original(*args)
+                self.panel._vault_authenticated = False
+                return record
+            with patch.object(vault_tools, "build_deposit", side_effect=build):
+                dialog._submit()
+            self.assertIsNone(dialog.result)
+        def revoke_after_submit(dialog):
+            self._fill_hidden_deposit(dialog)
+            dialog._submit()
+            self.assertIsNotNone(dialog.result)
+            self.panel._vault_authenticated = False
+        for action in (revoke_before_submit, revoke_during_validation, revoke_after_submit):
+            self.panel._vault_authenticated = True
+            self._run_hidden_deposit_dialog(window, action)
+            self.assertEqual(len(self.db.list_vault_deposits()), 1)
+            window._render()
+            self.assert_hidden(window)
+
+    def test_hidden_add_buttons_are_usable_and_restore_styles_in_both_themes(self):
+        from unittest.mock import patch
+        window = self.make_window()
+        for dark in (False, True, False):
+            if window.dark != dark:
+                window._toggle_theme()
+            self.root.update()
+            with self.subTest(dark=dark):
+                bank = window._add_bank_button.winfo_children()[0]
+                deposit = window._add_deposit_button.label_widget
+                with patch("tkinter.simpledialog.askstring", return_value=None) as ask:
+                    bank.invoke()
+                    ask.assert_called_once()
+                with patch.object(self.db, "list_vault_banks", wraps=self.db.list_vault_banks) as banks:
+                    window.win.after(0, lambda: window._deposit_dialog._cancel())
+                    deposit.event_generate("<ButtonPress-1>", when="now")
+                    deposit.event_generate("<ButtonRelease-1>", when="now")
+                    banks.assert_called_once()
+                window._render()
+                self.assertEqual(bank.cget("bg"), window.P["surface"])
+                self.assertEqual(bank.cget("fg"), window.P["link"])
+                self.assertEqual(window._add_bank_button.cget("bg"), window.P["link"])
+                self.assertEqual(deposit.cget("bg"), window.P["button"])
+                self.assertEqual(deposit.cget("fg"), window.P["button_fg"])
+                self.assertEqual(window._add_deposit_button.cget("bg"), window.P["button"])
+                self.assert_hidden(window)
+
+    def test_lock_during_bank_prompt_or_delete_confirmation_prevents_writes(self):
+        from unittest.mock import patch
+        window = self.make_window(visible=True)
+        def lock_and_return(*_args, **_kwargs):
+            window.lock_privacy()
+            return "锁屏时输入的银行"
+        with patch("tkinter.simpledialog.askstring", side_effect=lock_and_return):
+            window._add_bank()
+        self.assertEqual(len(self.db.list_vault_banks()), 1)
+        for action, identifier in ((window._remove_bank, self.bank_id),
+                                   (window._remove_deposit, self.deposit_id)):
+            window._toggle_privacy()
+            with patch("tkinter.messagebox.askyesno", side_effect=lock_and_return):
+                action(identifier)
+            self.assertEqual(len(self.db.list_vault_deposits()), 1)
+            self.assert_hidden(window)
+
+    def test_lock_during_deposit_modal_wait_prevents_write(self):
+        from unittest.mock import Mock, patch
+        window = self.make_window(visible=True)
+        dialog = Mock()
+        dialog.result = {"bank_id": self.bank_id, "name": "不应写入"}
+        with patch("lumina.vault_window._DepositDialog", return_value=dialog), patch.object(
+                window.win, "wait_window", side_effect=lambda _win: window.lock_privacy()), patch.object(
+                self.db, "add_vault_deposit") as write:
+            window._add_deposit()
+            write.assert_not_called()
+            dialog._cancel.assert_called_once()
+        self.assert_hidden(window)
+
+    def test_deposit_submit_rechecks_authentication(self):
+        from lumina.vault_window import _DepositDialog
+        window = self.make_window(visible=True)
+        dialog = _DepositDialog(window)
+        self.panel._vault_authenticated = False
+        dialog._submit()
+        self.assertIsNone(dialog.result)
+        self.assertFalse(dialog.win.winfo_exists())
+        self.assertEqual(len(self.db.list_vault_deposits()), 1)
+
+    def test_minimize_locks_before_base_and_summon_stays_hidden(self):
+        from unittest.mock import patch
+
+        from lumina.tool_window import _ToolWindow
+        window = self.make_window(visible=True)
+        def minimized(_window):
+            self.assertFalse(self.panel._vault_authenticated)
+            self.assert_hidden(window)
+        with patch.object(_ToolWindow, "_minimize", autospec=True, side_effect=minimized):
+            window._minimize()
+        with patch.object(self.db, "list_vault_banks") as read:
+            window.summon()
+            read.assert_not_called()
+        self.assert_hidden(window)
+
+    def test_summon_preserves_fresh_entry_authentication(self):
+        from unittest.mock import patch
+
+        from lumina.tool_window import _ToolWindow
+        window = self.make_window(visible=True)
+        window.lock_privacy()
+        self.panel._vault_authenticated = True  # 入口刚重新登录
+        with patch.object(window, "is_minimized", return_value=True), \
+                patch.object(_ToolWindow, "summon", return_value=True), \
+                patch.object(self.db, "list_vault_banks") as read:
+            window.summon()
+            read.assert_not_called()
+        self.assertTrue(self.panel._vault_authenticated)
+        self.assert_hidden(window)
+        window._toggle_privacy()
+        self.assertTrue(window._can_access())
+
+    def test_system_unmap_only_locks_iconic_toplevel(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        window = self.make_window(visible=True)
+        self.assertTrue(window.win.bind("<Unmap>"))
+        with patch.object(window.win, "state", return_value="iconic"):
+            window._on_unmap(SimpleNamespace(widget=window._privacy_button))
+            self.assertTrue(window._privacy_visible)
+            window._on_unmap(SimpleNamespace(widget=window.win))
+        self.assertFalse(self.panel._vault_authenticated)
+        self.assert_hidden(window)
+
+    def test_close_unregisters_monitor_and_reopen_remains_hidden(self):
+        window = self.make_window(visible=True)
+        window.close()
+        window.close()
+        self.monitor.close.assert_called_once()
+        self.assertFalse(self.panel._vault_authenticated)
+        self.assertEqual(window._data, {})
+        self.assertEqual(window._groups, [])
+        self.panel._authenticate_vault(parent=self.panel.win)
+        reopened = self.make_window()
+        self.assert_hidden(reopened)
+
+    def test_theme_changes_never_read_and_preserve_privacy_state(self):
+        from unittest.mock import patch
+        window = self.make_window(visible=True)
+        data = window._data.copy()
+        with patch.object(self.db, "list_vault_banks") as read:
+            window._toggle_theme()
+            self.assertTrue(window._privacy_visible)
+            self.assertEqual(window._data, data)
+            window._toggle_privacy()
+            for _ in range(2):
+                window._toggle_theme()
+                self.assert_hidden(window)
+            read.assert_not_called()
+
+    def test_revoked_authentication_cannot_reload_or_render_cached_data(self):
+        from unittest.mock import patch
+        window = self.make_window(visible=True)
+        self.panel._vault_authenticated = False
+        with patch.object(self.db, "list_vault_banks") as read:
+            window._reload()
+            window._toggle_theme()
+            read.assert_not_called()
+        self.assert_hidden(window)
 
 
 def _history_theme():
@@ -1541,6 +2098,7 @@ class DepositDialogTests(unittest.TestCase):
     def _dialog(self):
         from lumina.vault_window import _DepositDialog
         window = VaultWindow(self.panel)
+        window._toggle_privacy()
         self.windows.append(window)
         window._today = TODAY
         self.db.add_vault_bank("招商银行")
@@ -1548,16 +2106,33 @@ class DepositDialogTests(unittest.TestCase):
         self.root.update()
         return window, _DepositDialog(window)
 
+    def test_bank_flat_selector_and_name_presets(self):
+        window, dialog = self._dialog()
+        self.root.update()
+        self.assertFalse(int(dialog.bank_option.cget("indicatoron")))
+        self.assertEqual(dialog.bank_option.cget("relief"), "flat")
+        self.assertEqual(set(dialog.name_buttons), {1, 2, 3, 5})
+        for years, button in dialog.name_buttons.items():
+            button.event_generate("<Button-1>")
+            self.root.update()
+            self.assertEqual(dialog.variables["name"].get(), f"{years}年期存款")
+            self.assertEqual(dialog.variables["term"].get(), str(years * 12))
+            self.assertGreater(button.winfo_rooty(), dialog.entries["name"].winfo_rooty())
+            self.assertLessEqual(button.winfo_x() + button.winfo_width(), button.master.winfo_width())
+        dialog._cancel()
+
     def test_dialog_colours_and_tooltip_follow_both_themes(self):
         """实际构造对话框与提示气泡，检查普通交互不借用状态底色。"""
         from lumina.vault_window import _DepositDialog
         for dark in (False, True):
             window = VaultWindow(self.panel)
+            window._toggle_privacy()
             self.windows.append(window)
             self.db.add_vault_bank("测试银行")
             window._reload()
-            if dark:
+            if window.dark != dark:
                 window._toggle_theme()
+            self.assertEqual(window.dark, dark)
             dialog = _DepositDialog(window)
             self.root.update()
             P = window.P
@@ -1740,6 +2315,8 @@ class DepositDialogTests(unittest.TestCase):
         from lumina.vault_window import _DepositDialog
         second = _DepositDialog(_window)
         second.win.update()
+        second.entries["amount"].focus_force()
+        self.root.update()
         second.entries["amount"].event_generate("<Escape>", when="now")
         self.root.update()
         self.assertIsNone(second.result)
@@ -1789,6 +2366,7 @@ class DepositWritePathTests(unittest.TestCase):
 
     def _window(self):
         window = VaultWindow(self.panel)
+        window._toggle_privacy()
         self.windows.append(window)
         window._today = TODAY
         window._reload()

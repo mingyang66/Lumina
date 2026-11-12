@@ -1,10 +1,27 @@
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import sys
 import threading
 import uuid
+from contextlib import closing
+from datetime import datetime
+
+LEDGER_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS ledger_entry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK(kind IN ('expense','income','transfer','refund')),
+    amount_cents INTEGER NOT NULL CHECK(typeof(amount_cents)='integer'
+        AND amount_cents > 0 AND amount_cents <= 99999999999),
+    category TEXT NOT NULL CHECK(length(trim(category)) > 0),
+    account TEXT NOT NULL CHECK(length(trim(account)) > 0),
+    entry_date TEXT NOT NULL CHECK(entry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+"""
 
 FILE_STORE_DIR = "file_store"
 FILE_STORE_THRESHOLD = 10 * 1024 * 1024  # 10 MiB
@@ -121,8 +138,86 @@ class Database:
             self._local.conn = conn
         return conn
 
+    @staticmethod
+    def _schema_statements(schema):
+        statement = ''
+        for line in schema.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                yield statement
+                statement = ''
+        if statement.strip():
+            yield statement
+
+    def _migrate_ledger_schema(self):
+        conn = self.conn
+        removed = {'to_account', 'refund_of'}
+        columns = {row['name'] for row in conn.execute('PRAGMA table_info(ledger_entry)')}
+        if not columns & removed:
+            return
+        if conn.in_transaction:
+            raise RuntimeError('记账迁移须在无活动事务时初始化')
+        if self.path != ':memory:':
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            backup_path = self.path + '.ledger_schema_backup_' + stamp + '.sqlite3'
+            # backup 包含已提交的 WAL 数据，不能直接复制主文件。
+            with open(backup_path, 'xb'):
+                pass
+            with closing(sqlite3.connect(backup_path)) as backup:
+                conn.backup(backup)
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            columns = {row['name'] for row in conn.execute('PRAGMA table_info(ledger_entry)')}
+            if columns & removed:
+                indexes = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' "
+                    "AND tbl_name='ledger_entry' AND sql IS NOT NULL").fetchall()
+                triggers = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                    "AND tbl_name='ledger_entry'").fetchall()
+                sequence = conn.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name='ledger_entry'").fetchone()
+                conn.execute(LEDGER_TABLE_SQL.replace('ledger_entry', 'ledger_entry_migration', 1))
+                from .ledger_tools import RECORD_FIELDS
+                fields = ', '.join(('id', *RECORD_FIELDS, 'created_at'))
+                conn.execute(f'INSERT INTO ledger_entry_migration ({fields}) '
+                             f'SELECT {fields} FROM ledger_entry')
+                conn.execute('DROP TABLE ledger_entry')
+                conn.execute('ALTER TABLE ledger_entry_migration RENAME TO ledger_entry')
+                for row in indexes:
+                    if not re.search(r'\b(?:to_account|refund_of)\b', row['sql'], re.I):
+                        conn.execute(row['sql'])
+                for row in triggers:
+                    conn.execute(row['sql'])
+                if sequence is not None:
+                    current = conn.execute(
+                        "SELECT seq FROM sqlite_sequence WHERE name='ledger_entry'").fetchone()
+                    if current is None:
+                        conn.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('ledger_entry', ?)",
+                                     (sequence['seq'],))
+                    else:
+                        conn.execute("UPDATE sqlite_sequence SET seq=max(seq, ?) "
+                                     "WHERE name='ledger_entry'", (sequence['seq'],))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     def init_schema(self):
-        self.conn.executescript(self._load_schema())
+        schema = self._load_schema()
+        self._migrate_ledger_schema()
+        statements = []
+        for statement in self._schema_statements(schema):
+            sql = re.sub(r'--[^\n]*', '', statement).strip()
+            if re.match(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?ledger_entry\s*\(', sql, re.I):
+                statements.append(LEDGER_TABLE_SQL)
+            elif (re.match(r'CREATE\s+(?:UNIQUE\s+)?INDEX\b', sql, re.I)
+                  and re.search(r'\bON\s+ledger_entry\b', sql, re.I)
+                  and re.search(r'\b(?:to_account|refund_of)\b', sql, re.I)):
+                continue
+            else:
+                statements.append(statement)
+        self.conn.executescript('\n'.join(statements))
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_clipboard_pinned ON clipboard(pinned)")
         self.conn.execute(
@@ -532,6 +627,100 @@ class Database:
             cur = self.conn.execute(
                 "DELETE FROM vault_deposit WHERE id=?", (deposit_id,))
         return cur.rowcount > 0
+
+    # ---------- 独立记账 ----------
+
+    def add_ledger_entry(self, **record):
+        from .ledger_tools import RECORD_FIELDS, _validate_record
+        record = _validate_record(record)
+        conn = self.conn
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            cur = conn.execute(
+                'INSERT INTO ledger_entry (' + ', '.join(RECORD_FIELDS) + ') '
+                'VALUES (' + ', '.join('?' for _ in RECORD_FIELDS) + ')',
+                tuple(record[field] for field in RECORD_FIELDS))
+            conn.commit()
+            return cur.lastrowid
+        except Exception:
+            conn.rollback()
+            raise
+
+    def update_ledger_entry(self, entry_id, **record):
+        from .ledger_tools import RECORD_FIELDS, _validate_record
+        conn = self.conn
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            original = self.get_ledger_entry(entry_id)
+            if original is None:
+                raise ValueError('记账记录不存在')
+            merged = {field: original[field] for field in RECORD_FIELDS}
+            merged.update(record)
+            merged = _validate_record(merged)
+            conn.execute(
+                'UPDATE ledger_entry SET ' + ', '.join(field + '=?' for field in RECORD_FIELDS)
+                + ' WHERE id=?', (*[merged[field] for field in RECORD_FIELDS], entry_id))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+    def delete_ledger_entry(self, entry_id):
+        conn = self.conn
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            cur = conn.execute('DELETE FROM ledger_entry WHERE id=?', (entry_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        except Exception:
+            conn.rollback()
+            raise
+
+    def get_ledger_entry(self, id):
+        return self.conn.execute('SELECT * FROM ledger_entry WHERE id=?', (id,)).fetchone()
+
+    def list_ledger_entries(self, start, end, kind=None, category=None, query=''):
+        from .ledger_tools import _date
+        _date(start)
+        _date(end)
+        if start > end:
+            raise ValueError('开始日期不能晚于结束日期')
+        clauses = ['entry_date>=?', 'entry_date<=?']
+        params = [start, end]
+        for column, value in (('kind', kind), ('category', category)):
+            if value is not None:
+                clauses.append(column + '=?')
+                params.append(value)
+        if not isinstance(query, str):
+            raise ValueError('搜索词须为文本')
+        query = query.strip()
+        if query:
+            # instr 实现字面子串搜索，百分号及下划线不是通配符。
+            clauses.append('(instr(lower(note),lower(?))>0 OR '
+                           'instr(lower(category),lower(?))>0 OR '
+                           'instr(lower(account),lower(?))>0)')
+            params.extend([query] * 3)
+        return self.conn.execute(
+            'SELECT * FROM ledger_entry WHERE ' + ' AND '.join(clauses)
+            + ' ORDER BY entry_date DESC, id DESC', params).fetchall()
+
+    def list_ledger_accounts(self):
+        rows = self.conn.execute(
+            "SELECT DISTINCT account AS name FROM ledger_entry ORDER BY name").fetchall()
+        return list(dict.fromkeys(['现金', '银行卡'] + [row['name'] for row in rows]))
+
+    def list_ledger_categories(self, kind=None):
+        from .ledger_tools import DEFAULT_CATEGORIES
+        if kind is not None and kind not in DEFAULT_CATEGORIES:
+            raise ValueError('无效的记账类型')
+        defaults = (DEFAULT_CATEGORIES[kind] if kind else
+                    [category for values in DEFAULT_CATEGORIES.values() for category in values])
+        rows = self.conn.execute(
+            'SELECT DISTINCT category FROM ledger_entry'
+            + (' WHERE kind=?' if kind is not None else '') + ' ORDER BY category',
+            (kind,) if kind is not None else ()).fetchall()
+        return list(dict.fromkeys(defaults + [row['category'] for row in rows]))
 
     def stats(self):
         rows = self.conn.execute(
