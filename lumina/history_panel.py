@@ -1630,6 +1630,18 @@ class HistoryPanel:
             # 锁孔
             dr.ellipse([s * 0.46, s * 0.58, s * 0.54, s * 0.66], fill=c)
 
+        def ledger_icon(dr, s, c, w):
+            """线框账本：装订边与账目横线，和密匣锁图标配套。"""
+            w = int(round(w))
+            dr.rounded_rectangle(
+                [s * 0.22, s * 0.12, s * 0.78, s * 0.88],
+                radius=s * 0.06, outline=c, width=w)
+            dr.line([(s * 0.38, s * 0.14), (s * 0.38, s * 0.86)],
+                    fill=c, width=w)
+            for y in (0.36, 0.52, 0.68):
+                dr.line([(s * 0.48, s * y), (s * 0.68, s * y)],
+                        fill=c, width=w)
+
         if kind == "vault":
             # 「隐域」下拉：密匣与记账使用独立窗口，共享临时认证。
             # 用 indigo 而不是 gray：这一组是「敏感数据」，与设置里的
@@ -1641,8 +1653,12 @@ class HistoryPanel:
                 **btn_kw)
             lock_button.image = lock_photo
             lock_button.pack(fill="x", padx=4, pady=(4, 1))
-            tk.Button(frame, text="记账", command=lambda: self._popup_action(
-                self._open_ledger), **btn_kw).pack(fill="x", padx=4, pady=(1, 4))
+            ledger_photo = sm_icon(ledger_icon, 18, color_hex=self._sys("indigo"))
+            ledger_button = tk.Button(
+                frame, text="记账", image=ledger_photo, compound="right",
+                command=lambda: self._popup_action(self._open_ledger), **btn_kw)
+            ledger_button.image = ledger_photo
+            ledger_button.pack(fill="x", padx=4, pady=(1, 4))
         elif kind == "settings":
             refresh_photo = sm_icon(refresh_icon, 18, color_hex=self._sys("blue"))
             refresh_button = tk.Button(

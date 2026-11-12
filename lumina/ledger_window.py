@@ -130,22 +130,27 @@ class LedgerWindow(VaultWindow):
         period = tk.Frame(body, bg=self.P["surface"])
         period.grid(row=0, column=0, sticky="ew", pady=(4, 10))
         period.columnconfigure(1, weight=1)
-        modes = tk.Frame(period, bg=self.P["surface"])
+        modes = tk.Frame(period, bg=self.P["head_bg"], highlightthickness=1,
+                         highlightbackground=self.P["border"], highlightcolor=self.P["border"])
         modes.grid(row=0, column=0, sticky="w")
         self.mode_buttons = {}
         for mode, text in (("month", "月"), ("year", "年")):
             button = self._button(modes, text, lambda m=mode: self._set_mode(m))
-            button.pack(side="left")
+            button.configure(padx=12, pady=5, highlightthickness=0)
+            button.pack(side="left", padx=1, pady=1)
             self.mode_buttons[mode] = button
         navigation = tk.Frame(period, bg=self.P["surface"])
         navigation.grid(row=0, column=1)
         self.previous_button = self._button(navigation, "‹", lambda: self._move_period(-1))
+        self.previous_button.configure(padx=7)
         self.previous_button.pack(side="left")
-        self.period_label = self._caption(navigation, "")
-        self.period_label.pack(side="left", padx=8)
+        self.period_label = self._caption(navigation, "", size=11)
+        self.period_label.configure(font=(self.panel.FONT_FAMILY, 11, "bold"))
+        self.period_label.pack(side="left", padx=10)
         self.next_button = self._button(navigation, "›", lambda: self._move_period(1))
+        self.next_button.configure(padx=7)
         self.next_button.pack(side="left")
-        self.current_button = self._button(period, "本月", self._current_period)
+        self.current_button = self._button(period, "回到本月", self._current_period)
         self.current_button.grid(row=0, column=2, sticky="e")
         self.footer = tk.Frame(body, bg=self.P["surface"])
         self.footer.grid(row=5, column=0, sticky="ew", pady=(8, 0))
@@ -353,11 +358,20 @@ class LedgerWindow(VaultWindow):
         self._paint_privacy_eye()
         period_title = f"{self.year}年" + (f"{self.month}月" if self.mode == "month" else "")
         self.period_label.configure(text=period_title)
-        self.current_button.configure(text="本月" if self.mode == "month" else "本年")
-        for buttons, selected in ((self.mode_buttons, self.mode), (self.tab_buttons, self.tab)):
-            for key, button in buttons.items():
-                button.configure(relief="sunken" if key == selected else "flat",
-                                 font=(self.panel.FONT_FAMILY, 9, "bold" if key == selected else "normal"))
+        self.current_button.configure(text="回到本月" if self.mode == "month" else "回到本年")
+        for key, button in self.mode_buttons.items():
+            selected = key == self.mode
+            button.configure(
+                bg=self.P["button"] if selected else self.P["head_bg"],
+                fg=self.P["button_fg"] if selected else self.P["muted"],
+                activebackground=self.P["button_hot"] if selected else self.P["card"],
+                activeforeground=self.P["button_fg"] if selected else self.P["title"],
+                relief="flat",
+                font=(self.panel.FONT_FAMILY, 9, "bold" if selected else "normal"))
+        for key, button in self.tab_buttons.items():
+            selected = key == self.tab
+            button.configure(relief="sunken" if selected else "flat",
+                             font=(self.panel.FONT_FAMILY, 9, "bold" if selected else "normal"))
         for button, delta in ((self.previous_button, -1), (self.next_button, 1)):
             button.configure(state="normal" if self._valid_period(self.mode, *self._candidate(delta)) else "disabled")
         self._add_entry_button.configure(state="normal" if self._can_edit() else "disabled")
@@ -908,8 +922,13 @@ class _LedgerDialog:
             initial["amount"] = str(Decimal(item["amount_cents"]) / 100)
         fields = (("kind", "类型"), ("amount", "金额（元）"), ("entry_date", "日期"),
                   ("category", "分类"), ("account", "账户"), ("note", "备注"))
-        for i, (key, title) in enumerate(fields):
-            window._caption(self.win, title, p["muted"]).grid(row=i, column=0, sticky="w", padx=20, pady=7)
+        row = 0
+        self.category_choice = tk.StringVar(value="选择分类")
+        self.account_choice = tk.StringVar(value="选择账户")
+        account_values = list(dict.fromkeys(["现金", *accounts, *PAYMENT_ACCOUNTS]))
+        for key, title in fields:
+            window._caption(self.win, title, p["muted"]).grid(
+                row=row, column=0, sticky="w", padx=20, pady=7)
             variable = tk.StringVar(value=initial[key])
             self.variables[key] = variable
             if key == "kind":
@@ -930,26 +949,33 @@ class _LedgerDialog:
                                  insertbackground=p["title"], relief="flat", highlightthickness=1,
                                  highlightbackground=p["border"], highlightcolor=p["link"],
                                  font=(window.panel.FONT_FAMILY, 10))
-            entry.grid(row=i, column=1, sticky="ew", padx=(0, 20), pady=6, ipady=4)
+            entry.grid(row=row, column=1, sticky="ew", padx=(0, 20), pady=6, ipady=4)
             self.entries[key] = entry
-        suggestions = tk.Frame(self.win, bg=p["surface"])
-        suggestions.grid(row=6, column=1, sticky="ew", padx=(0, 20), pady=(4, 0))
-        suggestions.columnconfigure((0, 1), weight=1, uniform="suggestion")
-        self.category_choice = tk.StringVar(value="选择分类")
-        self.category_menu = window._option(suggestions, self.category_choice, ["选择分类"],
-                                            lambda v: self.variables["category"].set(v))
-        self.category_menu.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.account_choice = tk.StringVar(value="选择账户")
-        account_values = list(dict.fromkeys(["现金", *accounts, *PAYMENT_ACCOUNTS]))
-        self.account_menu = window._option(
-            suggestions, self.account_choice, ["选择账户", *account_values],
-            lambda v: self.variables["account"].set(v) if v != "选择账户" else None)
-        self.account_menu.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+            row += 1
+
+            # 快捷下拉紧跟对应输入框，避免分类和账户的选择控件混在一起。
+            if key in ("category", "account"):
+                window._caption(self.win, "快速选择", p["faint"], size=8).grid(
+                    row=row, column=0, sticky="w", padx=20, pady=(0, 4))
+                if key == "category":
+                    self.category_menu = window._option(
+                        self.win, self.category_choice, ["选择分类"],
+                        lambda value: self.variables["category"].set(value))
+                    self.category_menu.grid(row=row, column=1, sticky="ew",
+                                            padx=(0, 20), pady=(0, 5))
+                else:
+                    self.account_menu = window._option(
+                        self.win, self.account_choice, ["选择账户", *account_values],
+                        lambda value: self.variables["account"].set(value)
+                        if value != "选择账户" else None)
+                    self.account_menu.grid(row=row, column=1, sticky="ew",
+                                           padx=(0, 20), pady=(0, 5))
+                row += 1
         self.error = window._caption(self.win, "", p["matured_fg"])
         self.error.configure(wraplength=410, justify="left")
-        self.error.grid(row=7, column=0, columnspan=2, sticky="ew", padx=20, pady=6)
+        self.error.grid(row=row, column=0, columnspan=2, sticky="ew", padx=20, pady=6)
         buttons = tk.Frame(self.win, bg=p["surface"])
-        buttons.grid(row=8, column=0, columnspan=2, padx=20, pady=14, sticky="e")
+        buttons.grid(row=row + 1, column=0, columnspan=2, padx=20, pady=14, sticky="e")
         self.cancel_button = window._button(buttons, "取消", self._cancel)
         self.cancel_button.pack(side="left", padx=4)
         self.save_button = window._button(buttons, "保存", self._submit)

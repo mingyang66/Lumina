@@ -43,7 +43,9 @@ CREATE TABLE IF NOT EXISTS vault_deposit (
     months INTEGER NOT NULL,
     end_date TEXT NOT NULL,
     sort_index INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    CHECK((typeof(principal) IN ('integer','real') AND principal > 0)
+       OR (typeof(principal)='blob' AND length(principal) BETWEEN 29 AND 48))
 );
 CREATE INDEX IF NOT EXISTS idx_vault_deposit_bank ON vault_deposit(bank_id);
 CREATE INDEX IF NOT EXISTS idx_vault_deposit_end ON vault_deposit(end_date);
@@ -52,13 +54,15 @@ CREATE INDEX IF NOT EXISTS idx_vault_deposit_end ON vault_deposit(end_date);
 CREATE TABLE IF NOT EXISTS ledger_entry (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL CHECK(kind IN ('expense','income','transfer','refund')),
-    amount_cents INTEGER NOT NULL CHECK(typeof(amount_cents)='integer'
-        AND amount_cents > 0 AND amount_cents <= 99999999999),
+    amount_cents INTEGER NOT NULL,
     category TEXT NOT NULL CHECK(length(trim(category)) > 0),
     account TEXT NOT NULL CHECK(length(trim(account)) > 0),
     entry_date TEXT NOT NULL CHECK(entry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
     note TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    CHECK((typeof(amount_cents)='integer' AND amount_cents > 0
+           AND amount_cents <= 99999999999)
+       OR (typeof(amount_cents)='blob' AND length(amount_cents) BETWEEN 29 AND 39))
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_entry_date ON ledger_entry(entry_date, id);
 CREATE INDEX IF NOT EXISTS idx_ledger_entry_kind_category ON ledger_entry(kind, category, entry_date);

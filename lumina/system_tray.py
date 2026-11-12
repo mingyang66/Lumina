@@ -1,5 +1,39 @@
 """Windows system-tray integration for Lumina."""
+import os
 import threading
+import traceback
+
+
+def _best_effort_taskbar_filter(api):
+    """Ignore access denial for pystray's optional Explorer-restart filter."""
+    original = api.ChangeWindowMessageFilterEx
+    warned = False
+
+    def change_filter(hwnd, message, action, filter_info):
+        nonlocal warned
+        try:
+            return original(hwnd, message, action, filter_info)
+        except OSError as exc:
+            if (getattr(exc, "winerror", None) == 5
+                    and message == api.WM_TASKBARCREATED
+                    and action == api.MSGFLT_ALLOW):
+                if not warned:
+                    print("[lumina] tray warning: Windows denied the optional "
+                          "Explorer-restart message filter; the tray icon will "
+                          "continue without automatic recovery after Explorer restarts.",
+                          flush=True)
+                    warned = True
+                # pystray only needs this call to succeed to continue creating its
+                # message window; the filter itself is an optional recovery feature.
+                return True
+            raise
+
+    api.ChangeWindowMessageFilterEx = change_filter
+
+    def restore():
+        api.ChangeWindowMessageFilterEx = original
+
+    return restore
 
 
 class TrayIcon:
@@ -37,10 +71,20 @@ class TrayIcon:
         return True
 
     def _run(self):
+        restore_filter = lambda: None
         try:
+            if os.name == "nt":
+                # Pystray uses this filter only to re-register the icon after an
+                # Explorer restart. Some Windows environments reject it with
+                # access denied; that should not prevent normal tray startup.
+                from pystray._win32 import win32
+                restore_filter = _best_effort_taskbar_filter(win32)
             self._icon.run()
         except Exception as exc:
             print(f"[lumina] tray stopped: {exc}", flush=True)
+            traceback.print_exc()
+        finally:
+            restore_filter()
 
     def _show_panel(self, _icon, _item):
         self.app.ui.show_panel()

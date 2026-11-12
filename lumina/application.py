@@ -23,7 +23,9 @@ class LuminaApp:
         config = _resolve_db_path(config, self.config_path)
         self.config = config
         self.db = Database(config["db_path"])
-        self.db.init_schema()
+        self.db.init_schema(
+            encrypted_finances=True,
+            reset_financial_data=not bool(config.get("money_crypto")))
         self.ui = UiServer(self.db, config, actions=self)
         self.listener = ClipboardListener(
             on_text=self._on_text,

@@ -2,3 +2,5 @@ mss>=9.0
 Pillow>=10.0
 pystray>=0.19
 pytesseract>=0.3.10
+argon2-cffi>=23.1
+cryptography>=42.0

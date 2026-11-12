@@ -13,13 +13,15 @@ LEDGER_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS ledger_entry (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL CHECK(kind IN ('expense','income','transfer','refund')),
-    amount_cents INTEGER NOT NULL CHECK(typeof(amount_cents)='integer'
-        AND amount_cents > 0 AND amount_cents <= 99999999999),
+    amount_cents INTEGER NOT NULL,
     category TEXT NOT NULL CHECK(length(trim(category)) > 0),
     account TEXT NOT NULL CHECK(length(trim(account)) > 0),
     entry_date TEXT NOT NULL CHECK(entry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
     note TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    CHECK((typeof(amount_cents)='integer' AND amount_cents > 0
+           AND amount_cents <= 99999999999)
+       OR (typeof(amount_cents)='blob' AND length(amount_cents) BETWEEN 29 AND 39))
 );
 """
 
@@ -62,6 +64,8 @@ class Database:
         self.path = os.fspath(path) if os.fspath(path) == ':memory:' else os.path.abspath(path)
         self._local = threading.local()
         self._fts = None
+        self._financial_encryption_enabled = False
+        self._financial_key = None
         db_dir = os.path.dirname(os.path.abspath(path))
         self._file_store_dir = os.path.join(db_dir, FILE_STORE_DIR)
         # 仅真正归档时创建目录；内存数据库不接触文件系统。
@@ -149,6 +153,40 @@ class Database:
         if statement.strip():
             yield statement
 
+    def unlock_financial_data(self, data_key):
+        if not isinstance(data_key, bytes) or len(data_key) != 32:
+            raise ValueError("金额数据密钥无效")
+        self._financial_key = data_key
+
+    def lock_financial_data(self):
+        self._financial_key = None
+
+    def _require_financial_key(self):
+        if not self._financial_encryption_enabled:
+            return None
+        if self._financial_key is None:
+            raise PermissionError("金额数据尚未解锁")
+        return self._financial_key
+
+    @staticmethod
+    def _next_table_id(conn, table):
+        row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (table,)).fetchone()
+        sequence = row[0] if row else 0
+        maximum = conn.execute(f"SELECT COALESCE(MAX(id),0) FROM {table}").fetchone()[0]
+        return max(sequence, maximum) + 1
+
+    def _decode_money_row(self, row, table, field):
+        if row is None or not self._financial_encryption_enabled:
+            return row
+        from .money_crypto import decrypt_amount
+        data_key = self._require_financial_key()
+        record = dict(row)
+        record[field] = decrypt_amount(
+            data_key, table, record["id"], field, record[field])
+        if field == "principal":
+            record[field] = record[field] / 100
+        return record
+
     def _migrate_ledger_schema(self):
         conn = self.conn
         removed = {'to_account', 'refund_of'}
@@ -157,10 +195,10 @@ class Database:
             return
         if conn.in_transaction:
             raise RuntimeError('记账迁移须在无活动事务时初始化')
-        if self.path != ':memory:':
+        if self.path != ':memory:' and not self._financial_encryption_enabled:
             stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             backup_path = self.path + '.ledger_schema_backup_' + stamp + '.sqlite3'
-            # backup 包含已提交的 WAL 数据，不能直接复制主文件。
+            # 普通兼容迁移保留旧行为；财务加密模式明确不生成明文备份。
             with open(backup_path, 'xb'):
                 pass
             with closing(sqlite3.connect(backup_path)) as backup:
@@ -203,7 +241,34 @@ class Database:
             conn.rollback()
             raise
 
-    def init_schema(self):
+    def init_schema(self, *, encrypted_finances=False, reset_financial_data=False):
+        self._financial_encryption_enabled = bool(encrypted_finances)
+        conn = self.conn
+        if reset_financial_data:
+            if not self._financial_encryption_enabled:
+                raise ValueError("只能在财务加密模式下清理旧数据")
+            # 用户明确选择丢弃旧财务数据；不复制、不导出，也不备份旧金额。
+            conn.execute("PRAGMA secure_delete=ON")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for table in ("ledger_entry", "vault_deposit", "vault_bank"):
+                    conn.execute(f"DROP TABLE IF EXISTS {table}")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        elif self._financial_encryption_enabled:
+            encrypted_schema_checks = {
+                "ledger_entry": "typeof(amount_cents)='blob'",
+                "vault_deposit": "typeof(principal)='blob'",
+            }
+            for table, required_check in encrypted_schema_checks.items():
+                schema_row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone()
+                if schema_row and required_check not in (schema_row["sql"] or "").lower():
+                    raise RuntimeError(
+                        f"{table} 尚未切换到金额密文结构；拒绝在不安全状态下继续启动")
         schema = self._load_schema()
         self._migrate_ledger_schema()
         statements = []
@@ -224,6 +289,9 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_clipboard_category ON clipboard(category)")
         self._init_fts()
         self.conn.commit()
+        if reset_financial_data and self.path != ":memory:":
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
 
     def _init_fts(self):
         if self._fts is not None:
@@ -500,6 +568,7 @@ class Database:
         self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
     def close(self):
+        self.lock_financial_data()
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
@@ -585,28 +654,63 @@ class Database:
         return cur.rowcount > 0
 
     def list_vault_deposits(self, bank_id=None):
-        """全部存单，或某家银行下的存单。按 ``(bank_id, sort_index, id)`` 排。
-
-        ``end_date`` 是 ``YYYY-MM-DD`` 文本，字典序与时间序一致，
-        所以「按到期日排序」可以直接交给 SQL，不必取出来再排。
-        """
+        """列出存单；金额加密模式仅在解锁后返回明文本金。"""
+        self._require_financial_key()
         if bank_id is None:
-            return self.conn.execute(
+            rows = self.conn.execute(
                 "SELECT * FROM vault_deposit "
                 "ORDER BY bank_id, sort_index, id").fetchall()
-        return self.conn.execute(
-            "SELECT * FROM vault_deposit WHERE bank_id=? "
-            "ORDER BY sort_index, id", (bank_id,)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM vault_deposit WHERE bank_id=? "
+                "ORDER BY sort_index, id", (bank_id,)).fetchall()
+        if self._financial_encryption_enabled:
+            return [self._decode_money_row(
+                row, "vault_deposit", "principal") for row in rows]
+        return rows
+
+    @staticmethod
+    def _principal_to_cents(principal):
+        from decimal import Decimal, InvalidOperation
+        try:
+            value = Decimal(str(principal))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("本金金额无效") from exc
+        if not value.is_finite() or value <= 0:
+            raise ValueError("本金须为正数且最多两位小数")
+        cents = value * 100
+        if cents != cents.to_integral_value() or cents >= 10 ** 20:
+            raise ValueError("本金最多两位小数且不能超出安全范围")
+        return int(cents)
 
     def add_vault_deposit(self, bank_id, name, principal, rate, months,
                           end_date, sort_index=0):
-        with self.conn:
-            cur = self.conn.execute(
-                "INSERT INTO vault_deposit(bank_id, name, principal, rate, "
-                "months, end_date, sort_index) VALUES (?,?,?,?,?,?,?)",
-                (int(bank_id), name, float(principal), float(rate),
-                 int(months), end_date, int(sort_index)))
-        return cur.lastrowid
+        conn = self.conn
+        if not self._financial_encryption_enabled:
+            with conn:
+                cur = conn.execute(
+                    "INSERT INTO vault_deposit(bank_id, name, principal, rate, "
+                    "months, end_date, sort_index) VALUES (?,?,?,?,?,?,?)",
+                    (int(bank_id), name, float(principal), float(rate),
+                     int(months), end_date, int(sort_index)))
+            return cur.lastrowid
+        from .money_crypto import encrypt_amount
+        key = self._require_financial_key()
+        cents = self._principal_to_cents(principal)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            deposit_id = self._next_table_id(conn, "vault_deposit")
+            encrypted = encrypt_amount(key, "vault_deposit", deposit_id, "principal", cents)
+            conn.execute(
+                "INSERT INTO vault_deposit(id, bank_id, name, principal, "
+                "rate, months, end_date, sort_index) VALUES (?,?,?,?,?,?,?,?)",
+                (deposit_id, int(bank_id), name, encrypted, float(rate), int(months),
+                 end_date, int(sort_index)))
+            conn.commit()
+            return deposit_id
+        except Exception:
+            conn.rollback()
+            raise
 
     def update_vault_deposit(self, deposit_id, **fields):
         """改存单。只接受白名单里的列名，避免拼接出任意 SQL。"""
@@ -615,6 +719,13 @@ class Database:
         pairs = {k: v for k, v in fields.items() if k in allowed}
         if not pairs:
             return False
+        if self._financial_encryption_enabled:
+            key = self._require_financial_key()
+            if "principal" in pairs:
+                from .money_crypto import encrypt_amount
+                cents = self._principal_to_cents(pairs.pop("principal"))
+                pairs["principal"] = encrypt_amount(
+                    key, "vault_deposit", deposit_id, "principal", cents)
         assignments = ", ".join(f"{k}=?" for k in pairs)
         with self.conn:
             cur = self.conn.execute(
@@ -623,6 +734,7 @@ class Database:
         return cur.rowcount > 0
 
     def delete_vault_deposit(self, deposit_id):
+        self._require_financial_key()
         with self.conn:
             cur = self.conn.execute(
                 "DELETE FROM vault_deposit WHERE id=?", (deposit_id,))
@@ -636,12 +748,26 @@ class Database:
         conn = self.conn
         try:
             conn.execute('BEGIN IMMEDIATE')
-            cur = conn.execute(
-                'INSERT INTO ledger_entry (' + ', '.join(RECORD_FIELDS) + ') '
-                'VALUES (' + ', '.join('?' for _ in RECORD_FIELDS) + ')',
-                tuple(record[field] for field in RECORD_FIELDS))
+            if self._financial_encryption_enabled:
+                from .money_crypto import encrypt_amount
+                key = self._require_financial_key()
+                entry_id = self._next_table_id(conn, "ledger_entry")
+                stored = dict(record)
+                stored["amount_cents"] = encrypt_amount(
+                    key, "ledger_entry", entry_id, "amount_cents", record["amount_cents"])
+                cur = conn.execute(
+                    'INSERT INTO ledger_entry (id, ' + ', '.join(RECORD_FIELDS) + ') '
+                    'VALUES (?, ' + ', '.join('?' for _ in RECORD_FIELDS) + ')',
+                    (entry_id, *(stored[field] for field in RECORD_FIELDS)))
+                entry_id = cur.lastrowid
+            else:
+                cur = conn.execute(
+                    'INSERT INTO ledger_entry (' + ', '.join(RECORD_FIELDS) + ') '
+                    'VALUES (' + ', '.join('?' for _ in RECORD_FIELDS) + ')',
+                    tuple(record[field] for field in RECORD_FIELDS))
+                entry_id = cur.lastrowid
             conn.commit()
-            return cur.lastrowid
+            return entry_id
         except Exception:
             conn.rollback()
             raise
@@ -657,9 +783,18 @@ class Database:
             merged = {field: original[field] for field in RECORD_FIELDS}
             merged.update(record)
             merged = _validate_record(merged)
-            conn.execute(
-                'UPDATE ledger_entry SET ' + ', '.join(field + '=?' for field in RECORD_FIELDS)
-                + ' WHERE id=?', (*[merged[field] for field in RECORD_FIELDS], entry_id))
+            if self._financial_encryption_enabled:
+                from .money_crypto import encrypt_amount
+                key = self._require_financial_key()
+                merged["amount_cents"] = encrypt_amount(
+                    key, "ledger_entry", entry_id, "amount_cents", merged["amount_cents"])
+                conn.execute(
+                    'UPDATE ledger_entry SET ' + ', '.join(field + '=?' for field in RECORD_FIELDS)
+                    + ' WHERE id=?', (*(merged[field] for field in RECORD_FIELDS), entry_id))
+            else:
+                conn.execute(
+                    'UPDATE ledger_entry SET ' + ', '.join(field + '=?' for field in RECORD_FIELDS)
+                    + ' WHERE id=?', (*[merged[field] for field in RECORD_FIELDS], entry_id))
             conn.commit()
             return True
         except Exception:
@@ -667,6 +802,7 @@ class Database:
             raise
 
     def delete_ledger_entry(self, entry_id):
+        self._require_financial_key()
         conn = self.conn
         try:
             conn.execute('BEGIN IMMEDIATE')
@@ -678,9 +814,12 @@ class Database:
             raise
 
     def get_ledger_entry(self, id):
-        return self.conn.execute('SELECT * FROM ledger_entry WHERE id=?', (id,)).fetchone()
+        self._require_financial_key()
+        row = self.conn.execute('SELECT * FROM ledger_entry WHERE id=?', (id,)).fetchone()
+        return self._decode_money_row(row, "ledger_entry", "amount_cents")
 
     def list_ledger_entries(self, start, end, kind=None, category=None, query=''):
+        self._require_financial_key()
         from .ledger_tools import _date
         _date(start)
         _date(end)
@@ -701,9 +840,13 @@ class Database:
                            'instr(lower(category),lower(?))>0 OR '
                            'instr(lower(account),lower(?))>0)')
             params.extend([query] * 3)
-        return self.conn.execute(
+        rows = self.conn.execute(
             'SELECT * FROM ledger_entry WHERE ' + ' AND '.join(clauses)
             + ' ORDER BY entry_date DESC, id DESC', params).fetchall()
+        if self._financial_encryption_enabled:
+            return [self._decode_money_row(
+                row, "ledger_entry", "amount_cents") for row in rows]
+        return rows
 
     def list_ledger_accounts(self):
         rows = self.conn.execute(

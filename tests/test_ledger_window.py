@@ -615,6 +615,14 @@ class LedgerWindowTests(unittest.TestCase):
             self.assertEqual(dialog.variables["account"].get(), account)
         self.assertEqual(dialog.category_menu.winfo_rootx(),
                          dialog.entries["category"].winfo_rootx())
+        self.assertGreaterEqual(dialog.category_menu.winfo_rooty(),
+                                dialog.entries["category"].winfo_rooty()
+                                + dialog.entries["category"].winfo_height())
+        self.assertEqual(dialog.account_menu.winfo_rootx(),
+                         dialog.entries["account"].winfo_rootx())
+        self.assertGreaterEqual(dialog.account_menu.winfo_rooty(),
+                                dialog.entries["account"].winfo_rooty()
+                                + dialog.entries["account"].winfo_height())
         self.assertLessEqual(dialog.account_menu.winfo_rootx() + dialog.account_menu.winfo_width(),
                              dialog.entries["account"].winfo_rootx() + dialog.entries["account"].winfo_width())
         dialog._cancel()
@@ -755,9 +763,11 @@ class LedgerWindowTests(unittest.TestCase):
                 self.root.update()
                 window = self.window
                 self.assertEqual(len(window._metric_labels), 3)
-                self.assertEqual(window.mode_buttons["month"].cget("relief"), "sunken")
+                self.assertEqual(window.mode_buttons["month"].cget("bg"), window.P["button"])
+                self.assertEqual(window.mode_buttons["year"].cget("bg"), window.P["head_bg"])
                 self.assertEqual(window.tab_buttons["entries"].cget("relief"), "sunken")
-                self.assertEqual(window.mode_buttons["month"].winfo_rooty(), window.current_button.winfo_rooty())
+                self.assertLessEqual(abs(window.mode_buttons["month"].winfo_rooty()
+                                         - window.current_button.winfo_rooty()), 1)
                 for value in window._metric_labels.values():
                     font = tkfont.Font(font=value.cget("font"))
                     self.assertEqual(value.cget("wraplength"), 0)
@@ -985,7 +995,9 @@ class LedgerWindowTests(unittest.TestCase):
         self.click(self.window.explanation_button)
         self.assertTrue(self.window._explanation_open)
         self.click(self.window.mode_buttons["year"])
-        self.assertEqual(self.window.current_button.cget("text"), "本年")
+        self.assertEqual(self.window.current_button.cget("text"), "回到本年")
+        self.assertEqual(self.window.period_label.cget("text"), "2026年")
+        self.assertEqual(self.window.mode_buttons["year"].cget("bg"), self.window.P["button"])
         self.assertEqual(len(self.window._trend_periods()), 12)
         self.assertTrue(self.window.trend_canvas.find_withtag("month12"))
         self.assertFalse(self.window.trend_canvas.find_withtag("day1"))

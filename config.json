@@ -18,12 +18,22 @@
   "panel_width": 1360,
   "panel_height": 840,
   "floating_enabled": true,
-  "floating_x": 1833,
-  "floating_y": 930,
+  "floating_x": 1868,
+  "floating_y": 833,
   "floating_size": 52,
   "floating_hover_delay_ms": 200,
   "floating_hide_delay_ms": 400,
   "hide_panel_on_capture": false,
   "download_dir": "",
-  "autostart": false
+  "autostart": false,
+  "money_crypto": {
+    "version": 1,
+    "kdf": "argon2id",
+    "memory_kib": 65536,
+    "time_cost": 3,
+    "parallelism": 1,
+    "salt": "+S1UrqFdVAmoofgv9LYjHQ==",
+    "wrap_nonce": "5SQDIJ8bWrFfChCO",
+    "wrapped_key": "Ar3vhp0oLVKICi8FpYG4ylgxb9AXquh4ZXTrJgdvAds+IELFvH4MmILxTSNhKSc8"
+  }
 }

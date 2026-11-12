@@ -283,6 +283,7 @@ class VaultWindow(_ToolWindow):
         self._authenticating = False
         self._auth_seen = bool(getattr(panel, "_vault_authenticated", False))
         self._deposit_dialog = None
+        self._bank_dialog = None
         self._session_lock_monitor = None
         self._metric_widgets = {}        # 四张指标卡的控件（与 _data 分开！）
         self._load_error = ""
@@ -323,11 +324,12 @@ class VaultWindow(_ToolWindow):
     def _hide_privacy(self):
         self._privacy_visible = False
         self._clear_sensitive_data()
-        dialog = self._deposit_dialog
-        if dialog is not None:
-            self._deposit_dialog = None
-            if dialog.win.winfo_exists():
-                dialog._cancel()
+        for attribute in ("_deposit_dialog", "_bank_dialog"):
+            dialog = getattr(self, attribute)
+            if dialog is not None:
+                setattr(self, attribute, None)
+                if dialog.win.winfo_exists():
+                    dialog._cancel()
         from tkinter import simpledialog
         for child in self.win.winfo_children():
             if isinstance(child, simpledialog.Dialog):
@@ -337,6 +339,9 @@ class VaultWindow(_ToolWindow):
 
     def lock_privacy(self):
         self.panel._vault_authenticated = False
+        db = getattr(getattr(self.panel, "ui", None), "db", None)
+        if db is not None and hasattr(db, "lock_financial_data"):
+            db.lock_financial_data()
         self.panel._vault_write_generation = getattr(self.panel, "_vault_write_generation", 0) + 1
         windows = [self, *getattr(self.panel, "_tool_windows", {}).values()]
         for window in set(windows):
@@ -420,6 +425,83 @@ class VaultWindow(_ToolWindow):
         self._privacy_button.bind("<FocusOut>", lambda _e: self._privacy_button.configure(
             highlightbackground=self.P["rail_bg"]))
         self._paint_privacy_eye()
+
+        self._change_password_button = self.tk.Label(
+            rail, text="修改口令", bg=self.P["rail_bg"], fg=self.P["rail_fg"],
+            font=(self.panel.FONT_FAMILY, 9), padx=8, cursor="hand2")
+        self._change_password_button.pack(side="right", padx=(4, 2))
+        self._change_password_button.bind(
+            "<Button-1>", self._change_passphrase)
+        self._change_password_button.bind("<Enter>", lambda _e:
+            self._change_password_button.configure(
+                bg=self.P["head_bg"], fg=self.P["title"]))
+        self._change_password_button.bind("<Leave>", lambda _e:
+            self._change_password_button.configure(
+                bg=self.P["rail_bg"], fg=self.P["rail_fg"]))
+
+        self._reset_password_button = self.tk.Label(
+            rail, text="清空重设", bg=self.P["rail_bg"], fg=self.P["rail_fg"],
+            font=(self.panel.FONT_FAMILY, 9), padx=8, cursor="hand2")
+        self._reset_password_button.pack(side="right", padx=(12, 2))
+        self._reset_password_button.bind(
+            "<Button-1>", self._reset_encrypted_financial_data)
+        self._reset_password_button.bind("<Enter>", lambda _e:
+            self._reset_password_button.configure(
+                bg=self.P["matured_bg"], fg=self.P["matured_fg"]))
+        self._reset_password_button.bind("<Leave>", lambda _e:
+            self._reset_password_button.configure(
+                bg=self.P["rail_bg"], fg=self.P["rail_fg"]))
+
+    def _change_passphrase(self, _event=None):
+        if self._closed:
+            return "break"
+        from .vault_auth import change_vault_passphrase
+        change_vault_passphrase(self.panel, parent=self.win)
+        return "break"
+
+    def _reset_encrypted_financial_data(self, _event=None):
+        if self._closed:
+            return "break"
+        from tkinter import messagebox
+        title = "清空加密数据并重设口令"
+        warning = (
+            "此操作会永久删除全部记账流水、密匣银行和存单，并移除旧口令配置。\n"
+            "剪贴板记录及其他应用设置会保留；完成后可以立即设置新口令。\n"
+            "财务数据无法恢复。确定继续吗？")
+        if not messagebox.askyesno(title, warning, parent=self.win, default="no"):
+            return "break"
+        if not messagebox.askyesno(
+                "最终确认", "再次确认：永久清空全部记账与密匣数据并重设口令？",
+                parent=self.win, default="no"):
+            return "break"
+
+        from .vault_auth import reset_encrypted_financial_data
+        try:
+            reset = reset_encrypted_financial_data(
+                self.panel, revoke_callback=self.lock_privacy)
+        except Exception:
+            # 清理失败也保持锁定；配置只会在财务表清理成功后才被移除。
+            self.lock_privacy()
+            from tkinter import messagebox
+            if self.panel.ui.config.get("money_crypto"):
+                detail = ("重置未能完整完成。旧口令配置仍保留；财务数据可能已清空。\n"
+                          "可以用旧口令重新解锁后重试，剪贴板不受影响。")
+            else:
+                detail = "重置未能完整完成。请重启应用后再检查数据状态。"
+            messagebox.showerror("重置失败", detail, parent=self.win)
+            return "break"
+        if not reset:
+            messagebox.showinfo(
+                "无需清空", "当前没有旧口令配置；可通过“修改口令”直接设置口令。",
+                parent=self.win)
+            return "break"
+
+        # 数据已清空、旧 envelope 已移除。现在走首次设置流程；若取消，
+        # 下次打开密匣仍会提示设置新口令，数据库已经是空的。
+        self.lock_privacy()
+        if self.panel._authenticate_vault(parent=self.win):
+            self._toggle_privacy()
+        return "break"
 
     def _paint_privacy_eye(self):
         eye = self._privacy_button
@@ -1112,8 +1194,13 @@ class VaultWindow(_ToolWindow):
         if not self._can_edit():
             return
         token = self._write_token()
-        from tkinter import simpledialog
-        name = simpledialog.askstring("新增银行", "银行名称：", parent=self.win)
+        dialog = _BankDialog(self)
+        self._bank_dialog = dialog
+        try:
+            self.win.wait_window(dialog.win)
+        finally:
+            self._bank_dialog = None
+        name = dialog.result
         if not self._can_write(token) or not name or not name.strip():
             return
         try:
@@ -1156,9 +1243,8 @@ class VaultWindow(_ToolWindow):
         必然是 ``None``。不等待就直接读，等于「刚弹出来就问结果」——永远读到
         空值，**存单一条都写不进数据库**，而界面上不报任何错（用户以为存了）。
 
-        这个缺陷在真实库上留下的痕迹：``vault_bank`` 有行、``vault_deposit``
-        恒为 0——银行走 ``simpledialog.askstring``，它**自带模态循环**所以能存；
-        存单走自建 ``Toplevel``，少了这一句就全部丢失。
+        银行与存单均使用自建 ``Toplevel``，由调用方等待关闭，再检查写入令牌。
+        缺少等待会让 ``result`` 恒为 ``None``，用户输入无法写入数据库。
         """
         if not self._can_edit():
             return
@@ -1360,6 +1446,100 @@ def _attach_hint(entry, hint):
     # 对话框可能在鼠标还悬着的时候就被销毁（按回车提交），残留的气泡会
     # 孤零零留在桌面上。所以随控件一起收掉。
     entry.bind("<Destroy>", hide, add="+")
+
+
+class _BankDialog:
+    """新增银行：跟随当前主题，只收集名称，不读取数据库。"""
+
+    def __init__(self, window):
+        import tkinter as tk
+
+        self.window = window
+        self._write_session = window._write_token()
+        self.result = None
+        P = window.P
+        bg = P["surface"]
+        self.win = tk.Toplevel(window.win)
+        self.win.title("新增银行")
+        self.win.configure(bg=bg)
+        self.win.transient(window.win)
+        self.win.resizable(False, False)
+        tk.Label(self.win, text="新增银行", bg=bg, fg=P["title"],
+                 font=(window.panel.FONT_FAMILY, 11, "bold")).grid(
+            row=0, column=0, sticky="w", padx=24, pady=(14, 8))
+        tk.Label(self.win, text="银行名称", bg=bg, fg=P["muted"],
+                 font=(window.panel.FONT_FAMILY, 9)).grid(
+            row=1, column=0, sticky="w", padx=24, pady=4)
+        self.name_var = tk.StringVar()
+        self.entry = tk.Entry(
+            self.win, textvariable=self.name_var, bd=0, relief="flat",
+            bg=P["card"], fg=P["title"], highlightthickness=1,
+            highlightbackground=P["border"], highlightcolor=P["link"],
+            insertbackground=P["link"], font=(window.panel.FONT_FAMILY, 10), width=26)
+        self.entry.grid(row=2, column=0, sticky="ew", padx=24, ipady=6, pady=(8, 0))
+        self.error = tk.Label(self.win, text="", bg=bg, fg=P["matured_fg"],
+                              anchor="w", width=1, font=(window.panel.FONT_FAMILY, 9))
+        self.error.grid(row=3, column=0, sticky="ew", padx=24, pady=(6, 0))
+        buttons = tk.Frame(self.win, bg=bg)
+        buttons.grid(row=4, column=0, sticky="e", padx=14, pady=(10, 14))
+        self.cancel_button = tk.Button(
+            buttons, text="取消", command=self._cancel, padx=14, pady=3,
+            bd=1, relief="solid", bg=P["card"], fg=P["link"],
+            activebackground=P["head_bg"], activeforeground=P["link"],
+            cursor="hand2", highlightthickness=0, font=(window.panel.FONT_FAMILY, 9))
+        self.cancel_button.pack(side="right", padx=(8, 0))
+        self.add_button = tk.Button(
+            buttons, text="添加", command=self._submit, padx=14, pady=3,
+            bd=0, relief="flat", bg=P["button"], fg=P["button_fg"],
+            activebackground=P["button_hot"], activeforeground=P["button_fg"],
+            cursor="hand2", highlightthickness=0, font=(window.panel.FONT_FAMILY, 9))
+        self.add_button.pack(side="right")
+        self.name_var.trace_add("write", self._on_change)
+        self.win.bind("<Return>", lambda _e: self._submit())
+        self.win.bind("<Escape>", lambda _e: self._cancel())
+        self.win.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.win.columnconfigure(0, weight=1)
+        self.win.update_idletasks()
+        self.win.geometry(f"360x{self.win.winfo_reqheight()}")
+        self.win.update_idletasks()
+        parent = window.win
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.win.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.win.winfo_height()) // 2
+        # 原生标题栏与边框不计入客户区，定位时扣除它们的偏移。
+        x -= self.win.winfo_rootx() - self.win.winfo_x()
+        y -= self.win.winfo_rooty() - self.win.winfo_y()
+        self.win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.win.update_idletasks()
+        self.win.grab_set()
+        self.win.focus_force()
+        self.entry.focus_set()
+
+    def _on_change(self, *_args):
+        self.error.configure(text="")
+        self.entry.configure(highlightbackground=self.window.P["border"],
+                             highlightcolor=self.window.P["link"])
+
+    def _submit(self):
+        if not self.window._can_write(self._write_session):
+            return self._cancel()
+        name = self.name_var.get().strip()
+        if not name:
+            self.error.configure(text="请填银行名称")
+            self.entry.configure(highlightbackground=self.window.P["matured_fg"],
+                                 highlightcolor=self.window.P["matured_fg"])
+            self.entry.focus_set()
+            return "break"
+        if not self.window._can_write(self._write_session):
+            return self._cancel()
+        self.result = name
+        self.win.destroy()
+        return "break"
+
+    def _cancel(self):
+        self.result = None
+        if self.win.winfo_exists():
+            self.win.destroy()
+        return "break"
 
 
 class _DepositDialog:

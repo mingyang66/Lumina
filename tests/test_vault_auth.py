@@ -71,11 +71,45 @@ class _Widget:
 
 class AuthenticationTests(unittest.TestCase):
     def setUp(self):
+        import sys
+        from types import ModuleType
+
         self.owner = _Widget()
         self.dialog = _Widget(self.owner)
         self.entries = []
         self.labels = []
         self.panel = SimpleNamespace(win=self.owner)
+        self.key = b"k" * 32
+        self.metadata = {"version": 1, "kdf": "argon2id"}
+        self.crypto = ModuleType("lumina.money_crypto")
+
+        def create_key_envelope(secret):
+            if len(secret) < 10:
+                raise ValueError("保护口令至少需要 10 个字符")
+            return self.metadata.copy(), self.key
+
+        def unlock_key(metadata, secret):
+            if secret != "correct horse battery":
+                raise ValueError("保护口令错误")
+            return self.key
+
+        def rewrap_key_envelope(metadata, current, new):
+            if current != "correct horse battery":
+                raise ValueError("保护口令错误")
+            if len(new) < 10:
+                raise ValueError("保护口令至少需要 10 个字符")
+            return {**metadata, "rotated": True}
+
+        self.crypto.create_key_envelope = create_key_envelope
+        self.crypto.unlock_key = unlock_key
+        self.crypto.rewrap_key_envelope = rewrap_key_envelope
+        self.crypto_patch = patch.dict(sys.modules, {"lumina.money_crypto": self.crypto})
+        self.crypto_patch.start()
+        self.save_patch = patch("lumina.settings.save_config")
+        self.save_config = self.save_patch.start()
+        self.panel.ui = SimpleNamespace(
+            config={}, db=SimpleNamespace(unlock_financial_data=Mock()),
+            actions=SimpleNamespace(config_path="test-config.json"))
 
         def entry(*args, **kwargs):
             widget = _Widget(*args, **kwargs)
@@ -91,51 +125,157 @@ class AuthenticationTests(unittest.TestCase):
             Toplevel=Mock(return_value=self.dialog), Frame=_Widget,
             Label=label, Entry=entry, Button=_Widget, Canvas=_Widget)
 
-    def submit(self, username, password):
-        self.entries[0].value = username
-        self.entries[1].value = password
+    def tearDown(self):
+        self.save_patch.stop()
+        self.crypto_patch.stop()
+
+    def submit(self, password, confirmation=None):
+        self.entries[0].value = password
+        if len(self.entries) > 1:
+            self.entries[1].value = confirmation or ""
         self.assertEqual(self.dialog.bindings["<Return>"](), "break")
 
-    def test_success_masks_password_and_waits_modally(self):
-        self.dialog.wait_window.side_effect = lambda: self.submit("admin", "admin")
+    def test_first_use_sets_config_metadata_and_waits_modally(self):
+        self.dialog.wait_window.side_effect = lambda: self.submit(
+            "correct horse battery", "correct horse battery")
         self.assertTrue(vault_auth.authenticate_vault(self.panel))
-        self.assertEqual(self.entries[1].options["show"], "*")
-        self.assertEqual(self.entries[1].value, "")
+        self.assertEqual(self.entries[0].options["show"], "*")
+        self.assertEqual([entry.value for entry in self.entries], ["", ""])
+        self.assertEqual(self.panel.ui.config["money_crypto"], self.metadata)
+        self.save_config.assert_called_once_with(
+            self.panel.ui.config, "test-config.json")
+        self.panel.ui.db.unlock_financial_data.assert_called_once_with(self.key)
         self.dialog.grab_set.assert_called_once()
         self.dialog.wait_visibility.assert_called_once()
         self.dialog.wait_window.assert_called_once()
         self.assertFalse(self.panel._vault_auth_pending)
         self.assertNotIn("password", vars(self.panel))
 
-    def test_wrong_credentials_share_error_and_can_cancel(self):
+    def test_change_passphrase_rewraps_metadata_and_saves_config(self):
+        self.panel.ui.config["money_crypto"] = self.metadata
+
         def interact():
-            for username, password in (("other", "admin"), ("admin", "wrong"), ("", "")):
-                self.submit(username, password)
-                self.assertTrue(self.dialog.exists)
-                self.assertEqual(self.labels[-1].options["text"], "账号或密码错误")
-                self.assertEqual(self.entries[1].value, "")
+            self.entries[0].value = "correct horse battery"
+            self.entries[1].value = "new secure passphrase"
+            self.entries[2].value = "new secure passphrase"
+            self.assertEqual(self.dialog.bindings["<Return>"](), "break")
+            self.assertFalse(self.dialog.exists)
+
+        self.dialog.wait_window.side_effect = interact
+        self.assertTrue(vault_auth.change_vault_passphrase(self.panel))
+        self.assertTrue(self.panel.ui.config["money_crypto"]["rotated"])
+        self.assertEqual([entry.value for entry in self.entries], ["", "", ""])
+        self.save_config.assert_called_once_with(
+            {"money_crypto": self.panel.ui.config["money_crypto"]}, "test-config.json")
+        self.panel.ui.db.unlock_financial_data.assert_not_called()
+        self.assertFalse(self.panel._vault_auth_pending)
+
+    def test_change_passphrase_has_independent_eye_toggles(self):
+        self.panel.ui.config["money_crypto"] = self.metadata
+
+        def interact():
+            for index, entry in enumerate(self.entries):
+                entry.value = f"secret value {index}"
+            eyes = [next(child for child in entry.master.children if child is not entry)
+                    for entry in self.entries]
+            self.assertEqual([eye.options["width"] for eye in eyes], [28, 28, 28])
+            eyes[0].bindings["<Button-1>"]()
+            self.assertEqual([entry.options["show"] for entry in self.entries],
+                             ["", "*", "*"])
+            eyes[1].bindings["<space>"]()
+            self.assertEqual([entry.options["show"] for entry in self.entries],
+                             ["", "", "*"])
+            eyes[0].bindings["<Button-1>"]()
+            eyes[2].bindings["<Return>"]()
+            self.assertEqual([entry.options["show"] for entry in self.entries],
+                             ["*", "", ""])
+            self.assertEqual([entry.value for entry in self.entries],
+                             ["secret value 0", "secret value 1", "secret value 2"])
+            self.dialog.bindings["<Escape>"]()
+            self.assertEqual([entry.options["show"] for entry in self.entries],
+                             ["*", "*", "*"])
+
+        self.dialog.wait_window.side_effect = interact
+        self.assertFalse(vault_auth.change_vault_passphrase(self.panel))
+        self.assertEqual([entry.value for entry in self.entries], ["", "", ""])
+
+    def test_change_passphrase_rejects_wrong_current_and_mismatch(self):
+        self.panel.ui.config["money_crypto"] = self.metadata
+
+        def interact():
+            self.entries[0].value = "wrong horse battery"
+            self.entries[1].value = "new secure passphrase"
+            self.entries[2].value = "new secure passphrase"
+            self.dialog.bindings["<Return>"]()
+            self.assertEqual(self.labels[-1].options["text"], "保护口令错误")
+            self.assertEqual(self.panel.ui.config["money_crypto"], self.metadata)
+            self.entries[0].value = "correct horse battery"
+            self.entries[1].value = "new secure passphrase"
+            self.entries[2].value = "different secure phrase"
+            self.dialog.bindings["<Return>"]()
+            self.assertEqual(self.labels[-1].options["text"], "两次输入的新口令不一致")
+            self.dialog.bindings["<Escape>"]()
+
+        self.dialog.wait_window.side_effect = interact
+        self.assertFalse(vault_auth.change_vault_passphrase(self.panel))
+        self.save_config.assert_not_called()
+
+    def test_first_setup_confirmation_has_its_own_eye_and_copy_has_no_money_word(self):
+        def interact():
+            self.assertEqual(self.dialog.title.call_args.args[0], "保护口令")
+            self.assertEqual(self.labels[0].options["text"], "首次设置保护口令")
+            self.assertFalse(any("金额" in str(label.options.get("text", ""))
+                                 for label in self.labels))
+            password_eye = next(
+                child for child in self.entries[0].master.children
+                if child is not self.entries[0])
+            confirmation_eye = next(
+                child for child in self.entries[1].master.children
+                if child is not self.entries[1])
+            self.entries[0].value = "first secure password"
+            self.entries[1].value = "repeat secure password"
+            password_eye.bindings["<Button-1>"]()
+            self.assertEqual([entry.options["show"] for entry in self.entries], ["", "*"])
+            confirmation_eye.bindings["<space>"]()
+            self.assertEqual([entry.options["show"] for entry in self.entries], ["", ""])
+            password_eye.bindings["<Button-1>"]()
+            self.assertEqual([entry.options["show"] for entry in self.entries], ["*", ""])
+            self.dialog.bindings["<Escape>"]()
+            self.assertEqual([entry.options["show"] for entry in self.entries], ["*", "*"])
+
+        self.dialog.wait_window.side_effect = interact
+        self.assertFalse(vault_auth.authenticate_vault(self.panel))
+        self.assertEqual([entry.value for entry in self.entries], ["", ""])
+
+    def test_mismatched_setup_passwords_show_error_and_can_cancel(self):
+        def interact():
+            self.submit("correct horse battery", "different passphrase")
+            self.assertTrue(self.dialog.exists)
+            self.assertEqual(self.labels[-1].options["text"], "两次输入的口令不一致")
+            self.assertEqual([entry.value for entry in self.entries], ["", ""])
             self.dialog.bindings["<Escape>"]()
         self.dialog.wait_window.side_effect = interact
         self.assertFalse(vault_auth.authenticate_vault(self.panel))
 
-    def test_light_theme_eye_toggle_and_old_password_rejected(self):
+    def test_light_theme_eye_toggle_and_wrong_passphrase_rejected(self):
         from lumina.vault_window import VaultWindow
+        self.panel.ui.config["money_crypto"] = self.metadata
         def interact():
             self.assertEqual(self.dialog.options["bg"], VaultWindow.LIGHT_PALETTE["surface"])
-            password = self.entries[1]
+            password = self.entries[0]
             eye = next(c for c in password.master.children if c is not password)
-            password.value = "secret"
+            password.value = "wrong horse battery"
             eye.bindings["<Button-1>"]()
             self.assertEqual(password.options["show"], "")
-            self.assertEqual(password.value, "secret")
+            self.assertEqual(password.value, "wrong horse battery")
             eye.bindings["<space>"]()
             self.assertEqual(password.options["show"], "*")
             eye.bindings["<Return>"]()
-            self.submit("admin", "Lumina@2026")
+            self.submit("wrong horse battery")
             self.assertTrue(self.dialog.exists)
+            self.assertEqual(self.labels[-1].options["text"], "保护口令错误")
             self.assertEqual(password.value, "")
-            self.assertEqual(password.options["show"], "*")
-            self.submit("admin", "admin")
+            self.submit("correct horse battery")
         self.dialog.wait_window.side_effect = interact
         self.assertTrue(vault_auth.authenticate_vault(self.panel))
 
@@ -146,7 +286,7 @@ class AuthenticationTests(unittest.TestCase):
     def test_reentrant_authentication_does_not_create_second_dialog(self):
         def interact():
             self.assertFalse(vault_auth.authenticate_vault(self.panel))
-            self.submit("admin", "admin")
+            self.submit("correct horse battery", "correct horse battery")
         self.dialog.wait_window.side_effect = interact
         self.assertTrue(vault_auth.authenticate_vault(self.panel))
         self.panel.tk.Toplevel.assert_called_once()
@@ -234,7 +374,11 @@ class HistoryVaultEntryTests(unittest.TestCase):
         self.assertTrue(self.panel._popup_open)
         self.assertIs(self.panel._popup_menu, popup)
         button = popup.children[0].children[0]
+        ledger_button = popup.children[0].children[1]
         self.assertEqual(button.options["text"], "密匣")
+        self.assertEqual(ledger_button.options["text"], "记账")
+        self.assertEqual(ledger_button.options["compound"], "right")
+        self.assertIsNotNone(ledger_button.options["image"])
         with patch.object(self.panel, "_open_vault_box") as open_box:
             button.options["command"]()
             open_box.assert_called_once_with()

@@ -45,6 +45,7 @@ class UiServer:
         self._toast_stack = []
         self._panel = None
         self._region = None
+        self._region_suspended_grab = None
         self._pins = []
         self._image_preview = None
         self._image_preview_key = None
@@ -506,18 +507,59 @@ class UiServer:
         window.win.focus_force()
 
     # ---------- 区域截图 ----------
+    def _suspend_region_grab(self):
+        """释放本程序模态窗的 Tk grab，让全屏选区窗能接收鼠标事件。"""
+        try:
+            grabbed = self._root.grab_current()
+            if grabbed is None:
+                return None
+            status = grabbed.grab_status()
+            if status not in ("local", "global"):
+                return None
+            grabbed.grab_release()
+            return grabbed, status
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    def _restore_region_grab(self):
+        suspended = self._region_suspended_grab
+        self._region_suspended_grab = None
+        if suspended is None:
+            return
+        grabbed, status = suspended
+        try:
+            if not grabbed.winfo_exists():
+                return
+            current = self._root.grab_current()
+            # 不覆盖截图过程中由用户或其他弹框新建的 grab。
+            if current is not None and current != grabbed:
+                return
+            if status == "global":
+                grabbed.grab_set_global()
+            else:
+                grabbed.grab_set()
+            grabbed.focus_force()
+        except Exception:
+            traceback.print_exc()
+
     def _open_region(self, png):
         if self._region is not None:
             return
+        # 新增银行/存单等窗口使用 grab_set() 保证模态；若不暂时释放，
+        # 区域截图遮罩虽会出现，但鼠标事件仍被旧弹框截走，无法框选。
+        self._region_suspended_grab = self._suspend_region_grab()
         try:
             self._region = RegionSelector(self, png, self._region_done)
         except Exception:
             traceback.print_exc()
             self._region = None
+            self._restore_region_grab()
             self.actions.finish_region(None)
 
     def _region_done(self, png, pin=False, pos=None, source="region"):
         self._region = None
+        self._restore_region_grab()
         if png is not None and pin:
             try:
                 self._pins.append(PinWindow(self, png, pos))

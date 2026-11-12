@@ -1324,7 +1324,8 @@ class VaultPaletteChromeTests(unittest.TestCase):
             window = self.make_window(dark=dark)
             expected = "#0B1E2A" if dark else "#F7F4EA"
             for widget in (window.title_label.master, window.title_label,
-                           window._theme_button):
+                           window._theme_button, window._change_password_button,
+                           window._reset_password_button):
                 self.assertEqual(widget.cget("bg"), expected)
             self.assertEqual(window.title_label.cget("fg"), window.P["title"])
             self.assertGreaterEqual(_contrast(window.title_label.cget("fg"), expected), 4.5)
@@ -1357,6 +1358,57 @@ class VaultPaletteChromeTests(unittest.TestCase):
                     self.assertEqual(colors, {window.P[fg]})
                     # 控制图形非正文；确认的浅色 muted/surface 为 4.39。
                     self.assertGreaterEqual(_contrast(window.P[fg], button.cget("bg")), 3.0)
+
+    def test_change_password_button_opens_passphrase_dialog(self):
+        from unittest.mock import patch
+
+        window = self.make_window()
+        with patch("lumina.vault_auth.change_vault_passphrase", return_value=True) as change:
+            window._change_password_button.event_generate("<Button-1>", when="now")
+            self.root.update()
+        change.assert_called_once_with(self.panel, parent=window.win)
+
+    def test_change_password_button_hover_restores_rail_colours(self):
+        for dark in (False, True):
+            window = self.make_window(dark=dark)
+            button = window._change_password_button
+            button.event_generate("<Enter>", when="now")
+            self.root.update()
+            self.assertEqual(button.cget("bg"), window.P["head_bg"])
+            self.assertEqual(button.cget("fg"), window.P["title"])
+            button.event_generate("<Leave>", when="now")
+            self.root.update()
+            self.assertEqual(button.cget("bg"), window.P["rail_bg"])
+            self.assertEqual(button.cget("fg"), window.P["rail_fg"])
+
+    def test_reset_button_requires_double_confirmation_and_opens_new_setup(self):
+        from unittest.mock import patch
+
+        window = self.make_window()
+        with (patch("tkinter.messagebox.askyesno", side_effect=[True, True]) as confirm,
+              patch("lumina.vault_auth.reset_encrypted_financial_data",
+                    return_value=True) as reset):
+            window._reset_password_button.event_generate("<Button-1>", when="now")
+            self.root.update()
+        self.assertEqual(confirm.call_count, 2)
+        self.assertEqual(confirm.call_args_list[0].kwargs["default"], "no")
+        reset.assert_called_once_with(
+            self.panel, revoke_callback=window.lock_privacy)
+        self.assertTrue(self.panel._vault_authenticated)
+        self.assertTrue(window._privacy_visible)
+
+    def test_reset_button_hover_uses_warning_palette(self):
+        for dark in (False, True):
+            window = self.make_window(dark=dark)
+            button = window._reset_password_button
+            button.event_generate("<Enter>", when="now")
+            self.root.update()
+            self.assertEqual(button.cget("bg"), window.P["matured_bg"])
+            self.assertEqual(button.cget("fg"), window.P["matured_fg"])
+            button.event_generate("<Leave>", when="now")
+            self.root.update()
+            self.assertEqual(button.cget("bg"), window.P["rail_bg"])
+            self.assertEqual(button.cget("fg"), window.P["rail_fg"])
 
     def test_theme_button_hover_restores_rail_colours(self):
         for dark in (False, True):
@@ -1533,6 +1585,49 @@ class VaultPrivacyTests(unittest.TestCase):
         self.root.update()
         return window
 
+    def test_region_capture_releases_and_restores_add_dialog_grab(self):
+        from unittest.mock import Mock, patch
+        from lumina.ui import UiServer
+        from lumina.vault_window import _BankDialog, _DepositDialog
+
+        window = self.make_window()
+        dialog_factories = [
+            ("新增银行", lambda: _BankDialog(window)),
+            ("新增存单", lambda: _DepositDialog(window, banks=[{
+                "id": self.bank_id, "name": "隐私银行"}])),
+        ]
+        ui = UiServer.__new__(UiServer)
+        ui._root = self.root
+        ui._region = None
+        ui._region_suspended_grab = None
+        ui._pins = []
+        ui.actions = Mock()
+
+        for title, create_dialog in dialog_factories:
+            dialog = create_dialog()
+            with self.subTest(dialog=title):
+                self.assertIs(self.root.grab_current(), dialog.win)
+                with patch("lumina.ui.RegionSelector", side_effect=RuntimeError), \
+                        patch("lumina.ui.traceback.print_exc"):
+                    ui._open_region(b"frozen screenshot")
+                self.assertIs(self.root.grab_current(), dialog.win,
+                              "选区初始化失败时也恢复原有模态弹框")
+                ui.actions.finish_region.assert_called_once_with(None)
+                ui.actions.finish_region.reset_mock()
+                with patch("lumina.ui.RegionSelector", return_value=object()):
+                    ui._open_region(b"frozen screenshot")
+                self.assertIsNone(self.root.grab_current(),
+                                  "区域选框显示期间不能被录入弹框截走鼠标")
+                self.assertIs(ui._region_suspended_grab[0], dialog.win)
+                with patch("lumina.ui.threading.Thread") as worker:
+                    ui._region_done(None)
+                    worker.assert_called_once()
+                    worker.return_value.start.assert_called_once_with()
+                self.assertIs(self.root.grab_current(), dialog.win,
+                              "取消/完成截图后恢复原有模态弹框")
+                dialog._cancel()
+                self.assertIsNone(self.root.grab_current())
+
     def assert_hidden(self, window):
         self.assertFalse(window._privacy_visible)
         self.assertEqual(window._groups, [])
@@ -1631,7 +1726,7 @@ class VaultPrivacyTests(unittest.TestCase):
                 self.panel._vault_authenticated = False
             else:
                 window._toggle_privacy()
-            with patch("tkinter.simpledialog.askstring") as ask, patch(
+            with patch("lumina.vault_window._BankDialog") as ask, patch(
                     "tkinter.messagebox.askyesno") as confirm, patch(
                     "lumina.vault_window._DepositDialog") as dialog:
                 window._remove_bank(self.bank_id)
@@ -1643,31 +1738,183 @@ class VaultPrivacyTests(unittest.TestCase):
         self.assertEqual([dict(row) for row in self.db.list_vault_deposits()], before)
         self.assertEqual(len(self.db.list_vault_banks()), 1)
 
+    def _run_bank_dialog(self, window, action):
+        from unittest.mock import patch
+        from lumina.vault_window import _BankDialog
+        dialogs, errors = [], []
+
+        class AutomatedDialog(_BankDialog):
+            def __init__(self, owner):
+                super().__init__(owner)
+                dialogs.append(self)
+                self.win.after(0, self.run_action)
+
+            def run_action(dialog):
+                try:
+                    action(dialog)
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    if dialog.win.winfo_exists():
+                        dialog._cancel()
+
+        with patch("lumina.vault_window._BankDialog", AutomatedDialog):
+            window._add_bank()
+        self.assertIsNone(window._bank_dialog)
+        if errors:
+            raise errors[0]
+        return dialogs[0]
+
+    @staticmethod
+    def _submit_bank(dialog, name):
+        dialog.name_var.set(name)
+        dialog._submit()
+
     def test_hidden_add_bank_writes_without_reading_or_revealing_data(self):
         from unittest.mock import patch
         self.panel._vault_authenticated = False
         window = self.make_window()
-        with patch("tkinter.simpledialog.askstring", return_value="  新增隐私银行  "), \
-                patch.object(self.db, "list_vault_banks") as banks, \
+        with patch.object(self.db, "list_vault_banks") as banks, \
                 patch.object(self.db, "list_vault_deposits") as deposits:
-            window._add_bank()
+            dialog = self._run_bank_dialog(
+                window, lambda dialog: self._submit_bank(dialog, "  新增隐私银行  "))
+            self.assertEqual(dialog.result, "新增隐私银行")
             banks.assert_not_called()
             deposits.assert_not_called()
         self.assertEqual([row["name"] for row in self.db.list_vault_banks()],
                          ["隐私银行", "新增隐私银行"])
         self.assert_hidden(window)
 
+    def test_bank_dialog_colours_geometry_and_modal_focus_in_both_themes(self):
+        window = self.make_window()
+        for dark in (False, True):
+            if window.dark != dark:
+                window._toggle_theme()
+            self.root.update()
+            def inspect(dialog):
+                self.root.update()
+                P = window.P
+                self.assertEqual(dialog.win.cget("bg"), P["surface"])
+                self.assertEqual(str(dialog.win.transient()), str(window.win))
+                self.assertEqual(dialog.win.resizable(), (0, 0))
+                self.assertIs(dialog.win.grab_current(), dialog.win)
+                self.assertIs(dialog.win.focus_get(), dialog.entry)
+                self.assertEqual(dialog.win.winfo_width(), 360)
+                self.assertLess(dialog.win.winfo_height(), 300)
+                self.assertAlmostEqual(
+                    dialog.win.winfo_rootx() + dialog.win.winfo_width() / 2,
+                    window.win.winfo_rootx() + window.win.winfo_width() / 2, delta=2)
+                self.assertAlmostEqual(
+                    dialog.win.winfo_rooty() + dialog.win.winfo_height() / 2,
+                    window.win.winfo_rooty() + window.win.winfo_height() / 2, delta=2)
+                for option, key in (("bg", "card"), ("fg", "title"),
+                                    ("highlightbackground", "border"),
+                                    ("highlightcolor", "link"), ("insertbackground", "link")):
+                    self.assertEqual(dialog.entry.cget(option), P[key])
+                self.assertEqual(dialog.entry.grid_info()["ipady"], 6)
+                self.assertEqual(dialog.error.cget("fg"), P["matured_fg"])
+                for button, colours in (
+                        (dialog.add_button, ("button", "button_fg", "button_hot", "button_fg")),
+                        (dialog.cancel_button, ("card", "link", "head_bg", "link"))):
+                    for option, key in zip(
+                            ("bg", "fg", "activebackground", "activeforeground"), colours):
+                        self.assertEqual(button.cget(option), P[key])
+                dialog.cancel_button.invoke()
+            with self.subTest(dark=dark):
+                self._run_bank_dialog(window, inspect)
+                self.assertIsNone(window.win.grab_current())
+                self.assert_hidden(window)
+
+    def test_bank_blank_error_stays_open_and_clears_when_corrected(self):
+        window = self.make_window()
+        def validate(dialog):
+            for value in ("", " \t\n\u3000 "):
+                self._submit_bank(dialog, value)
+                self.assertTrue(dialog.win.winfo_exists())
+                self.assertIsNone(dialog.result)
+                self.assertEqual(dialog.error.cget("text"), "请填银行名称")
+                self.assertEqual(dialog.entry.cget("highlightcolor"), window.P["matured_fg"])
+            dialog.name_var.set("  修正银行  ")
+            self.assertEqual(dialog.error.cget("text"), "")
+            self.assertEqual(dialog.entry.cget("highlightcolor"), window.P["link"])
+            dialog.add_button.invoke()
+        dialog = self._run_bank_dialog(window, validate)
+        self.assertEqual(dialog.result, "修正银行")
+        self.assertEqual(self.db.list_vault_banks()[-1]["name"], "修正银行")
+
+    def test_bank_enter_submits_and_escape_or_window_close_cancel(self):
+        window = self.make_window()
+        for sequence in ("<Return>", "<Escape>", "WM_DELETE_WINDOW"):
+            def key_action(dialog):
+                dialog.name_var.set("  回车银行  ")
+                dialog.entry.focus_force()
+                self.root.update()
+                if sequence == "WM_DELETE_WINDOW":
+                    dialog.win.tk.call(dialog.win.protocol(sequence))
+                else:
+                    dialog.entry.event_generate(sequence, when="now")
+                self.assertFalse(dialog.win.winfo_exists())
+            with self.subTest(sequence=sequence):
+                dialog = self._run_bank_dialog(window, key_action)
+                self.assertEqual(dialog.result, "回车银行" if sequence == "<Return>" else None)
+                self.assertEqual(len(self.db.list_vault_banks()), 2)
+                self.assert_hidden(window)
+
+    def test_bank_lock_hide_close_and_auth_revocation_cancel_without_writing(self):
+        for action in ("lock", "hide", "close", "revoke"):
+            window = self.make_window()
+            self.panel._vault_authenticated = True
+            def cancel(dialog):
+                dialog.name_var.set("不得写入")
+                self.assertIs(window._bank_dialog, dialog)
+                if action == "lock":
+                    window.lock_privacy()
+                elif action == "hide":
+                    window._hide_privacy()
+                elif action == "close":
+                    window.close()
+                else:
+                    self.panel._vault_authenticated = False
+                    dialog._submit()
+                self.assertFalse(dialog.win.winfo_exists())
+                self.assertIsNone(dialog.result)
+            with self.subTest(action=action):
+                self._run_bank_dialog(window, cancel)
+                self.assertEqual(len(self.db.list_vault_banks()), 1)
+
+    def test_bank_initial_unverified_token_blocks_submit_after_lock_and_reauthentication(self):
+        from unittest.mock import patch
+        self.panel._vault_authenticated = False
+        window = self.make_window()
+        def validate(dialog):
+            dialog.name_var.set("不得写入")
+            with patch.object(dialog.name_var, "get", side_effect=lambda: (
+                    window.lock_privacy(), setattr(self.panel, "_vault_authenticated", True),
+                    "不得写入")[-1]):
+                dialog._submit()
+            self.assertIsNone(dialog.result)
+        self._run_bank_dialog(window, validate)
+        self.assertEqual(len(self.db.list_vault_banks()), 1)
+        self.panel._vault_authenticated = False
+        window._auth_seen = False
+        def after_submit(dialog):
+            self._submit_bank(dialog, "不得写入")
+            window.lock_privacy()
+            self.panel._vault_authenticated = True
+        self._run_bank_dialog(window, after_submit)
+        self.assertEqual(len(self.db.list_vault_banks()), 1)
+
     def test_hidden_add_bank_cancel_blank_and_write_error_leave_database_unchanged(self):
         from unittest.mock import patch
         window = self.make_window()
         for name in (None, "", "   "):
-            with self.subTest(name=name), patch("tkinter.simpledialog.askstring", return_value=name):
-                window._add_bank()
+            with self.subTest(name=name):
+                self._run_bank_dialog(window, lambda dialog: (
+                    dialog._cancel() if name is None else self._submit_bank(dialog, name)))
                 self.assert_hidden(window)
-        with patch("tkinter.simpledialog.askstring", return_value="失败银行"), \
-                patch.object(self.db, "add_vault_bank", side_effect=RuntimeError("私密错误")), \
+        with patch.object(self.db, "add_vault_bank", side_effect=RuntimeError("私密错误")), \
                 patch("lumina.vault_window.traceback.print_exc") as reported:
-            window._add_bank()
+            self._run_bank_dialog(window, lambda dialog: self._submit_bank(dialog, "失败银行"))
             reported.assert_called_once()
         self.assertEqual(len(self.db.list_vault_banks()), 1)
         self.assert_hidden(window)
@@ -1771,18 +2018,18 @@ class VaultPrivacyTests(unittest.TestCase):
         self.assert_hidden(window)
 
     def test_hidden_bank_prompt_rechecks_authentication_after_return(self):
-        from unittest.mock import patch
         window = self.make_window()
         for lock in (True, False):
             self.panel._vault_authenticated = True
-            def revoke(*_args, **_kwargs):
+            def revoke(dialog):
+                self._submit_bank(dialog, "不得写入")
+                self.assertIsNotNone(dialog.result)
                 if lock:
                     window.lock_privacy()
                 else:
                     self.panel._vault_authenticated = False
-                return "不得写入"
-            with self.subTest(lock=lock), patch("tkinter.simpledialog.askstring", side_effect=revoke):
-                window._add_bank()
+            with self.subTest(lock=lock):
+                self._run_bank_dialog(window, revoke)
             self.assertEqual(len(self.db.list_vault_banks()), 1)
             window._render()
             self.assert_hidden(window)
@@ -1873,9 +2120,9 @@ class VaultPrivacyTests(unittest.TestCase):
             with self.subTest(dark=dark):
                 bank = window._add_bank_button.winfo_children()[0]
                 deposit = window._add_deposit_button.label_widget
-                with patch("tkinter.simpledialog.askstring", return_value=None) as ask:
-                    bank.invoke()
-                    ask.assert_called_once()
+                window.win.after(0, lambda: window._bank_dialog._cancel())
+                bank.invoke()
+                self.assertIsNone(window._bank_dialog)
                 with patch.object(self.db, "list_vault_banks", wraps=self.db.list_vault_banks) as banks:
                     window.win.after(0, lambda: window._deposit_dialog._cancel())
                     deposit.event_generate("<ButtonPress-1>", when="now")
@@ -1896,8 +2143,12 @@ class VaultPrivacyTests(unittest.TestCase):
         def lock_and_return(*_args, **_kwargs):
             window.lock_privacy()
             return "锁屏时输入的银行"
-        with patch("tkinter.simpledialog.askstring", side_effect=lock_and_return):
-            window._add_bank()
+        def lock_bank(dialog):
+            dialog.name_var.set("锁屏时输入的银行")
+            window.lock_privacy()
+            self.assertFalse(dialog.win.winfo_exists())
+            self.assertIsNone(dialog.result)
+        self._run_bank_dialog(window, lock_bank)
         self.assertEqual(len(self.db.list_vault_banks()), 1)
         for action, identifier in ((window._remove_bank, self.bank_id),
                                    (window._remove_deposit, self.deposit_id)):
