@@ -35,5 +35,13 @@
     "salt": "+S1UrqFdVAmoofgv9LYjHQ==",
     "wrap_nonce": "5SQDIJ8bWrFfChCO",
     "wrapped_key": "Ar3vhp0oLVKICi8FpYG4ylgxb9AXquh4ZXTrJgdvAds+IELFvH4MmILxTSNhKSc8"
-  }
+  },
+  "alarm_enabled": false,
+  "alarm_label": "闹钟",
+  "alarm_date": "2026-11-13",
+  "alarm_time": "17:51:47",
+  "alarm_lead_minutes": 5,
+  "alarm_repeat": "once",
+  "alarm_style": "soft",
+  "alarm_sound": true
 }

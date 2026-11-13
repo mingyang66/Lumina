@@ -262,7 +262,23 @@ class HistoryPanel:
         # 应用上去，构建期的设置会被覆盖）。
         self.win.bind("<Map>", self._on_map_claim_taskbar, add="+")
         self._build_widgets()
+        # 闹钟调度完全独立于剪贴板数据，只依赖现有 Tk 事件循环和应用配置。
+        # 即使历史面板隐藏，after 回调仍会运行；设置窗关闭也不会停掉已保存的闹钟。
+        from .alarm_window import AlarmScheduler
+        card_master = getattr(self.win, "master", None) or self.win
+        self._alarm_scheduler = AlarmScheduler(
+            self.win, self.ui.config, self._save_alarm_settings,
+            card_master=card_master,
+            on_open_settings=self._open_alarm_settings)
+        self._alarm_scheduler.start()
+        self.win.bind("<Destroy>", self._stop_alarm_scheduler, add="+")
         self.win.withdraw()
+
+    def _stop_alarm_scheduler(self, event):
+        if event.widget is self.win:
+            scheduler = getattr(self, "_alarm_scheduler", None)
+            if scheduler is not None:
+                scheduler.stop()
 
     def _build_widgets(self):
         tk = self.tk
@@ -1585,6 +1601,30 @@ class HistoryPanel:
                 button.pack(fill="x", padx=4,
                             pady=(4, 1) if first else (1, 4))
                 first = False
+
+            def alarm_icon(dr, s, c, w):
+                w = int(round(w))
+                dr.ellipse([s * 0.16, s * 0.16, s * 0.84, s * 0.84],
+                           outline=c, width=w)
+                dr.line([(s * 0.50, s * 0.50), (s * 0.50, s * 0.30)],
+                        fill=c, width=w)
+                dr.line([(s * 0.50, s * 0.50), (s * 0.68, s * 0.58)],
+                        fill=c, width=w)
+                dr.line([(s * 0.31, s * 0.12), (s * 0.21, s * 0.20)],
+                        fill=c, width=w)
+                dr.line([(s * 0.69, s * 0.12), (s * 0.79, s * 0.20)],
+                        fill=c, width=w)
+
+            tk.Frame(frame, bg=T["separator"], height=1).pack(
+                fill="x", padx=6, pady=4)
+            alarm_photo = sm_icon(alarm_icon, 18,
+                                  color_hex=self._sys("purple"))
+            alarm_button = tk.Button(
+                frame, text="闹钟", image=alarm_photo, compound="right",
+                command=lambda: self._popup_action(self._open_alarm_settings),
+                **btn_kw)
+            alarm_button.image = alarm_photo
+            alarm_button.pack(fill="x", padx=4, pady=(1, 4))
         elif kind == "shot":
             cut_photo = sm_icon(fullscreen_icon, 18, color_hex=self._sys("blue"))
             cut_button = tk.Button(
@@ -1972,6 +2012,45 @@ class HistoryPanel:
             traceback.print_exc()
             self.status_var.set("工具打开失败，详情见控制台")
             return None
+
+    def _save_alarm_settings(self, values):
+        """保存闹钟选项；轻量 UI 测试无 App actions 时仅更新注入配置。"""
+        actions = getattr(self.ui, "actions", None)
+        save = getattr(actions, "save_settings", None)
+        if callable(save):
+            save(values)
+        else:
+            self.ui.config.update(values)
+        scheduler = getattr(self, "_alarm_scheduler", None)
+        if scheduler is not None:
+            try:
+                scheduler.refresh()
+            except Exception:
+                traceback.print_exc()
+
+    def _open_alarm_settings(self):
+        """打开单实例、与剪贴板历史解耦的闹钟设置窗。"""
+        from .alarm_window import AlarmSettingsWindow
+        registry = getattr(self, "_tool_windows", None)
+        if registry is None:
+            registry = self._tool_windows = {}
+        existing = registry.get("alarm")
+        if existing is not None and not existing._closed:
+            try:
+                if existing.window.winfo_exists():
+                    existing.summon()
+                    return existing
+            except Exception:
+                pass
+        try:
+            window = AlarmSettingsWindow(
+                self.win, self.ui.config, self._save_alarm_settings)
+        except Exception:
+            traceback.print_exc()
+            self.status_var.set("闹钟设置打开失败，详情见控制台")
+            return None
+        registry["alarm"] = window
+        return window
 
     def _cleanup_now(self):
         try:
