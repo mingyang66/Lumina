@@ -248,7 +248,6 @@ class DiffUiTests(unittest.TestCase):
     def run_lifecycle(self, has_window=True, abnormal=False):
         server = self.server
         server._build_panel = MagicMock()
-        server._build_floating_ball = MagicMock()
         root = MagicMock()
         events = []
         window = None

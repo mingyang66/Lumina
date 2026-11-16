@@ -489,26 +489,10 @@ class PreviewAndPanelTests(unittest.TestCase):
         self.assertEqual(self.server._pins, [other_pin])
         preview.win.destroy.assert_called_once()
 
-    def test_locked_panel_is_not_topmost_hover_still_is(self):
+    def test_startup_shows_the_history_panel(self):
         with patch.object(ui.clipboard_api, 'get_foreground_hwnd', return_value=12):
-            for locked in (True, False):
-                self.server._show_panel_from_floating(locked=locked)
-                self.server._panel.show.assert_called_with(
-                    12, position=None, topmost=not locked)
-
-    def test_hover_to_locked_demotes_and_cancels_hide(self):
-        self.server._panel.is_visible.return_value = True
-        self.server._floating_hide_job = 42
-        self.server._floating_click()
-        self.assertTrue(self.server._panel_locked)
-        self.server._panel.win.attributes.assert_called_with('-topmost', False)
-        self.server._root.after_cancel.assert_called_once_with(42)
-
-    def test_panel_events_bind_without_floating_ball(self):
-        with patch.object(ui, 'HistoryPanel', return_value=self.server._panel):
-            self.server._build_panel()
-        events = [call.args[0] for call in self.server._panel.win.bind.call_args_list]
-        self.assertEqual(events, ['<Enter>', '<Leave>', '<FocusOut>'])
+            self.server._show_panel_on_startup()
+        self.server._panel.show.assert_called_once_with(12)
 
     def test_detail_image_click_routes_to_single_preview(self):
         source = (ROOT / 'lumina' / 'history_panel.py').read_text(encoding='utf-8')
@@ -527,10 +511,6 @@ class PreviewAndPanelTests(unittest.TestCase):
             detail.cat = 'file'
             namespace['_open_image_preview'](detail)
             show.assert_called_with(b'file-png', ('file', 3))
-
-    def test_no_floating_ball_does_not_auto_hide_panel(self):
-        self.server._schedule_floating_hide()
-        self.server._root.after.assert_not_called()
 
     def test_preview_not_topmost_pin_still_topmost_and_update(self):
         from PIL import ImageTk
