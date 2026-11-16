@@ -94,12 +94,13 @@ class AlarmScheduler:
     TICK_MS = 1000
 
     def __init__(self, master, config, save_settings, card_master=None,
-                 on_open_settings=None):
+                 on_open_settings=None, on_show_clipboard=None):
         self.master = master
         self.card_master = card_master or master
         self.config = config
         self.save_settings = save_settings
         self.on_open_settings = on_open_settings
+        self.on_show_clipboard = on_show_clipboard
         self._job = None
         self._signature = None
         self._target = None
@@ -187,6 +188,7 @@ class AlarmScheduler:
             on_acknowledge=self._acknowledge,
             on_snooze=self._snooze, persistent=True,
             on_open_settings=self.on_open_settings,
+            on_show_clipboard=self.on_show_clipboard,
             start_collapsed=(stage == "idle" or collapsed))
 
     def _acknowledge(self, stage):
@@ -258,7 +260,8 @@ class AlarmAlertWindow:
 
     def __init__(self, master, config, stage, target,
                  on_acknowledge, on_snooze, persistent=False,
-                 start_collapsed=False, on_open_settings=None):
+                 start_collapsed=False, on_open_settings=None,
+                 on_show_clipboard=None):
         import tkinter as tk
 
         self.tk = tk
@@ -270,6 +273,7 @@ class AlarmAlertWindow:
         self.on_snooze = on_snooze
         self.persistent = persistent
         self.on_open_settings = on_open_settings
+        self.on_show_clipboard = on_show_clipboard
         self.collapsed = False
         self._closed = False
         self._sound_job = None
@@ -288,6 +292,10 @@ class AlarmAlertWindow:
         self._speed = 0.014
         self._interval = 130
         self._drag_origin = None
+        self._drag_moved = False
+        self._custom_position = False
+        self._handle_drag_origin = None
+        self._handle_dragged = False
         self._current_x = 0
         self._target_y = self.MARGIN
         self.bg, self.card, self.accent, self.fg = PALETTES.get(
@@ -375,7 +383,9 @@ class AlarmAlertWindow:
         self.handle_frame = tk.Canvas(
             self.window, width=self.HANDLE_WIDTH, height=self.HANDLE_HEIGHT,
             bg=corner, highlightthickness=0, bd=0, cursor="hand2")
-        self.handle_frame.bind("<Button-1>", self._handle_click)
+        self.handle_frame.bind("<ButtonPress-1>", self._handle_press)
+        self.handle_frame.bind("<B1-Motion>", self._handle_drag)
+        self.handle_frame.bind("<ButtonRelease-1>", self._handle_release)
         self.handle_frame.bind("<Enter>", self._handle_enter)
         self.handle_frame.bind("<Leave>", self._handle_leave)
         self._build_orb_photo()
@@ -694,12 +704,20 @@ class AlarmAlertWindow:
         self._update_countdown()
         self._start_tab_animation()
         self.window.update_idletasks()
-        self.window.geometry(
-            f"{self.HANDLE_WIDTH}x{self.HANDLE_HEIGHT}+"
-            f"{self._current_x}+{self._target_y}")
-        self._animate_x(
-            max(0, self.window.winfo_screenwidth() - self.HANDLE_WIDTH
-                - self.ORB_MARGIN))
+        if self._custom_position:
+            x, y = self._clamp_to_screen(
+                self._current_x, self._target_y,
+                self.HANDLE_WIDTH, self.HANDLE_HEIGHT)
+            self._current_x, self._target_y = x, y
+            self.window.geometry(
+                f"{self.HANDLE_WIDTH}x{self.HANDLE_HEIGHT}+{x}+{y}")
+        else:
+            self.window.geometry(
+                f"{self.HANDLE_WIDTH}x{self.HANDLE_HEIGHT}+"
+                f"{self._current_x}+{self._target_y}")
+            self._animate_x(
+                max(0, self.window.winfo_screenwidth() - self.HANDLE_WIDTH
+                    - self.ORB_MARGIN))
 
     def expand(self):
         """Restore the full card and slide it back to the top-right margin."""
@@ -718,10 +736,17 @@ class AlarmAlertWindow:
         self.window.update_idletasks()
         width = max(self.WIDTH, self.window.winfo_reqwidth())
         height = self.window.winfo_reqheight()
-        self.window.geometry(f"{width}x{height}+{self._current_x}+{self._target_y}")
+        if self._custom_position:
+            x, y = self._clamp_to_screen(
+                self._current_x, self._target_y, width, height)
+            self._current_x, self._target_y = x, y
+            self.window.geometry(f"{width}x{height}+{x}+{y}")
+        else:
+            self.window.geometry(
+                f"{width}x{height}+{self._current_x}+{self._target_y}")
+            self._animate_x(
+                max(0, self.window.winfo_screenwidth() - width - self.MARGIN))
         self._start_animation()
-        self._animate_x(
-            max(0, self.window.winfo_screenwidth() - width - self.MARGIN))
 
     def _resize_to_content(self):
         if self._closed or self.collapsed:
@@ -729,8 +754,13 @@ class AlarmAlertWindow:
         self.window.update_idletasks()
         width = max(self.WIDTH, self.window.winfo_reqwidth())
         height = self.window.winfo_reqheight()
-        self._current_x = max(
-            0, self.window.winfo_screenwidth() - width - self.MARGIN)
+        if self._custom_position:
+            x, y = self._clamp_to_screen(
+                self._current_x, self._target_y, width, height)
+            self._current_x, self._target_y = x, y
+        else:
+            self._current_x = max(
+                0, self.window.winfo_screenwidth() - width - self.MARGIN)
         self.window.geometry(f"{width}x{height}+{self._current_x}+{self._target_y}")
 
     def _animate_x(self, target_x):
@@ -875,8 +905,60 @@ class AlarmAlertWindow:
         self._sound_job = self.window.after(2200, self._ring)
 
     def _handle_click(self, _event=None):
+        if self.stage == "idle" and self.on_show_clipboard is not None:
+            try:
+                self.on_show_clipboard()
+            except Exception:
+                pass
+            return "break"
         self.expand()
         return "break"
+
+    def _handle_press(self, event):
+        self._cancel_slide()
+        self._handle_drag_origin = (event.x_root - self._current_x,
+                                    event.y_root - self._target_y)
+        self._handle_dragged = False
+        return "break"
+
+    def _handle_drag(self, event):
+        if self._handle_drag_origin is None:
+            return "break"
+        dx, dy = self._handle_drag_origin
+        x = event.x_root - dx
+        y = event.y_root - dy
+        if (abs(x - self._current_x) > 2
+                or abs(y - self._target_y) > 2):
+            self._handle_dragged = True
+            self._custom_position = True
+        if not self._handle_dragged:
+            return "break"
+        x, y = self._clamp_to_screen(
+            x, y, self.HANDLE_WIDTH, self.HANDLE_HEIGHT)
+        self._current_x, self._target_y = x, y
+        self.window.geometry(
+            f"{self.HANDLE_WIDTH}x{self.HANDLE_HEIGHT}+{x}+{y}")
+        return "break"
+
+    def _handle_release(self, _event=None):
+        moved = self._handle_dragged
+        self._handle_drag_origin = None
+        self._handle_dragged = False
+        if not moved:
+            if self.stage == "idle" and self.on_show_clipboard is not None:
+                try:
+                    self.on_show_clipboard()
+                except Exception:
+                    pass
+            else:
+                self.expand()
+        return "break"
+
+    def _clamp_to_screen(self, x, y, width, height):
+        screen_w = self.window.winfo_screenwidth()
+        screen_h = self.window.winfo_screenheight()
+        return (min(max(0, int(x)), max(0, screen_w - width)),
+                min(max(0, int(y)), max(0, screen_h - height)))
 
     def _enable_drag(self):
         self.window.bind("<Button-1>", self._drag_start)
@@ -887,18 +969,31 @@ class AlarmAlertWindow:
         if self.collapsed:
             return
         self._cancel_slide()
+        self._cancel_auto_collapse()
         self._drag_origin = (event.x_root - self._current_x,
                              event.y_root - self._target_y)
+        self._drag_moved = False
 
     def _drag_move(self, event):
         if self._drag_origin is None:
             return
-        self._current_x = event.x_root - self._drag_origin[0]
-        self._target_y = event.y_root - self._drag_origin[1]
-        self.window.geometry(f"+{self._current_x}+{self._target_y}")
+        x = event.x_root - self._drag_origin[0]
+        y = event.y_root - self._drag_origin[1]
+        if (abs(x - self._current_x) > 2
+                or abs(y - self._target_y) > 2):
+            self._drag_moved = True
+            self._custom_position = True
+        if not self._drag_moved:
+            return
+        x, y = self._clamp_to_screen(
+            x, y, self.window.winfo_width(), self.window.winfo_height())
+        self._current_x, self._target_y = x, y
+        self.window.geometry(f"+{x}+{y}")
 
     def _drag_end(self, _event=None):
         self._drag_origin = None
+        self._drag_moved = False
+        self._schedule_auto_collapse()
 
     def _open_settings(self, _event=None):
         if self.on_open_settings is None:
@@ -1467,6 +1562,17 @@ class AlarmSettingsWindow:
         return True
 
     def preview(self):
+        preview_config = {
+            "alarm_label": self.label_var.get().strip() or "闹钟预览",
+            "alarm_style": STYLE_VALUES.get(self.style_var.get(), "neon"),
+            "alarm_sound": False,
+        }
+        if not self.enabled_var.get():
+            AlarmAlertWindow(self.parent, preview_config, "idle", None,
+                             on_acknowledge=lambda _stage: None,
+                             on_snooze=lambda _stage, _minutes: None,
+                             on_open_settings=self.summon)
+            return
         try:
             moment = self.datetime_picker.value()
         except (TypeError, ValueError):
@@ -1477,14 +1583,10 @@ class AlarmSettingsWindow:
             "alarm_date": moment.strftime(DATE_FORMAT),
             "alarm_repeat": REPEAT_VALUES.get(self.repeat_var.get(), "once"),
         }) or moment
-        preview_config = {
-            "alarm_label": self.label_var.get().strip() or "闹钟预览",
-            "alarm_style": STYLE_VALUES.get(self.style_var.get(), "neon"),
-            "alarm_sound": False,
-        }
         AlarmAlertWindow(self.parent, preview_config, "early", target,
                          on_acknowledge=lambda _stage: None,
-                         on_snooze=lambda _stage, _minutes: None)
+                         on_snooze=lambda _stage, _minutes: None,
+                         on_open_settings=self.summon)
 
     def summon(self):
         if self._closed:

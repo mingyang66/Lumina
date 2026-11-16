@@ -192,9 +192,13 @@ class UiServer:
                     elif kind == "toggle_panel":
                         self._toggle_panel()
                     elif kind == "show_panel":
-                        if self._panel and not self._panel.is_visible():
-                            self._prev_hwnd = clipboard_api.get_foreground_hwnd()
-                            self._panel.show(self._prev_hwnd)
+                        if self._panel:
+                            if self._panel.is_visible():
+                                self._panel.win.lift()
+                                self._panel.win.focus_force()
+                            else:
+                                self._prev_hwnd = clipboard_api.get_foreground_hwnd()
+                                self._panel.show(self._prev_hwnd)
                     elif kind == "hide_panel":
                         if self._panel and self._panel.is_visible():
                             self._panel.hide()

@@ -2,6 +2,8 @@
 import re
 import unittest
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 try:
     import tkinter as tk
@@ -242,6 +244,67 @@ class AlarmAlertWindowTests(unittest.TestCase):
         self.assertEqual(window.full_frame.winfo_manager(), "pack")
         self.assertEqual(window.handle_frame.winfo_manager(), "")
 
+    def test_collapsed_orb_can_be_dragged_without_expanding(self):
+        window = self._make("scheduled", persistent=True)
+        window.collapse()
+        window._cancel_slide()
+        window._current_x = 500
+        window._target_y = 120
+        window.window.geometry("100x100+500+120")
+        window._handle_press(SimpleNamespace(x_root=510, y_root=130))
+        window._handle_drag(SimpleNamespace(x_root=560, y_root=170))
+        window._handle_release(SimpleNamespace(x_root=560, y_root=170))
+        self.assertTrue(window.collapsed)
+        self.assertTrue(window._custom_position)
+        self.assertEqual((window._current_x, window._target_y), (550, 160))
+
+    def test_orb_click_without_moving_expands(self):
+        window = self._make("scheduled", persistent=True)
+        window.collapse()
+        window._cancel_slide()
+        window._current_x = 500
+        window._target_y = 120
+        window.window.geometry("100x100+500+120")
+        window._handle_press(SimpleNamespace(x_root=510, y_root=130))
+        window._handle_release(SimpleNamespace(x_root=510, y_root=130))
+        self.assertFalse(window.collapsed)
+
+    def test_expanded_card_drag_keeps_custom_position(self):
+        window = self._make()
+        window._current_x = 1000
+        window._target_y = 100
+        window.window.geometry("420x363+1000+100")
+        window._drag_start(SimpleNamespace(x_root=1010, y_root=110))
+        window._drag_move(SimpleNamespace(x_root=1060, y_root=150))
+        window._drag_end()
+        self.assertTrue(window._custom_position)
+        self.assertEqual((window._current_x, window._target_y), (1050, 140))
+
+    def test_custom_position_survives_collapse_and_expand(self):
+        window = self._make()
+        window._custom_position = True
+        window._current_x = 500
+        window._target_y = 100
+        window.collapse()
+        window._cancel_slide()
+        self.assertEqual((window._current_x, window._target_y), (500, 100))
+        window.expand()
+        window._cancel_slide()
+        self.assertEqual((window._current_x, window._target_y), (500, 100))
+
+    def test_idle_orb_click_opens_clipboard_instead_of_card(self):
+        calls = []
+        self.window = AlarmAlertWindow(
+            self.root,
+            {"alarm_label": "闹钟", "alarm_style": "soft", "alarm_sound": False},
+            "idle", None, lambda _stage: None,
+            lambda _stage, _minutes: None, persistent=True,
+            start_collapsed=True, on_show_clipboard=lambda: calls.append(True))
+        self.window._handle_press(SimpleNamespace(x_root=100, y_root=100))
+        self.window._handle_release(SimpleNamespace(x_root=100, y_root=100))
+        self.assertEqual(calls, [True])
+        self.assertTrue(self.window.collapsed)
+
     def test_collapsed_tab_shows_the_second_countdown(self):
         window = self._make("scheduled", persistent=True)
         window.primary.invoke()
@@ -437,6 +500,25 @@ class AlarmSettingsWindowTests(unittest.TestCase):
         self.window.time_var.set("12:34:56")
         self.assertTrue(self.window.save())
         self.assertEqual(self.saved["alarm_time"], "12:34:56")
+
+    def test_preview_without_an_enabled_alarm_shows_idle_card(self):
+        self.window.enabled_var.set(False)
+        with patch("lumina.alarm_window.AlarmAlertWindow") as factory:
+            self.window.preview()
+        args, _kwargs = factory.call_args
+        self.assertEqual(args[2], "idle")
+        self.assertIsNone(args[3])
+
+    def test_preview_with_an_enabled_alarm_shows_early_card(self):
+        self.window.enabled_var.set(True)
+        self.window.date_var.set(
+            (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
+        self.window.time_var.set("12:34:56")
+        with patch("lumina.alarm_window.AlarmAlertWindow") as factory:
+            self.window.preview()
+        args, _kwargs = factory.call_args
+        self.assertEqual(args[2], "early")
+        self.assertIsNotNone(args[3])
 
     def test_picker_selection_writes_back_date_and_time(self):
         moment = (datetime.now() + timedelta(days=2)).replace(microsecond=0)

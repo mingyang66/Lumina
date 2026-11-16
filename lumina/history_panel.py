@@ -269,7 +269,8 @@ class HistoryPanel:
         self._alarm_scheduler = AlarmScheduler(
             self.win, self.ui.config, self._save_alarm_settings,
             card_master=card_master,
-            on_open_settings=self._open_alarm_settings)
+            on_open_settings=self._open_alarm_settings,
+            on_show_clipboard=self.ui.show_panel)
         self._alarm_scheduler.start()
         self.win.bind("<Destroy>", self._stop_alarm_scheduler, add="+")
         self.win.withdraw()

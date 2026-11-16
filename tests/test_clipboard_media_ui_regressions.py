@@ -494,6 +494,13 @@ class PreviewAndPanelTests(unittest.TestCase):
             self.server._show_panel_on_startup()
         self.server._panel.show.assert_called_once_with(12)
 
+    def test_show_panel_lifts_a_visible_panel(self):
+        self.server._panel.is_visible.return_value = True
+        self.server._put(("show_panel",))
+        self.server._poll()
+        self.server._panel.win.lift.assert_called_once()
+        self.server._panel.win.focus_force.assert_called_once()
+
     def test_detail_image_click_routes_to_single_preview(self):
         source = (ROOT / 'lumina' / 'history_panel.py').read_text(encoding='utf-8')
         cls = next(node for node in ast.parse(source).body
