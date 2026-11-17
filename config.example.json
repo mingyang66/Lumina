@@ -20,16 +20,6 @@
   "hide_panel_on_capture": false,
   "download_dir": "",
   "autostart": false,
-  "money_crypto": {
-    "version": 1,
-    "kdf": "argon2id",
-    "memory_kib": 65536,
-    "time_cost": 3,
-    "parallelism": 1,
-    "salt": "+S1UrqFdVAmoofgv9LYjHQ==",
-    "wrap_nonce": "5SQDIJ8bWrFfChCO",
-    "wrapped_key": "Ar3vhp0oLVKICi8FpYG4ylgxb9AXquh4ZXTrJgdvAds+IELFvH4MmILxTSNhKSc8"
-  },
   "alarm_enabled": false,
   "alarm_label": "闹钟",
   "alarm_date": "2026-11-16",
