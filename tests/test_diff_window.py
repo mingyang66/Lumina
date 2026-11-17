@@ -560,7 +560,13 @@ class DiffWindowTests(unittest.TestCase):
         window.win.update()
         popup = window._mode_popup
         self.assertIsNotNone(popup)
-        self.assertIs(window.win.focus_get(), popup.canvas)
+        # 本用例后半段靠 <Down>/<Return> 事件分发，前提是弹层真的拿到控件级
+        # 焦点。锁屏/远程/后台会话里 focus_get() 只返回窗口自身或 None，键盘
+        # 事件根本送不到处理器，继续跑只会得到「_active == 0」这种假红。
+        focused = window.win.focus_get()
+        if focused is None or focused is window.win:
+            self.skipTest("当前会话拿不到控件级焦点，键盘事件无法分发")
+        self.assertIs(focused, popup.canvas)
         popup.canvas.event_generate('<Motion>', x=30, y=popup._pad + popup._row_height + 10)
         window.win.update()
         self.assertEqual(popup._hover, 1)

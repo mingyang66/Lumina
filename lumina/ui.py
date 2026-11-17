@@ -5,6 +5,7 @@ Tk 解释器。因此 toast 与面板共用这里的一个 UI 线程，通过队
 """
 import gc
 import io
+import logging
 import queue
 import threading
 import time
@@ -15,6 +16,8 @@ from . import clipboard_api
 from .diff_window import DiffWindow
 from .history_panel import HistoryPanel
 from .region_selector import RegionSelector
+
+log = logging.getLogger(__name__)
 
 
 class UiServer:
@@ -73,7 +76,7 @@ class UiServer:
             self._put(("quit",), replace_oldest=True)
             thread.join(timeout=3)
             if thread.is_alive():
-                print("[lumina] UI thread did not stop in time", flush=True)
+                log.warning("UI thread did not stop in time")
             else:
                 self._thread = None
 
@@ -142,14 +145,14 @@ class UiServer:
         try:
             import tkinter as tk
         except ImportError:
-            print("[lumina] UI disabled: tkinter unavailable", flush=True)
+            log.warning("UI disabled: tkinter unavailable")
             self.toast_enabled = self.panel_enabled = False
             return
         self._tk = tk
         try:
             root = tk.Tk()
         except Exception as e:
-            print(f"[lumina] UI disabled: {e}", flush=True)
+            log.warning("UI disabled: %s", e)
             self.toast_enabled = self.panel_enabled = False
             return
         try:

@@ -1,4 +1,5 @@
 import ctypes
+import logging
 import queue
 import threading
 import time
@@ -7,6 +8,8 @@ from ctypes import wintypes
 
 from . import clipboard_api
 from .media import dib_to_png
+
+log = logging.getLogger(__name__)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -194,13 +197,12 @@ class ClipboardListener(threading.Thread):
                 hid = HOTKEY_BASE + i
                 mods, vk = parse_hotkey(spec)
                 if mods is None:
-                    print(f"[lumina] invalid hotkey spec: '{spec}'", flush=True)
+                    log.warning("invalid hotkey spec: %r", spec)
                     continue
                 if user32.RegisterHotKey(hwnd, hid, mods, vk):
                     self._hotkey_ids[hid] = (spec, cb)
                 else:
-                    print(f"[lumina] hotkey '{spec}' register failed: "
-                          f"{ctypes.WinError()}", flush=True)
+                    log.warning("hotkey %r register failed: %s", spec, ctypes.WinError())
             self._ready.set()
             msg = MSG()
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -299,10 +301,9 @@ class ClipboardListener(threading.Thread):
             try:
                 self._work_queue.put_nowait(item)
             except queue.Full:
-                print("[lumina] processor queue saturated; newest item dropped",
-                      flush=True)
+                log.warning("processor queue saturated; newest item dropped")
                 return
-            print("[lumina] processor queue full; oldest item dropped", flush=True)
+            log.warning("processor queue full; oldest item dropped")
 
     def _worker_loop(self):
         try:

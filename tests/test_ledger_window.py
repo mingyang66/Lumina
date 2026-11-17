@@ -183,7 +183,13 @@ class LedgerWindowTests(unittest.TestCase):
 
         def first():
             dialog = self.window._deposit_dialog
-            self.assertEqual(dialog.win.focus_get(), dialog.entries["amount"])
+            # 本会话锁屏/无前台窗口时，Tk 的焦点只停在窗口自身（focus_get()
+            # 返回 Toplevel 甚至 None），控件级焦点根本拿不到；只有焦点真的
+            # 落在控件上时才断言，否则这条会假红（见 test_tool_window 里对
+            # focus_get() 判别力的同一段说明）。
+            focused = dialog.win.focus_get()
+            if focused is not None and focused is not dialog.win:
+                self.assertEqual(focused, dialog.entries["amount"])
             self.fill(dialog, amount="5")
             calls.append(1)
             dialog._submit(True)
@@ -688,7 +694,7 @@ class LedgerWindowTests(unittest.TestCase):
         self.reveal()
         marks = {w[4].cget("text")[0] for w in self.window._entry_widgets.values()}
         self.assertEqual(marks, {"−", "＋", "⇄", "↩"})
-        row, category, account, info, amount, edit, delete, detail = self.window._entry_widgets[item]
+        row, _category, _account, info, _amount, edit, delete, detail = self.window._entry_widgets[item]
         self.assertTrue(info.cget("text").endswith("..."))
         self.assertFalse(detail.winfo_ismapped())
         self.assertTrue(int(edit.cget("takefocus")))
@@ -731,7 +737,7 @@ class LedgerWindowTests(unittest.TestCase):
         self.window.win.geometry("1000x760")
         self.root.update()
         item, widgets = next(iter(self.window._entry_widgets.items()))
-        row, category, account, info, amount, edit, delete, detail = widgets
+        row, _category, _account, _info, _amount, edit, delete, detail = widgets
         self.assertEqual([edit.cget("text"), delete.cget("text")], ["编辑", "删除"])
         self.assertFalse(detail.winfo_ismapped())
         self.assertEqual(len([c for c in row.winfo_children() if isinstance(c, tk.Button)]), 0)
@@ -820,7 +826,7 @@ class LedgerWindowTests(unittest.TestCase):
         self.assertEqual(len(self.window._filtered_rows()), 2)
         self.assertEqual(self.window.filter_tags.cget("text"), "")
         self.assertFalse(self.window.clear_filters_button.winfo_ismapped())
-        row, category, account, info, amount, edit, delete, detail = self.window._entry_widgets[item]
+        _row, _category, _account, info, _amount, edit, delete, detail = self.window._entry_widgets[item]
         with patch("lumina.ledger_window.messagebox.showinfo") as show:
             self.click(info)
             self.assertIn("特定备注" * 60, detail.cget("text"))
@@ -870,7 +876,7 @@ class LedgerWindowTests(unittest.TestCase):
                         font = tkfont.Font(font=summary.cget("font"))
                         self.assertLessEqual(font.measure(summary.cget("text")), summary.winfo_width() - 4)
                 for widgets in self.window._entry_widgets.values():
-                    row, cat, acc, note, amount, edit, delete, detail = widgets
+                    row, cat, acc, note, amount, edit, delete, _detail = widgets
                     self.assertGreaterEqual(row.winfo_height(), 36)
                     self.assertLessEqual(row.winfo_height(), 40)
                     for column, widget in enumerate((cat, acc, note, amount)):
@@ -895,7 +901,7 @@ class LedgerWindowTests(unittest.TestCase):
         self.reveal()
         for _ in range(2):
             for index, widgets in enumerate(self.window._entry_widgets.values()):
-                row, category, account, note, amount, edit, delete, detail = widgets
+                row, category, account, note, amount, edit, delete, _detail = widgets
                 base = self.window.P["row_alt" if index % 2 else "card"]
                 row.event_generate("<Leave>", x=-10, y=-10)
                 self.root.update()

@@ -194,8 +194,12 @@ class MoneyCryptoTests(unittest.TestCase):
 
     def test_change_passphrase_rewraps_same_key_without_touching_amounts(self):
         from lumina.money_crypto import (
-            InvalidPassphrase, create_key_envelope, decrypt_amount,
-            encrypt_amount, rewrap_key_envelope, unlock_key,
+            InvalidPassphrase,
+            create_key_envelope,
+            decrypt_amount,
+            encrypt_amount,
+            rewrap_key_envelope,
+            unlock_key,
         )
 
         old_metadata, data_key = create_key_envelope("correct horse battery")

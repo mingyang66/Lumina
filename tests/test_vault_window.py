@@ -1587,6 +1587,7 @@ class VaultPrivacyTests(unittest.TestCase):
 
     def test_region_capture_releases_and_restores_add_dialog_grab(self):
         from unittest.mock import Mock, patch
+
         from lumina.ui import UiServer
         from lumina.vault_window import _BankDialog, _DepositDialog
 
@@ -1740,6 +1741,7 @@ class VaultPrivacyTests(unittest.TestCase):
 
     def _run_bank_dialog(self, window, action):
         from unittest.mock import patch
+
         from lumina.vault_window import _BankDialog
         dialogs, errors = [], []
 
@@ -2358,7 +2360,7 @@ class DepositDialogTests(unittest.TestCase):
         return window, _DepositDialog(window)
 
     def test_bank_flat_selector_and_name_presets(self):
-        window, dialog = self._dialog()
+        _window, dialog = self._dialog()
         self.root.update()
         self.assertFalse(int(dialog.bank_option.cget("indicatoron")))
         self.assertEqual(dialog.bank_option.cget("relief"), "flat")

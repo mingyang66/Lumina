@@ -18,7 +18,7 @@ from lumina import json_modes, json_tools
 
 # 测试位于 tests/ 子目录，上跳一层才是项目根（lumina/ 与 main.py 所在处）。
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / 'lumina' / 'history_panel.py'
+SOURCE = ROOT / 'lumina' / 'panel_detail.py'
 
 # ``DetailPane`` 的类体与它内部的方法**在运行期会查找这些模块级名字**
 # （``JSON_MODE_LABELS = MODE_LABELS``、``_json_menu`` 里的 ``build_menu_items``、

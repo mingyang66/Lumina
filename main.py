@@ -2,13 +2,22 @@ import argparse
 import os
 import sys
 
+from lumina import __version__
 from lumina.database import Database
 from lumina.settings import default_config_path, load_config
 
 
 def cmd_run(cfg, config_path=None):
+    from lumina.log_setup import configure
+    configure()
     from lumina.application import LuminaApp
     LuminaApp(cfg, config_path).start()
+
+
+def cmd_doctor(cfg, config_path):
+    from lumina.doctor import collect, format_report
+    print(format_report(collect(cfg, config_path)))
+    return 0
 
 
 def _print_rows(rows):
@@ -143,6 +152,7 @@ def main():
         sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
     parser = argparse.ArgumentParser(prog="lumina",
                                      description="clipboard & screenshot archiver (SQLite)")
+    parser.add_argument("--version", action="version", version=f"Lumina {__version__}")
     default_config = default_config_path()
     parser.add_argument("-c", "--config", default=default_config, help="config file path")
     sub = parser.add_subparsers(dest="cmd")
@@ -164,6 +174,7 @@ def main():
     p_export.add_argument("out", nargs="?")
     sub.add_parser("clean", help="run retention cleanup now")
     sub.add_parser("stats", help="show database statistics")
+    sub.add_parser("doctor", help="check interpreter, dependencies, Tesseract and storage")
     args = parser.parse_args()
 
     args.config = os.path.abspath(args.config)
@@ -190,6 +201,8 @@ def main():
         cmd_clean(cfg)
     elif cmd == "stats":
         cmd_stats(cfg)
+    elif cmd == "doctor":
+        cmd_doctor(cfg, args.config)
 
 
 if __name__ == "__main__":

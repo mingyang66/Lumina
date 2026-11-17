@@ -502,7 +502,7 @@ class PreviewAndPanelTests(unittest.TestCase):
         self.server._panel.win.focus_force.assert_called_once()
 
     def test_detail_image_click_routes_to_single_preview(self):
-        source = (ROOT / 'lumina' / 'history_panel.py').read_text(encoding='utf-8')
+        source = (ROOT / 'lumina' / 'panel_detail.py').read_text(encoding='utf-8')
         cls = next(node for node in ast.parse(source).body
                    if isinstance(node, ast.ClassDef) and node.name == 'DetailPane')
         method = next(node for node in cls.body

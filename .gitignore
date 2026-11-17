@@ -25,6 +25,7 @@ Thumbs.db
 .idea/
 *.swp
 
+
 # Logs
 *.log
 err.log

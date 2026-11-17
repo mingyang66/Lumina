@@ -471,6 +471,18 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(settings.load_config(config)['db_path'], db_path)
                 self.assertEqual(config.read_bytes(), original)
 
+    def test_missing_default_config_is_created_from_example(self):
+        """仓库不再跟踪 config.json：首次运行从 config.example.json 生成。"""
+        target = self.root / 'config.json'
+        self.assertFalse(target.exists())
+        with patch.object(settings, 'default_config_path', return_value=str(target)):
+            cfg = settings.load_config()
+        self.assertTrue(target.is_file())
+        self.assertEqual(cfg['db_path'], str(self.root / 'data' / 'lumina.db'))
+        written = json.loads(target.read_text(encoding='utf-8'))
+        self.assertEqual(written['db_path'], 'data/lumina.db')
+        self.assertNotIn('money_crypto', written)
+
     def test_frozen_bootstrap_uses_bundle_then_stable_config(self):
         executable = self.root / 'portable' / 'Lumina.exe'
         bundle = self.root / 'unpack'
@@ -494,7 +506,12 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(stable.is_file())
             self.assertEqual(cfg['db_path'], target)
             self.assertFalse(Path(target).exists())
-            self.assertEqual(json.loads(stable.read_text(encoding='utf-8')), cfg)
+            written = json.loads(stable.read_text(encoding='utf-8'))
+            # db_path 写回时折成相对写法（见 settings._relative_db_path），
+            # 因此比较「解析后的绝对路径」与「其余字段原样」。
+            self.assertEqual(settings.load_config(stable)['db_path'], cfg['db_path'])
+            self.assertEqual({k: v for k, v in written.items() if k != 'db_path'},
+                             {k: v for k, v in cfg.items() if k != 'db_path'})
             cfg['autostart'] = True
             settings.save_config(cfg)
             (bundle / 'config.json').unlink()

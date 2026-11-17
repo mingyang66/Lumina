@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import queue
 import threading
@@ -15,6 +16,8 @@ from .settings import _resolve_db_path, default_config_path, save_config, set_au
 from .system_tray import TrayIcon
 from .text_classifier import classify_text
 from .ui import UiServer
+
+log = logging.getLogger(__name__)
 
 
 class LuminaApp:
@@ -125,7 +128,7 @@ class LuminaApp:
 
     @staticmethod
     def _log(msg):
-        print(f"[lumina] {msg}", flush=True)
+        log.info(msg)
 
     # ---------- 截图 ----------
     def _hide_panel_for_capture(self):
@@ -149,8 +152,7 @@ class LuminaApp:
             if self.config.get("copy_screenshot_to_clipboard", True):
                 dib = image_to_dib(img)
                 self.listener.write_clipboard(clipboard_api.set_clipboard_dib, dib)
-            print(f"[lumina] screenshot #{clip_id} saved ({len(png) // 1024} KB)",
-                  flush=True)
+            log.info("screenshot #%s saved (%d KB)", clip_id, len(png) // 1024)
             self.ui.notify("screenshot", clip_id, png=png, source="screenshot")
             self.ui.refresh_panel()
         except Exception:
@@ -283,7 +285,7 @@ class LuminaApp:
                     self.config.get("max_rows", 5000),
                 )
                 if deleted:
-                    print(f"[lumina] cleanup: removed {deleted} expired record(s)")
+                    log.info("cleanup: removed %s expired record(s)", deleted)
         except Exception:
             traceback.print_exc()
         finally:
@@ -296,7 +298,7 @@ class LuminaApp:
                 self.config.get("max_rows", 5000),
             )
             if deleted:
-                print(f"[lumina] startup cleanup: removed {deleted} expired record(s)")
+                log.info("startup cleanup: removed %s expired record(s)", deleted)
             self._cleaner_thread = threading.Thread(
                 target=self._cleaner_loop, name="lumina-cleaner", daemon=True)
             self._cleaner_thread.start()
@@ -310,22 +312,19 @@ class LuminaApp:
                 raise RuntimeError(
                     f"clipboard listener failed to start: {self.listener._startup_error}")
             self.tray.start()
-            print("[lumina] clipboard monitor running", flush=True)
-            print(f"[lumina] db: {os.path.abspath(self.db.path)}", flush=True)
-            print(f"[lumina] screenshot hotkey: {self.config.get('hotkey_capture')}",
-                  flush=True)
-            print(f"[lumina] region capture hotkey: {self.config.get('hotkey_region')}",
-                  flush=True)
-            print(f"[lumina] history panel hotkey: {self.config.get('hotkey_panel')}",
-                  flush=True)
-            print(f"[lumina] retention: {self.config.get('retention_days')} days / "
-                  f"max {self.config.get('max_rows')} rows", flush=True)
-            print("[lumina] press Ctrl+C to exit", flush=True)
+            log.info("clipboard monitor running")
+            log.info("db: %s", os.path.abspath(self.db.path))
+            log.info("hotkeys: capture=%s region=%s panel=%s",
+                     self.config.get("hotkey_capture"),
+                     self.config.get("hotkey_region"),
+                     self.config.get("hotkey_panel"))
+            log.info("retention: %s days / max %s rows",
+                     self.config.get("retention_days"), self.config.get("max_rows"))
             while not self._stop.wait(0.5):
                 if not self.listener.is_alive():
                     raise RuntimeError("clipboard listener stopped unexpectedly")
         except KeyboardInterrupt:
-            print("\n[lumina] shutting down...")
+            log.info("shutting down...")
         finally:
             self._stop.set()
             self._file_queue.put(None)

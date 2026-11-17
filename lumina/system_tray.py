@@ -1,7 +1,9 @@
 """Windows system-tray integration for Lumina."""
+import logging
 import os
 import threading
-import traceback
+
+log = logging.getLogger(__name__)
 
 
 def _best_effort_taskbar_filter(api):
@@ -18,10 +20,10 @@ def _best_effort_taskbar_filter(api):
                     and message == api.WM_TASKBARCREATED
                     and action == api.MSGFLT_ALLOW):
                 if not warned:
-                    print("[lumina] tray warning: Windows denied the optional "
-                          "Explorer-restart message filter; the tray icon will "
-                          "continue without automatic recovery after Explorer restarts.",
-                          flush=True)
+                    log.warning(
+                        "tray warning: Windows denied the optional "
+                        "Explorer-restart message filter; the tray icon will "
+                        "continue without automatic recovery after Explorer restarts.")
                     warned = True
                 # pystray only needs this call to succeed to continue creating its
                 # message window; the filter itself is an optional recovery feature.
@@ -48,7 +50,7 @@ class TrayIcon:
         try:
             import pystray
         except ImportError:
-            print("[lumina] tray disabled: install pystray to enable it", flush=True)
+            log.warning("tray disabled: install pystray to enable it")
             return False
 
         # 画法与任务栏图标**同源**：直接复用 `app_icon.draw_mark`，不再在这里
@@ -57,8 +59,10 @@ class TrayIcon:
         # 大图标尺寸），`draw_mark` 内部自带超采样抗锯齿。
         from .app_icon import draw_mark
         image = draw_mark(48)
+        from . import __version__
 
         menu = pystray.Menu(
+            pystray.MenuItem(f"Lumina v{__version__}", None, enabled=False),
             pystray.MenuItem("显示面板", self._toggle_panel,
                              checked=self._panel_is_visible, default=True),
             pystray.Menu.SEPARATOR,
@@ -71,7 +75,9 @@ class TrayIcon:
         return True
 
     def _run(self):
-        restore_filter = lambda: None
+        def restore_filter():
+            """非 Windows 或未装过滤器时的兜底：无操作。"""
+
         try:
             if os.name == "nt":
                 # Pystray uses this filter only to re-register the icon after an
@@ -81,8 +87,7 @@ class TrayIcon:
                 restore_filter = _best_effort_taskbar_filter(win32)
             self._icon.run()
         except Exception as exc:
-            print(f"[lumina] tray stopped: {exc}", flush=True)
-            traceback.print_exc()
+            log.error("tray stopped: %s", exc, exc_info=True)
         finally:
             restore_filter()
 

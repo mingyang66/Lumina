@@ -22,6 +22,20 @@ Windows 剪贴板管理器。常驻托盘，自动记录文本 / 图片 / 文件
 .venv\Scripts\python.exe main.py
 ```
 
+首次运行会在项目根生成 `config.json`（从 `config.example.json` 复制，模板里
+`db_path` 是相对路径），之后所有设置改动都写回它。仓库**不跟踪** `config.json`
+—— 它会变，而且含有密匣的密钥材料。
+
+环境有问题先跑自检，别靠猜：
+
+```powershell
+.venv\Scripts\python.exe main.py doctor
+```
+
+它会一次列出解释器（是否 venv）、各运行时依赖、Tesseract 的版本与语言包、
+配置文件 / 数据库 / 日志的落点。用系统 `python` 启动时，OCR、托盘、密匣会
+静默降级 —— `doctor` 会把这种「看起来正常但少东西」的状态直接标出来。
+
 常用快捷键在 `config.json` 里配置，默认 `ctrl+alt+v` 采集、`ctrl+alt+s` 区域截图、
 `alt+v` 打开历史面板。
 
@@ -739,48 +753,38 @@ LUMINA 字样，与托盘图标同源），存成含 16/32/48/256 四种尺寸�
 
 # 打包命令
 
-使用 PyInstaller 将 Lumina 打包为 Windows 应用程序：
+用 PyInstaller 打成单文件 Windows 程序。**构建入口只有 `Lumina.spec`**（图标、
+版本资源、数据文件都写在里面），不要再手敲一长串命令行参数——两套口径必然漂。
 
 ```powershell
-python -m PyInstaller --clean --noconfirm --onefile --windowed --name "Lumina" `
-    --add-data "config.json;." `
-    --add-data "data/schema.sql;data" `
-    --hidden-import "tkinter" `
-    --hidden-import "_tkinter" `
-    --hidden-import "PIL" `
-    --hidden-import "PIL.Image" `
-    main.py
+.venv\Scripts\python.exe -m pip install pyinstaller      # 打包依赖，不在 requirements.txt 里
+.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm Lumina.spec
 ```
 
-参数说明：
+产物在 `dist/Lumina.exe`。`Lumina.spec` 里固化的东西：
 
-- `python -m PyInstaller`：使用当前 Python 环境中的 PyInstaller 打包工具。建议在项目 `.venv` 激活后执行。
-  PyInstaller 属于**打包时的开发依赖，不在 `requirements.txt` 里**（运行时并不需要它），首次打包前需单独安装：
-  ```powershell
-  pip install pyinstaller
-  ```
-- `--clean`：清理 PyInstaller 的临时缓存后再开始构建，避免旧缓存影响打包结果。
-- `--noconfirm`：自动确认覆盖并删除已有的输出目录，不再显示确认提示。
-- `--windowed`：生成窗口程序，运行 GUI 应用时不显示命令行窗口。该参数也可以写成 `--noconsole`。
-- `--onefile`：将程序及其依赖打包成一个独立的 `Lumina.exe` 文件。
-- `--name "Lumina"`：将生成的应用程序命名为 `Lumina`。
-- `--add-data "config.json;."`：将 `config.json` 一起复制到打包程序的顶层目录。Windows 使用分号分隔源文件和目标目录。
-- `--hidden-import`：显式包含动态导入的 `tkinter`、`_tkinter` 和 Pillow 模块。
-- `main.py`：指定应用程序的入口文件。
+| 项 | 作用 |
+|---|---|
+| `icon='lumina-app.ico'` | exe 在资源管理器/任务栏的图标 |
+| `version='version_info.txt'` | 文件版本号（0.1.0），属性面板可见 |
+| `datas=[('config.example.json','.'), ('data/schema.sql','data')]` | 只带配置**模板**与建表脚本 |
+| `hiddenimports=[..., 'pytesseract']` | 截图提取文字用；该导入在函数内部，PyInstaller 需要显式声明 |
 
-打包结果默认生成在 `dist/` 目录中，可执行文件为 `dist/Lumina.exe`。
+> **`config.json` 既不进仓库，也不打进 exe。**
+> 它是用户数据：运行期会被改写（闹钟、面板尺寸、密匣口令），而且含有密匣的
+> `salt` / `wrapped_key`。首次启动时 `settings.load_config()` 从
+> `config.example.json` 生成 `%LOCALAPPDATA%/Lumina/config.json`；模板里的
+> `db_path` 是相对路径 `data/lumina.db`，按配置文件所在目录解析 —— 换台机器
+> 不会指向开发机的盘符，也不需要打包前再手改一次。
 
-> **打包前务必检查 `config.json` 里的 `db_path`。**
-> 该文件会被原样嵌进 exe，并在用户首次启动时复制到 `%LOCALAPPDATA%/Lumina/config.json`
-> 长期生效。如果它是开发机的绝对路径（如 `D:\workplace-python\Lumina\data\lumina.db`），
-> 在别人机器上会指向一个不存在的盘符目录。发布前请确认它是相对路径：
->
-> ```json
-> { "db_path": "data/lumina.db" }
-> ```
->
-> 相对路径会按配置文件所在目录解析（打包后即 `%LOCALAPPDATA%/Lumina/data/lumina.db`），
-> 具体见下文 Path Configuration。
+其余与构建相关的说明：
+
+- `--clean` / `--noconfirm`：清临时缓存、覆盖旧产物，免交互。
+- `--windowed`（等价 `--noconsole`）与 `--onefile` 已经固化在 spec 的
+  `EXE(...)` 里（`console=False`、单文件）。不要在命令行再传一遍——两处同时
+  决定会互相矛盾，而以 spec 为准。
+- PyInstaller 是**打包期依赖**，不在 `requirements.txt` 里。
+- 首次打包前确认 `data/schema.sql` 存在（spec 会把它带进 `data/`）。
 
 # 运行测试
 
@@ -817,7 +821,9 @@ python -m unittest tests.test_storage_regressions
   的子目录，移除后整个测试集会被静默跳过。
 - 测试文件中通过 `Path(__file__).resolve().parent.parent` 定位项目根，新增测试
   文件时请沿用该写法。
-- 当前用例数：991 项通过、2 项跳过（跳过项依赖符号链接权限）。
+- 当前用例数：1250 项。其中少数 UI 用例依赖「真实前台窗口」和「可写的临时目录」，
+  在无头/远程/受限沙箱里会跳过或报环境错误，而不是代码问题；`main.py doctor`
+  能区分这两类情况。
 
 # Lumina Clipboard Manager - Database Documentation
 
