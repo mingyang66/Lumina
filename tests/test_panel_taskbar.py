@@ -82,6 +82,10 @@ class _FakeUI:
         self.config = {}
         self.panel_visible = False
 
+    def show_panel(self):
+        """顶栏「剪贴板」入口；HistoryPanel 构造时会取用。"""
+        pass
+
 
 def _window_rect(hwnd):
     """读窗口的 Win32 屏幕矩形。

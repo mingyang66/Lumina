@@ -571,6 +571,15 @@ class Database:
         self.lock_financial_data()
         conn = getattr(self._local, "conn", None)
         if conn is not None:
+            # 退出前把 WAL 截断：PASSIVE 的 checkpoint() 只把页写回主库，
+            # -wal 文件会一直保持运行期的峰值大小（实测 83 MB 的库旁边躺着
+            # 83 MB 的 -wal，直到下次有写入才慢慢回收）。TRUNCATE 在有别的
+            # 连接读取时会返回 busy，但页已经落盘，截断失败不影响正确性。
+            try:
+                if self.path != ":memory:":
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                logging.debug("lumina: wal checkpoint on close failed", exc_info=True)
             conn.close()
             self._local.conn = None
 

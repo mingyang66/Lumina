@@ -79,6 +79,10 @@ class _FakeUI:
         self.config = {}
         self.panel_visible = False
 
+    def show_panel(self):
+        """顶栏「剪贴板」入口；HistoryPanel 构造时会取用。"""
+        pass
+
 
 @unittest.skipUnless(TK_OK, SKIP_REASON)
 class HeaderMenuHoverTests(unittest.TestCase):

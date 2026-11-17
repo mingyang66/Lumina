@@ -10,6 +10,7 @@ ENV/
 
 # PyInstaller
 build/
+dist/
 data/*
 !data/schema.sql
 *.spec

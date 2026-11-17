@@ -1466,8 +1466,18 @@ class RegionSelector:
                     messagebox.showerror("OCR 结果面板", f"识别成功，但结果面板显示失败：{exc}", parent=self.win)
             else:
                 messagebox.showinfo("提取文字", "未识别到文字。", parent=self.win)
-        except ImportError:
-            messagebox.showwarning("提取文字", "请安装 pytesseract 和 Tesseract OCR 后重试。", parent=self.win)
+        except ImportError as exc:
+            # ImportError 不等于 Tesseract 没装：Tesseract 是独立可执行文件，
+            # 这句提示只在 **pytesseract 模块导入失败** 时出现，而模块装不装
+            # 取决于 app 用了哪个解释器（项目约定是 .venv，系统 python 里没有）。
+            # 把真正缺失的模块名说出来，否则会把人引去重装已经装好的 Tesseract。
+            traceback.print_exc()
+            messagebox.showwarning(
+                "提取文字",
+                f"缺少 OCR 依赖：{exc}\n\n"
+                "请用项目虚拟环境启动：.venv\\Scripts\\pythonw.exe main.py\n"
+                "（或在当前使用的解释器里 pip install pytesseract）",
+                parent=self.win)
         except Exception as exc:
             if exc.__class__.__name__ == "TesseractNotFoundError":
                 messagebox.showwarning(

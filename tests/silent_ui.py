@@ -63,6 +63,14 @@ def _silence_new_window(original):
             self.attributes('-alpha', 0.0)
         except tk.TclError:
             pass    # 无图形环境
+        # tkinter 只把进程里**第一个** Tk 记成默认 root，之后不再更新；而不传
+        # ``master`` 的 ``ImageTk.PhotoImage`` 永远绑在那个解释器上。测试按用例
+        # 新建 root，图像就会画到「别的 root 的 Canvas」上，报
+        # ``image "pyimageN" doesn't exist``（438 个用例栽在这上面）。
+        # 生产里 UI 线程只有一个 root，这里让默认 root 跟着最新的走，
+        # 测试才与生产的单解释器语义一致。
+        if isinstance(self, tk.Tk):
+            tk._default_root = self
 
     init._lumina_silent = True
     return init
