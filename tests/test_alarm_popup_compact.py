@@ -237,6 +237,33 @@ class AlarmPopupAdaptationTests(AlarmWindowHarness):
         self.assertTrue(win.collapsed)
         self.assertEqual(self.errors, [])
 
+    def test_alarm_stage_places_inside_work_area_immediately(self):
+        """闹钟弹框不做入场滑动，创建后就应该完整落在工作区内。"""
+        win = self.build(stage='alarm')
+        mx, _my, mw, _mh = win._monitor_work_area()
+        self.assertLessEqual(win._current_x + win.window.winfo_width(),
+                             mx + mw)
+
+    def test_expansion_from_orb_never_overflows_work_area(self):
+        """回归：小球贴右缘，展开成 420 宽的整卡时右侧不能露到屏外。"""
+        win = self.build(stage='scheduled')
+        win.window.update()
+        win.collapse()
+        win.window.update()
+        win.apply('alarm', datetime.now() + timedelta(minutes=1))
+        win.window.update()
+        mx, _my, mw, _mh = win._monitor_work_area()
+        right = win._current_x + win.window.winfo_width()
+        self.assertLessEqual(right, mx + mw)
+
+    def test_ensure_on_screen_pulls_window_back(self):
+        win = self.build()
+        win._current_x = 10 ** 6
+        self.assertTrue(win._ensure_on_screen())
+        mx, _my, mw, _mh = win._monitor_work_area()
+        self.assertLessEqual(win._current_x + win.window.winfo_width(),
+                             mx + mw)
+
     def test_ripple_fills_the_canvas(self):
         win = self.build()
         max_radius = win._s(36 + 30)

@@ -711,10 +711,21 @@ class AlarmAlertWindow:
         height = self.window.winfo_reqheight()
         self._current_x = mx + mw + 8
         self._target_y = my + self._s(self.MARGIN)
+        target_x = max(mx, mx + mw - width - self._s(self.MARGIN))
+        if self.stage == "alarm":
+            # 闹钟是“错过就没了”的事件：不做入场滑动，直接落到最终位置。
+            # 滑动期间右侧整段都在屏外，看起来就像“弹框被右边切掉了”。
+            self._cancel_slide()
+            self._current_x = target_x
+            self.window.geometry(
+                f"{width}x{height}+{target_x}+{self._target_y}")
+            self.window.deiconify()
+            self.window.lift()
+            return
         self.window.geometry(f"{width}x{height}+{self._current_x}+{self._target_y}")
         self.window.deiconify()
         self.window.lift()
-        self._animate_x(max(mx, mx + mw - width - self._s(self.MARGIN)))
+        self._animate_x(target_x)
 
     def _set_stage(self, stage, target):
         self.stage = stage
@@ -975,6 +986,7 @@ class AlarmAlertWindow:
             self._start_animation()
         if stage == "alarm":
             self.window.focus_force()
+        self._ensure_on_screen()
         self.window.lift()
         if stage in ("scheduled", "early"):
             self._schedule_auto_collapse()
@@ -1032,11 +1044,21 @@ class AlarmAlertWindow:
             self._current_x, self._target_y = x, y
             self.window.geometry(f"{width}x{height}+{x}+{y}")
         else:
-            self.window.geometry(
-                f"{width}x{height}+{self._current_x}+{self._target_y}")
             mx, _my, mw, _mh = self._monitor_work_area()
-            self._animate_x(
-                max(mx, mx + mw - width - self._s(self.MARGIN)))
+            target_x = max(mx, mx + mw - width - self._s(self.MARGIN))
+            if self._current_x + width > mx + mw:
+                # 小球贴着右缘，而整卡宽得多：当前 x 放不下整卡。原来先把整卡
+                # 摆在球的位置（右侧露出屏外）再靠动画滑回来，动画一旦被拖慢或
+                # 打断就停在越界处。这里直接落到目标位。
+                self._cancel_slide()
+                self._current_x = target_x
+                self.window.geometry(
+                    f"{width}x{height}+{target_x}+{self._target_y}")
+            else:
+                self.window.geometry(
+                    f"{width}x{height}+{self._current_x}+{self._target_y}")
+                self._animate_x(target_x)
+        self._ensure_on_screen()
         self._start_animation()
 
     def _resize_to_content(self):
@@ -1054,6 +1076,7 @@ class AlarmAlertWindow:
             self._current_x = max(
                 mx, mx + mw - width - self._s(self.MARGIN))
         self.window.geometry(f"{width}x{height}+{self._current_x}+{self._target_y}")
+        self._ensure_on_screen()
 
     def _animate_x(self, target_x):
         self._cancel_slide()
@@ -1245,6 +1268,26 @@ class AlarmAlertWindow:
             else:
                 self.expand()
         return "break"
+
+    def _ensure_on_screen(self):
+        """把窗口拉回当前显示器工作区内；返回是否真的移动过。
+
+        尺寸一变就可能越界（尤其从 100px 的球展开成整卡），任何一次几何写入
+        之后都应该过一遍这里，避免“右半截在屏幕外”。
+        """
+        if self._closed:
+            return False
+        self.window.update_idletasks()
+        mx, my, mw, mh = self._monitor_work_area()
+        width = max(1, self.window.winfo_width())
+        height = max(1, self.window.winfo_height())
+        x = min(max(mx, self._current_x), max(mx, mx + mw - width))
+        y = min(max(my, self._target_y), max(my, my + mh - height))
+        if (x, y) == (self._current_x, self._target_y):
+            return False
+        self._current_x, self._target_y = x, y
+        self.window.geometry(f"{width}x{height}+{x}+{y}")
+        return True
 
     def _clamp_to_screen(self, x, y, width, height):
         mx, my, mw, mh = self._monitor_work_area()
