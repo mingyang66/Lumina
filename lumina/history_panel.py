@@ -95,6 +95,11 @@ class HistoryPanel:
     # 低于这个值布局会被挤扁（左栏撑不住标题、详情区横向滚动条常驻）。
     MIN_PANEL_W = 880
     MIN_PANEL_H = 520
+    # 左栏分页：一次画这么多条，滚到底再续拉下一页（见 _load_next_page）。
+    PAGE_SIZE = 60
+    # 续拉的软上限。卡片是 Canvas 手绘、图片行还要按宽度重采样，一次铺太多
+    # 会明显卡顿；到上限就停止续拉，交给搜索/筛选收窄，而不是硬撑到几千条。
+    MAX_LOADED = 600
     TRANS_COLOR = "#010203"
     FILTERS: ClassVar[tuple] = (
         ("all", "全部"), ("text", "文本"), ("code", "代码"),
@@ -302,6 +307,14 @@ class HistoryPanel:
         self._card_w = 0
         self._row_h = 0
         self._rows_displayed = []
+        # 分页状态：左栏一次 PAGE_SIZE 条，滚到底续拉下一页。
+        # `_total_rows` 是当前筛选条件下的总匹配数（来自 count），
+        # `_has_more` 判断还有没有下一页，`_load_pending` 防重复调度。
+        self._page_size = self.PAGE_SIZE
+        self._total_rows = 0
+        self._has_more = False
+        self._loading_more = False
+        self._load_pending = False
         self._canvas_w = None
         self._relayout_id = None
         self._resize_state = None
@@ -765,6 +778,9 @@ class HistoryPanel:
             if h <= 1:
                 return
             first_x, last_x = float(first), float(last)
+            # 滚到底（含 0.5% 容差）就续拉下一页；真正的防重入在 _maybe_load_more。
+            if last_x >= 0.995 and getattr(self, "_has_more", False):
+                self._maybe_load_more()
             if last_x - first_x >= 0.999:
                 if self._scroll_ind is not None:
                     canvas.delete(self._scroll_ind)
@@ -2240,16 +2256,79 @@ class HistoryPanel:
         else:
             total = self.db.count(q, category=self._filter)
         shown = len(rows)
-        self.status_var.set(
-            f"显示 {shown} / 共 {total} 条" if shown != total
-            else f"共 {total} 条")
-        if getattr(self, "_diff_base_id", None) is not None:
-            self.status_var.set(self.status_var.get() + f" · 比对基准 ID {self._diff_base_id}")
-        elif base_removed:
-            self.status_var.set(self.status_var.get() + " · 比对基准已删除，已取消")
+        self._total_rows = total
+        self._has_more = shown < total
+        self._set_status(shown, total, base_removed)
         if self._detail is not None:
             self._detail_hover_id = None
             self._detail.show(self._sel_id, immediate=True)
+
+    def _set_status(self, shown, total, base_removed=False):
+        """状态行唯一出口：条数、是否还有下一页之外的信息都在这里拼。"""
+        text = (f"显示 {shown} / 共 {total} 条" if shown != total
+                else f"共 {total} 条")
+        if getattr(self, "_diff_base_id", None) is not None:
+            text += f" · 比对基准 ID {self._diff_base_id}"
+        elif base_removed:
+            text += " · 比对基准已删除，已取消"
+        self.status_var.set(text)
+
+    def _load_next_page(self):
+        """续拉下一页并追加到左栏；返回是否真的拉到了新记录。
+
+        分页用 ``OFFSET`` 而不是记住游标：列表本来就按 ``created_at`` 倒序，
+        新复制的内容只会插到最前面，不会让已加载的那一段错位；真错位了也有
+        下面的按 id 去重兜底。
+        """
+        if self._loading_more or not self._has_more:
+            return False
+        loaded = len(self._rows_displayed)
+        if loaded >= self.MAX_LOADED:
+            self._has_more = False
+            self._set_status(loaded, self._total_rows)
+            return False
+        self._loading_more = True
+        try:
+            q = self.search_var.get().strip()
+            pinned = self._filter == "pinned"
+            category = None if self._filter in ("all", "pinned") else self._filter
+            if q:
+                more = self.db.search(q, self._page_size, category=category,
+                                      pinned=pinned, offset=loaded)
+            else:
+                more = self.db.list_recent(self._page_size, category=category,
+                                           pinned=pinned, offset=loaded)
+        except TypeError:
+            # 桩件或旧实现没有 offset 参数：停在这里，不要反复重试同一条路径。
+            more = []
+        finally:
+            self._loading_more = False
+        fresh = [row for row in (more or [])
+                 if str(row["id"]) not in self._rows]
+        if not fresh:
+            self._has_more = False
+            self._set_status(loaded, self._total_rows)
+            return False
+        rows = self._rows_displayed + fresh
+        self._rows.update({str(r["id"]): r for r in fresh})
+        self._refresh_cards(rows)
+        self._has_more = len(rows) < self._total_rows
+        self._set_status(len(rows), self._total_rows)
+        return True
+
+    def _flush_load_more(self):
+        self._load_pending = False
+        self._load_next_page()
+
+    def _maybe_load_more(self):
+        """滚到底时排一次续拉；连续的滚动事件不会叠成多次查询。"""
+        if self._load_pending or self._loading_more or not self._has_more:
+            return
+        self._load_pending = True
+        try:
+            self.win.after_idle(self._flush_load_more)
+        except Exception:
+            self._load_pending = False
 
     def _apply_filter(self, rows):
         if self._filter == "pinned":

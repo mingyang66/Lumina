@@ -120,6 +120,29 @@ class DetailPane:
                               fg=T["label2"], font=("Microsoft YaHei UI", 8),
                               anchor="w", bd=0, highlightthickness=0, pady=0)
         self._meta.pack(fill="x")
+        # 标签入口：元信息条右侧一个轻量标签，点开在下方展开一行输入框。
+        # 放在元信息条是为了不挤占动作栏——最窄 380px 时动作栏已排到 6 个按钮。
+        self._tag_btn = tk.Label(self._meta_wrap, text="＋标签", bg=T["field"],
+                                 fg=T["label2"], cursor="hand2", bd=0,
+                                 highlightthickness=0,
+                                 font=("Microsoft YaHei UI", 8))
+        self._tag_btn.pack(side="right", padx=(6, 8))
+        self._tag_btn.bind("<Button-1>", self._on_tag_btn)
+        self._tag_row = tk.Frame(self.frame, bg=T["field"])
+        self._tag_entry = tk.Entry(self._tag_row, bg=T["card_bg"], fg=T["label"],
+                                   insertbackground=T["label"], relief="flat",
+                                   bd=0, highlightthickness=1,
+                                   highlightbackground=T["hairline"],
+                                   highlightcolor=T["accent"],
+                                   font=("Microsoft YaHei UI", 9))
+        self._tag_entry.pack(side="left", fill="x", expand=True,
+                             padx=(8, 6), pady=6)
+        self._tag_hint = tk.Label(self._tag_row, text="逗号分隔 · 回车保存 · ESC 取消",
+                                  bg=T["field"], fg=T["label2"],
+                                  font=("Microsoft YaHei UI", 8))
+        self._tag_hint.pack(side="left", padx=(0, 8))
+        self._tag_entry.bind("<Return>", self._commit_tags)
+        self._tag_entry.bind("<Escape>", lambda _e: self._hide_tag_row())
         self._host = tk.Frame(self.frame, bg=self.BG)
         self._host.pack(fill="both", expand=True, padx=8, pady=(6, 4))
         self._action_separator = tk.Frame(self.frame, bg=T["hairline"], height=1)
@@ -492,6 +515,53 @@ class DetailPane:
             return
         if self.panel._delete_record(row["id"]):
             self._cur_key = None
+
+    # ---------- 标签编辑 ----------
+    def _on_tag_btn(self, _event=None):
+        """拦截点击，避免冒泡到元信息条上的窗口拖动绑定。"""
+        self._toggle_tag_row()
+        return "break"
+
+    def _toggle_tag_row(self):
+        """展开/收起标签输入行；没有选中记录时什么都不做。"""
+        if self.row is None:
+            return "break"
+        if self._tag_row.winfo_ismapped():
+            self._hide_tag_row()
+            return "break"
+        self._tag_entry.delete(0, "end")
+        self._tag_entry.insert(0, self.row["tags"] or "")
+        self._tag_row.pack(fill="x", padx=8, pady=(4, 0), before=self._host)
+        self._tag_entry.focus_set()
+        self._tag_entry.select_range(0, "end")
+        return "break"
+
+    def _hide_tag_row(self):
+        self._tag_row.pack_forget()
+        return "break"
+
+    def _commit_tags(self, _event=None):
+        cid = self.current_id()
+        if cid is None:
+            self._hide_tag_row()
+            return "break"
+        try:
+            if not self.panel.db.set_tags(cid, self._tag_entry.get()):
+                self.panel.status_var.set(f"#{cid} 标签保存失败")
+            else:
+                # tags 变了而 content 没变，_render 的去重键会命中缓存不重画，
+                # 所以先清键再刷列表，元信息里的标签才跟着更新。
+                self._cur_key = None
+                self.row = None
+                self.panel.refresh()
+                # 详情栏可能停在悬停预览的相邻行，明确把刚打标签的那条画出来。
+                if str(cid) in self.panel._rows:
+                    self._render(str(cid))
+                self.panel.status_var.set(f"#{cid} 标签已更新")
+        except Exception:
+            traceback.print_exc()
+        self._hide_tag_row()
+        return "break"
 
     def _close_menu(self):
         menu, self._flat_menu = self._flat_menu, None

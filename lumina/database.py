@@ -485,16 +485,16 @@ class Database:
                 params.append(category)
         return clauses, params
 
-    def list_recent(self, n=20, category=None, pinned=False):
+    def list_recent(self, n=20, category=None, pinned=False, offset=0):
         clauses, params = self._filter_clauses(category, pinned)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         return self.conn.execute(
             f"SELECT {LIST_COLUMNS} FROM clipboard{where} "
-            "ORDER BY created_at DESC, id DESC LIMIT ?",
-            (*params, n),
+            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (*params, n, offset),
         ).fetchall()
 
-    def search(self, query, n=20, category=None, pinned=False):
+    def search(self, query, n=20, category=None, pinned=False, offset=0):
         query = (query or "").strip()
         if not query:
             return []
@@ -506,15 +506,15 @@ class Database:
                 f"SELECT {JOIN_COLUMNS} "
                 "FROM clipboard_fts f JOIN clipboard c ON c.id = f.rowid "
                 f"WHERE clipboard_fts MATCH ?{extra} "
-                "ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
-                (match, *params, n),
+                "ORDER BY c.created_at DESC, c.id DESC LIMIT ? OFFSET ?",
+                (match, *params, n, offset),
             ).fetchall()
         like = f"%{query}%"
         return self.conn.execute(
             f"SELECT {LIST_COLUMNS} FROM clipboard c "
             f"WHERE (c.content LIKE ? OR c.tags LIKE ? OR c.source LIKE ?){extra} "
-            "ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
-            (like, like, like, *params, n),
+            "ORDER BY c.created_at DESC, c.id DESC LIMIT ? OFFSET ?",
+            (like, like, like, *params, n, offset),
         ).fetchall()
 
     def count(self, query="", category=None, pinned=False):
