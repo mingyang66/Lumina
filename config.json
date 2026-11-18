@@ -37,5 +37,6 @@
   "alarm_lead_minutes": 5,
   "alarm_repeat": "once",
   "alarm_style": "soft",
-  "alarm_sound": true
+  "alarm_sound": true,
+  "panel_split": 0.2682
 }

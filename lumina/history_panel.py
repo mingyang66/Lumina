@@ -11,6 +11,75 @@ from typing import ClassVar
 
 from . import clipboard_api, taskbar
 
+# ---------- 布局偏好：分栏比例 + 尺寸记忆 ----------
+# 下面几个都是**纯函数**，不碰 Tk：面板只负责接线，测试直接测这里。
+# 比例存的是 0~1 的逻辑值而不是像素——换显示器/改缩放时像素会失效，比例不会。
+DEFAULT_SPLIT_RATIO = 0.38
+# 可拖范围放得比默认布局宽很多：默认值只是「开箱好看」，不是可用区间。
+# 下限留出窄列表（够放一条卡片），上限留出宽列表（详情只剩一列文本）。
+SPLIT_MIN_RATIO = 0.18
+SPLIT_MAX_RATIO = 0.78
+# 窗口尺寸变化小于这个值就不写盘，避免拖拽时的抖动式 IO。
+SIZE_SAVE_THRESHOLD = 8
+# 两栏之间的横向装饰总量：1px 竖线 + 左侧 4 + 右侧 10。
+# 左窄右宽是刻意的：左边紧挨着列表的滚动条（SCROLLBAR_W=4、
+# SCROLLBAR_RIGHT_PAD=1），10px 的空隙会把它和分隔线拉开一大截；
+# 右侧详情是正文，留 10px 才不贴线。
+# **必须与 _build_compact 里 sep 的 pack padx 同步**，不同步首帧左右栏宽度会偏。
+SPLIT_CHROME = 15
+
+
+def resolve_split_ratio(config):
+    """从 config 读分栏比例。
+
+    缺省、非数字、NaN、越界一律夹回 ``[SPLIT_MIN_RATIO, SPLIT_MAX_RATIO]``：
+    配置文件是用户手改的，一个拼错的 ``panel_split`` 不该让面板打不开。
+    """
+    try:
+        raw = (config or {}).get("panel_split")
+    except Exception:
+        return DEFAULT_SPLIT_RATIO
+    if raw in (None, ""):
+        return DEFAULT_SPLIT_RATIO
+    try:
+        ratio = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SPLIT_RATIO
+    if ratio != ratio:                    # NaN
+        return DEFAULT_SPLIT_RATIO
+    return min(SPLIT_MAX_RATIO, max(SPLIT_MIN_RATIO, ratio))
+
+
+def split_widths(total, dpi, ratio, left_min, left_max, detail_min):
+    """按比例算左栏/详情栏的像素宽，套上三条硬约束，返回 ``(left, detail)``。
+
+    约束顺序与历史实现一致：先按比例取左栏 → 夹进 ``[left_min*dpi,
+    left_max*dpi]`` → 再保证详情栏不少于 ``detail_min*dpi``。
+    """
+    avail = max(0, total - SPLIT_CHROME)
+    scale = dpi if dpi and dpi > 0 else 1.0
+    minimum = left_min * scale
+    maximum = left_max * scale
+    detail_floor = detail_min * scale
+    left = int(min(max(avail * ratio, minimum), maximum,
+                   max(minimum, avail - detail_floor)))
+    detail = int(max(detail_floor, avail - left))
+    return left, detail
+
+
+def logical_size(width_px, height_px, dpi):
+    """像素尺寸 → 逻辑像素（config 里 ``panel_width`` / ``panel_height`` 的单位）。"""
+    scale = dpi if dpi and dpi > 0 else 1.0
+    return int(round(width_px / scale)), int(round(height_px / scale))
+
+
+def size_worth_saving(new_size, old_size, threshold=SIZE_SAVE_THRESHOLD):
+    """尺寸变化超过阈值才值得落盘（防抖之后的第二道闸）。"""
+    if not old_size:
+        return True
+    return (abs(new_size[0] - old_size[0]) > threshold
+            or abs(new_size[1] - old_size[1]) > threshold)
+
 
 class HistoryPanel:
     # 默认窗口尺寸（逻辑像素，实际会乘 DPI 缩放）。
@@ -2839,8 +2908,8 @@ class HistoryPanel:
                 val = int(float(raw))
             except (TypeError, ValueError):
                 continue
-            # **太小的值会把双栏布局压塌**：左栏最小 LEFT_MIN=400、详情最小
-            # DETAIL_MIN=380，加上分隔与内边距要 850 才不挤。所以下限取
+            # **太小的值会把双栏布局压塌**：左栏最小 LEFT_MIN=300、详情最小
+            # DETAIL_MIN=320，加上分隔与内边距要 697 才不挤。所以下限取
             # 「默认值的一半」只能挡住一部分，还必须再跟这个硬下限取大。
             # 上限取默认值两倍，避免一个手滑的 0 把窗口撑到离谱。
             if idx == 0:
@@ -2863,8 +2932,13 @@ class HistoryPanel:
         except Exception:
             dpi = 1.0
         self._dpi = dpi
+        # 分栏比例：配置优先，缺省/非法回落默认；拖拽后写回同一个键。
+        self._split_ratio = resolve_split_ratio(getattr(self.ui, "config", None))
         bound_w, bound_h = self._resolve_window_size(dpi)
         self._cw, self._ch = bound_w, bound_h
+        # 尺寸记忆的基线：用来判断拖完窗口后是否值得落盘。
+        self._saved_logical_size = logical_size(bound_w, bound_h, dpi)
+        self._size_save_job = None
 
         # 圆角由 Windows 原生窗口区域裁剪，Canvas 只负责绘制背景和边框。
         self._bg_canvas = tk.Canvas(self.win, bg=self._c("window_bg"),
@@ -2877,6 +2951,10 @@ class HistoryPanel:
         self._bg_canvas.bind("<B1-Motion>", self._border_move)
         self._bg_canvas.bind("<ButtonRelease-1>", self._border_release)
         self._bg_canvas.bind("<Configure>", self._schedule_background_resize)
+        # 尺寸记忆：只绑一次，避免 apply_mode 重建时重复叠加回调。
+        if not getattr(self, "_size_bound", False):
+            self.win.bind("<Configure>", self._on_window_configure, add="+")
+            self._size_bound = True
         self.win.bind_all("<Motion>", self._global_border_motion, add="+")
         self.win.bind_all("<ButtonPress-1>", self._global_border_press, add="+")
         self.win.bind_all("<B1-Motion>", self._global_border_move, add="+")
@@ -2980,8 +3058,8 @@ class HistoryPanel:
         body_split = tk.Frame(self._cmp_root, bg=win_bg)
         body_split.pack(fill="both", expand=True, padx=12, pady=(6, 0))
         body_split.bind("<Configure>", self._on_split_configure)
-        body_split.bind("<ButtonPress-1>", self._hdr_press)
-        body_split.bind("<B1-Motion>", self._hdr_move)
+        body_split.bind("<ButtonPress-1>", self._split_body_press)
+        body_split.bind("<B1-Motion>", self._split_body_motion)
         left = tk.Frame(body_split, bg=win_bg)
         self._left_frame = left
         left.configure(width=left_w)
@@ -3012,10 +3090,19 @@ class HistoryPanel:
         self._search_canvas.bind("<ButtonPress-1>", self._search_press)
         self._search_canvas.bind("<B1-Motion>", self._hdr_move)
 
+        # 分隔条：**就是一条 1px 竖线**，不加宽热区。
+        # 可拖范围靠 body_split 上的「靠近即接管」实现（见 _split_body_press），
+        # 所以视觉上是一条线，手感上仍有约 ±4px 的命中带。
+        # 1 + 左 4 + 右 10 = SPLIT_CHROME(15)，与 _left_width 的内缩常数同源。
+        self._body_split = body_split
         sep = tk.Frame(body_split, bg=T["hairline"], width=1)
-        sep.pack(side="left", fill="y", padx=10, pady=2)
-        sep.bind("<ButtonPress-1>", self._hdr_press)
-        sep.bind("<B1-Motion>", self._hdr_move)
+        sep.pack(side="left", fill="y", padx=(4, 10), pady=2)
+        self._split_handle = sep
+        sep.configure(cursor="sb_h_double_arrow")
+        sep.bind("<ButtonPress-1>", self._split_handle_press)
+        sep.bind("<B1-Motion>", self._split_handle_motion)
+        sep.bind("<ButtonRelease-1>", self._split_handle_release)
+        sep.bind("<Double-Button-1>", self._split_handle_reset)
         self._detail = DetailPane(self, body_split, detail_w)
 
         # ---------- 过滤胶囊 pills（Canvas 自绘，紧凑） ----------
@@ -3087,26 +3174,29 @@ class HistoryPanel:
         self._create_resize_grips(win_bg)
 
     # ---------- 双栏比例 ----------
+    # LEFT_RATIO 保留为「默认值」的别名：既有测试与外部引用按这个名字取。
+    # **这里写字面量而不是 DEFAULT_SPLIT_RATIO**：test_diff_history_regressions
+    # 会把类体单独 ast+exec 到一个只有注入名字的命名空间里跑方法，类体引用模块
+    # 全局会直接 NameError。两者的同值由 test_panel_split 钉住。
     LEFT_RATIO = 0.38
-    LEFT_MIN = 400
-    LEFT_MAX = 640
-    DETAIL_MIN = 380
+    # 像素硬约束只负责「别压塌」，不作为常用区间：
+    # 300 能放下一条卡片 + 首字图标；1000 是「列表再宽也没意义」的天花板，
+    # 真正起作用的通常是 SPLIT_MAX_RATIO（0.78）。
+    LEFT_MIN = 300
+    LEFT_MAX = 1000
+    DETAIL_MIN = 320
+    # 运行期比例（可拖拽）；类属性只是兜底，实例在 _build_compact 里按 config 覆盖。
+    _split_ratio = LEFT_RATIO
 
     def _left_width(self, total):
-        """计算列表栏宽度，限制最大值避免最大化时左栏过宽。"""
-        avail = max(0, total - 21)
-        d = self._dpi
-        minimum = self.LEFT_MIN * d
-        maximum = self.LEFT_MAX * d
-        detail_min = self.DETAIL_MIN * d
-        return int(min(max(avail * self.LEFT_RATIO, minimum),
-                       maximum, max(minimum, avail - detail_min)))
+        """计算列表栏宽度：比例来自 ``_split_ratio``，再套三条硬约束。"""
+        return split_widths(total, self._dpi, self._split_ratio,
+                            self.LEFT_MIN, self.LEFT_MAX, self.DETAIL_MIN)[0]
 
     def _detail_width(self, total):
-        """详情栏占用左栏和分隔线之外的剩余宽度。"""
-        avail = max(0, total - 21)
-        return int(max(self.DETAIL_MIN * self._dpi,
-                       avail - self._left_width(total)))
+        """详情栏占用左栏与分隔条之外的剩余宽度。"""
+        return split_widths(total, self._dpi, self._split_ratio,
+                            self.LEFT_MIN, self.LEFT_MAX, self.DETAIL_MIN)[1]
 
     def _left_col_width(self):
         """左栏（列表画布）宽度推导：画布尚未映射时的首帧渲染兜底。"""
@@ -3127,6 +3217,156 @@ class HistoryPanel:
                 self._detail.invalidate_size()
         except Exception:
             pass
+
+    # ---------- 分栏拖拽 ----------
+    def _apply_split_widths(self, total=None):
+        """把当前比例套到两栏上；``total`` 缺省时读 body_split 的实际宽度。"""
+        body = getattr(self, "_body_split", None)
+        if body is None:
+            return
+        width = total if total is not None else body.winfo_width()
+        if width <= 0:
+            return
+        try:
+            self._left_frame.configure(width=self._left_width(width))
+            self._detail.frame.configure(width=self._detail_width(width))
+        except Exception:
+            pass
+
+    # ---------- 分隔线命中带 ----------
+    # 分隔线本身只有 1px，直接命中太难；按在它左右各 4px 内都算抓分隔线。
+    HIT_SLOP = 4
+
+    def _split_line_x(self):
+        """分隔线在 body_split 坐标系里的 x；取不到几何时返回 None。"""
+        body = getattr(self, "_body_split", None)
+        handle = getattr(self, "_split_handle", None)
+        if body is None or handle is None:
+            return None
+        try:
+            return (handle.winfo_rootx() - body.winfo_rootx()
+                    + handle.winfo_width() // 2)
+        except Exception:
+            return None
+
+    def _near_split(self, x):
+        line_x = self._split_line_x()
+        if line_x is None or x is None:
+            return False
+        return abs(x - line_x) <= self.HIT_SLOP
+
+    def _split_body_press(self, event):
+        """body_split 上的按下：靠近分隔线就调分栏，否则照旧拖窗口。"""
+        if self._near_split(getattr(event, "x", None)):
+            return self._split_handle_press(event)
+        return self._hdr_press(event)
+
+    def _split_body_motion(self, event):
+        if getattr(self, "_split_dragging", False):
+            return self._split_handle_motion(event)
+        return self._hdr_move(event)
+
+    def _split_handle_press(self, event):
+        # 抓住指针：拖到分隔条外面也不丢 <B1-Motion>。
+        self._split_dragging = True
+        self._split_drag_origin = (event.x_root, self._split_ratio)
+        try:
+            self._split_handle.grab_set()
+        except Exception:
+            pass
+        return "break"
+
+    def _split_handle_motion(self, event):
+        if not getattr(self, "_split_dragging", False):
+            return "break"
+        body = getattr(self, "_body_split", None)
+        if body is None:
+            return "break"
+        total = body.winfo_width()
+        if total <= SPLIT_CHROME:
+            return "break"
+        origin_x, origin_ratio = self._split_drag_origin
+        avail = float(max(1, total - SPLIT_CHROME))
+        desired = min(SPLIT_MAX_RATIO,
+                      max(SPLIT_MIN_RATIO,
+                          origin_ratio + (event.x_root - origin_x) / avail))
+        # 把「理想比例」换成这一宽度下真正能取到的像素，再折回比例：
+        # 否则指针会在被 LEFT_MIN / DETAIL_MIN 夹住的死区里空走，
+        # 往回拖时要先退出死区，手感像卡住。
+        left, _detail = split_widths(total, self._dpi, desired,
+                                     self.LEFT_MIN, self.LEFT_MAX, self.DETAIL_MIN)
+        ratio = min(1.0, max(0.0, left / avail))
+        if abs(ratio - self._split_ratio) < 1e-4:
+            return "break"
+        self._split_ratio = ratio
+        self._apply_split_widths(total)
+        return "break"
+
+    def _split_handle_release(self, _event=None):
+        if not getattr(self, "_split_dragging", False):
+            return "break"
+        self._split_dragging = False
+        try:
+            self._split_handle.grab_release()
+        except Exception:
+            pass
+        origin = getattr(self, "_split_drag_origin", None)
+        if origin is not None and abs(self._split_ratio - origin[1]) < 1e-4:
+            return "break"          # 只是点了一下，没拖动，不值得写盘
+        self._persist({"panel_split": round(self._split_ratio, 4)})
+        # 拖动过程中不重采样图片（每帧缩放会卡），松手才让它失效重排。
+        try:
+            if self._detail.row is not None and self._detail.row["kind"] == "image":
+                self._detail.invalidate_size()
+        except Exception:
+            pass
+        return "break"
+
+    def _split_handle_reset(self, _event=None):
+        """双击分隔条回到默认比例。"""
+        self._split_dragging = False
+        self._split_ratio = self.LEFT_RATIO
+        self._apply_split_widths()
+        self._persist({"panel_split": self.LEFT_RATIO})
+        return "break"
+
+    # ---------- 尺寸记忆 ----------
+    def _persist(self, values):
+        """把布局偏好写回 config；没有宿主 actions 时静默跳过（测试环境）。"""
+        actions = getattr(self.ui, "actions", None)
+        save = getattr(actions, "save_settings", None)
+        if save is None:
+            return
+        try:
+            save(dict(values))
+        except Exception:
+            traceback.print_exc()
+
+    def _on_window_configure(self, event):
+        if getattr(event, "widget", None) is not self.win:
+            return
+        if getattr(self, "_maxed", False) or not self.win.winfo_viewable():
+            return
+        job = getattr(self, "_size_save_job", None)
+        if job is not None:
+            try:
+                self.win.after_cancel(job)
+            except Exception:
+                pass
+        self._size_save_job = self.win.after(600, self._persist_window_size)
+
+    def _persist_window_size(self):
+        self._size_save_job = None
+        if getattr(self, "_maxed", False) or not self.win.winfo_viewable():
+            return
+        width, height = self.win.winfo_width(), self.win.winfo_height()
+        if width < 200 or height < 200:
+            return
+        size = logical_size(width, height, self._dpi)
+        if not size_worth_saving(size, getattr(self, "_saved_logical_size", None)):
+            return
+        self._saved_logical_size = size
+        self._persist({"panel_width": size[0], "panel_height": size[1]})
 
     # ---------- Apple 风格控件绘制助手 ----------
     def _font_path(self):
