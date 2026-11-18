@@ -30,13 +30,14 @@
     "wrap_nonce": "5SQDIJ8bWrFfChCO",
     "wrapped_key": "Ar3vhp0oLVKICi8FpYG4ylgxb9AXquh4ZXTrJgdvAds+IELFvH4MmILxTSNhKSc8"
   },
-  "alarm_enabled": false,
+  "alarm_enabled": true,
   "alarm_label": "闹钟",
-  "alarm_date": "2026-11-17",
-  "alarm_time": "14:35:47",
+  "alarm_date": "2026-11-18",
+  "alarm_time": "19:49:06",
   "alarm_lead_minutes": 5,
   "alarm_repeat": "once",
   "alarm_style": "soft",
   "alarm_sound": true,
-  "panel_split": 0.2973
+  "panel_split": 0.1796,
+  "alarm_snooze_minutes": 5
 }

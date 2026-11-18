@@ -5,9 +5,13 @@
 """
 import calendar
 import math
+import tkinter as tk
+import traceback
 from datetime import date, datetime, timedelta
 
 LEAD_MINUTES = (0, 1, 3, 5, 10, 15)
+# 稍后提醒可选时长（分钟）。设置页与弹框按钮共用同一份清单。
+SNOOZE_MINUTES = (1, 3, 5, 10, 15, 30)
 REPEAT_LABELS = {"once": "单次", "daily": "每天", "weekdays": "工作日"}
 REPEAT_VALUES = {value: key for key, value in REPEAT_LABELS.items()}
 STYLE_LABELS = {"neon": "霓虹光环", "soft": "柔和星光", "minimal": "极简"}
@@ -86,6 +90,208 @@ def next_alarm_occurrence(settings, now=None):
     except (TypeError, ValueError):
         return None
     return None
+
+
+class PillButton(tk.Canvas):
+    """画布自绘的圆角按钮，保留 ``tk.Button`` 的常用子集 API。
+
+    弹框原来用原生 ``tk.Button``，和主面板自绘的 pill 按钮不是一套视觉语言。
+    这里换成自绘版本，同时保留 ``cget`` / ``configure`` / ``invoke`` /
+    ``grid`` / ``grid_remove`` / ``winfo_manager``，调用方与既有测试都不用改。
+    """
+
+    def __init__(self, parent, text="", command=None, bg="#334155",
+                 fg="#ffffff", hover=None, pressed=None, padx=12, pady=6,
+                 font=("Microsoft YaHei UI", 9), dpi=1.0, radius=9):
+        self._dpi = dpi or 1.0
+        self._padx = max(6, int(round(padx * self._dpi)))
+        self._pady = max(3, int(round(pady * self._dpi)))
+        self._radius = max(4, int(round(radius * self._dpi)))
+        self._font = font
+        self._text = text
+        self._command = command
+        self._bg = bg
+        self._fg = fg
+        self._fg_active = fg
+        self._hover = hover or bg
+        self._pressed = pressed or hover or bg
+        self._photos = {}
+        self._state = "normal"
+        self._text_w, self._text_h = self._measure()
+        width, height = self._size()
+        try:
+            parent_bg = parent.cget("bg")
+        except Exception:
+            parent_bg = bg
+        super().__init__(parent, width=width, height=height, bd=0,
+                         highlightthickness=0, cursor="hand2", bg=parent_bg)
+        self._draw(self._bg)
+        self.bind("<Enter>", lambda _e: self._draw(self._hover))
+        self.bind("<Leave>", lambda _e: self._draw(self._bg))
+        self.bind("<ButtonPress-1>", lambda _e: self._draw(self._pressed))
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    # ---------- 兼容 tk.Button 的常用面 ----------
+    def cget(self, key):
+        if key == "text":
+            return self._text
+        if key == "bg":
+            return self._bg
+        if key == "fg":
+            return self._fg
+        if key == "command":
+            return self._command
+        return super().cget(key)
+
+    def configure(self, **kwargs):
+        redraw = False
+        if "text" in kwargs:
+            self._text = kwargs.pop("text")
+            redraw = True
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "bg" in kwargs:
+            self._bg = kwargs.pop("bg")
+            redraw = True
+        if "fg" in kwargs:
+            self._fg = kwargs.pop("fg")
+            self._fg_active = self._fg
+            redraw = True
+        if "activebackground" in kwargs:
+            self._hover = kwargs.pop("activebackground")
+        if "activeforeground" in kwargs:
+            self._fg_active = kwargs.pop("activeforeground")
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+        if kwargs:
+            super().configure(**kwargs)
+        if redraw:
+            self._text_w, self._text_h = self._measure()
+            width, height = self._size()
+            super().configure(width=width, height=height)
+            self._draw(self._bg)
+        return self
+
+    config = configure
+
+    def invoke(self):
+        if self._state != "disabled" and self._command is not None:
+            return self._command()
+        return None
+
+    # ---------- 绘制 ----------
+    def _measure(self):
+        from tkinter import font as tkfont
+        measured = tkfont.Font(font=self._font)
+        return measured.measure(self._text or ""), measured.metrics("linespace")
+
+    def _size(self):
+        return (self._text_w + 2 * self._padx, self._text_h + 2 * self._pady)
+
+    def _photo(self, color, width, height):
+        key = (color, width, height)
+        photo = self._photos.get(key)
+        if photo is not None:
+            return photo
+        from PIL import Image, ImageDraw, ImageTk
+
+        scale = 2
+        image = Image.new("RGBA", (width * scale, height * scale),
+                          (0, 0, 0, 0))
+        ImageDraw.Draw(image).rounded_rectangle(
+            (0, 0, width * scale - 1, height * scale - 1),
+            radius=self._radius * scale, fill=color)
+        photo = ImageTk.PhotoImage(
+            image.resize((width, height), Image.LANCZOS), master=self)
+        self._photos[key] = photo
+        return photo
+
+    def _draw(self, color):
+        width, height = self._size()
+        self.delete("all")
+        self.create_image(0, 0, image=self._photo(color, width, height),
+                          anchor="nw")
+        hovered = color == self._hover and self._hover != self._bg
+        self.create_text(width // 2, height // 2, text=self._text,
+                         fill=self._fg_active if hovered else self._fg,
+                         font=self._font)
+
+    def _on_release(self, _event=None):
+        self._draw(self._hover)
+        return self.invoke()
+
+
+def menu_theme(palette):
+    """FlatMenu 的配色：从 palette 派生，弹框与设置页共用一份。"""
+    _bg, card, accent, fg = palette
+    return {
+        "hairline": blend_color(card, accent, 0.30),
+        "card_bg": card,
+        "separator": blend_color(card, fg, 0.18),
+        "label": fg,
+        "accent": accent,
+        "accent_soft": blend_color(card, accent, 0.30),
+        "fill_hover": blend_color(card, accent, 0.22),
+    }
+
+
+class PickField(tk.Frame):
+    """自绘下拉：左边显示当前值，点一下用 FlatMenu 选。
+
+    原来用 ``ttk.Combobox``，但 Windows 的 ttk 字段恒为浅色，插在深色卡片里像
+    白补丁；这里换成自绘，配色跟着 palette 走，行为与只读下拉一致。
+    """
+
+    def __init__(self, parent, var, values, palette, width=14, font=None,
+                 dpi=1.0):
+        _bg, card, accent, fg = palette
+        self._dpi = dpi or 1.0
+        self._field_bg = blend_color(card, "#000000", 0.45)
+        super().__init__(parent, bg=self._field_bg, highlightthickness=1,
+                         highlightbackground=blend_color(card, accent, 0.35),
+                         highlightcolor=accent, takefocus=1)
+        self._var = var
+        self._values = list(values)
+        self._palette = palette
+        self._fg = fg
+        self._font = font or ("Microsoft YaHei UI", 10)
+        self._label = tk.Label(self, textvariable=var, anchor="w",
+                               bg=self._field_bg, fg=fg, font=self._font,
+                               padx=self._s(8), pady=self._s(4), width=width)
+        self._label.pack(side="left", fill="x", expand=True)
+        self._arrow = tk.Label(self, text="▾", bg=self._field_bg,
+                               fg=blend_color(fg, card, 0.35),
+                               font=self._font, padx=self._s(8))
+        self._arrow.pack(side="right")
+        for widget in (self, self._label, self._arrow):
+            widget.configure(cursor="hand2")
+            widget.bind("<Button-1>", self._open)
+        self.bind("<Return>", self._open)
+        self.bind("<space>", self._open)
+        self.bind("<FocusIn>", lambda _event: self._label.configure(fg=accent))
+        self.bind("<FocusOut>",
+                  lambda _event: self._label.configure(fg=self._fg))
+
+    def _s(self, value):
+        return int(round(value * self._dpi))
+
+    def _open(self, _event=None):
+        if not self._values:
+            return "break"
+        try:
+            from .panel_menu import FlatMenu
+            items = [(value, (lambda chosen=value: self._choose(chosen)))
+                     for value in self._values]
+            menu = FlatMenu(tk, self.winfo_toplevel(), items,
+                            theme=menu_theme(self._palette))
+            menu.popup(self.winfo_rootx(),
+                       self.winfo_rooty() + self.winfo_height())
+        except Exception:
+            traceback.print_exc()
+        return "break"
+
+    def _choose(self, value):
+        self._var.set(value)
 
 
 class AlarmScheduler:
@@ -242,12 +448,59 @@ def blend_color(first, second, ratio):
     return "#" + "".join(f"{channel:02x}" for channel in channels)
 
 
+def detect_dpi(window):
+    """与 history_panel 同一口径：fpixels('1i')/96，夹在 0.8–3.0。"""
+    try:
+        return max(0.8, min(window.winfo_fpixels("1i") / 96.0, 3.0))
+    except Exception:
+        return 1.0
+
+
+def monitor_work_area(window):
+    """鼠标所在显示器的工作区 ``(x, y, w, h)``。
+
+    取不到（无 Win32 API / 无图形会话）时退回主屏整屏。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Rect(ctypes.Structure):
+            _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                        ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+        class _MonitorInfo(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", _Rect),
+                        ("rcWork", _Rect), ("dwFlags", wintypes.DWORD)]
+
+        point = wintypes.POINT()
+        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+            raise OSError("GetCursorPos failed")
+        monitor = ctypes.windll.user32.MonitorFromPoint(
+            point, 2)  # MONITOR_DEFAULTTONEAREST
+        info = _MonitorInfo()
+        info.cbSize = ctypes.sizeof(_MonitorInfo)
+        if not ctypes.windll.user32.GetMonitorInfoW(monitor,
+                                                   ctypes.byref(info)):
+            raise OSError("GetMonitorInfoW failed")
+        rect = info.rcWork
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if width > 0 and height > 0:
+            return rect.left, rect.top, width, height
+    except Exception:
+        pass
+    return (0, 0, window.winfo_screenwidth(), window.winfo_screenheight())
+
+
 class AlarmAlertWindow:
-    """无边框闹钟卡片：同心圆涟漪动效，右上角常驻、可折叠。"""
+    """无边框闹钟卡片：同心圆涟漪动效、右上角常驻、可折叠。"""
 
     WIDTH = 420
     CANVAS_WIDTH = 396
-    CANVAS_HEIGHT = 200
+    # 高度演进：200 → 96（紧凑化）→ 144（用户要求涟漪再大）。
+    # 144 让环的最大直径到 132，仍留 6px 上下余量；整卡约 297 高。
+    CANVAS_HEIGHT = 144
     HANDLE_WIDTH = 100
     HANDLE_HEIGHT = 100
     ORB_RADIUS = 32
@@ -256,6 +509,9 @@ class AlarmAlertWindow:
     ALERT_ACCENT = "#FF7A6B"
     AUTO_COLLAPSE_MS = 3000
     MARGIN = 20
+    # 标题栏里闹钟名称的最长可见字符数，超出用省略号（否则会把整卡撑宽）。
+    CAPTION_MAX = 12
+    SNOOZE_DEFAULT = 5
     WEEKDAYS = ("一", "二", "三", "四", "五", "六", "日")
 
     def __init__(self, master, config, stage, target,
@@ -305,6 +561,11 @@ class AlarmAlertWindow:
         self.alert_border = blend_color(self.card, self.ALERT_ACCENT, 0.55)
         self.window = tk.Toplevel(master)
         self.window.withdraw()
+        self._dpi = self._detect_dpi()
+        self._canvas_w = self._s(self.CANVAS_WIDTH)
+        self._canvas_h = self._s(self.CANVAS_HEIGHT)
+        self._handle_w = self._s(self.HANDLE_WIDTH)
+        self._handle_h = self._s(self.HANDLE_HEIGHT)
         self.window.overrideredirect(True)
         self.window.configure(bg=self.border)
         self.window.attributes("-topmost", True)
@@ -335,7 +596,7 @@ class AlarmAlertWindow:
         close_label = tk.Label(header, text="×", bg=self.card, fg=self.muted,
                                font=("Segoe UI", 13), cursor="hand2")
         close_label.pack(side="right")
-        close_label.bind("<Button-1>", lambda _event: self._ack())
+        close_label.bind("<Button-1>", self._dismiss_view)
         close_label.bind("<Enter>", lambda _event: close_label.configure(fg=self.fg))
         close_label.bind("<Leave>", lambda _event: close_label.configure(fg=self.muted))
         self.clock_label = tk.Label(
@@ -354,34 +615,43 @@ class AlarmAlertWindow:
                 "<Leave>",
                 lambda _event: self.settings_label.configure(fg=self.muted))
         self.canvas = tk.Canvas(
-            inner, width=self.CANVAS_WIDTH, height=self.CANVAS_HEIGHT,
+            inner, width=self._canvas_w, height=self._canvas_h,
             bg=self.card, bd=0, highlightthickness=0)
-        self.canvas.pack(fill="x", padx=10, pady=(4, 0))
+        self.canvas.pack(fill="x", padx=self._s(10), pady=(self._s(2), 0))
         self.title_label = tk.Label(
             inner, text="", bg=self.card, fg=self.fg,
-            font=("Segoe UI", 17, "bold"))
+            font=("Segoe UI", 18, "bold"), justify="center",
+            wraplength=self.WIDTH - 56)
         self.title_label.pack(pady=(4, 0))
         self.detail_label = tk.Label(
             inner, text="", bg=self.card, fg=self.muted,
-            font=("Segoe UI", 10))
-        self.detail_label.pack(pady=(2, 8))
+            font=("Segoe UI", 10), justify="center",
+            wraplength=self.WIDTH - 56)
+        self.detail_label.pack(pady=(2, 6))
         footer = tk.Frame(inner, bg=self.card)
-        footer.pack(pady=(0, 12))
-        self.secondary = tk.Button(
-            footer, text="", command=lambda: self._snooze(5), relief="flat",
-            bd=0, padx=12, pady=6, cursor="hand2", bg="#37334d", fg=self.fg,
-            activebackground="#47415f", activeforeground=self.fg,
-            font=("Segoe UI", 9))
-        self.secondary.grid(row=0, column=0, padx=(0, 8))
-        self.primary = tk.Button(
-            footer, text="", command=self._ack, relief="flat", bd=0,
-            padx=16, pady=6, cursor="hand2", bg=self.accent, fg="#171521",
-            activebackground=self.accent, activeforeground="#171521",
-            font=("Segoe UI", 9, "bold"))
+        footer.pack(pady=(0, 8))
+        secondary_bg = blend_color(self.card, self.accent, 0.22)
+        secondary_hover = blend_color(self.card, self.accent, 0.34)
+        primary_fg = blend_color(self.card, "#000000", 0.82)
+        primary_hover = blend_color(self.accent, "#ffffff", 0.18)
+        self._secondary_bg = secondary_bg
+        self._secondary_hover = secondary_hover
+        self._primary_fg = primary_fg
+        self.secondary = PillButton(
+            footer, text="", command=lambda: self._snooze(self.snooze_minutes()),
+            bg=secondary_bg, fg=self.fg, hover=secondary_hover,
+            pressed=secondary_hover, padx=12, pady=6, dpi=self._dpi,
+            font=("Microsoft YaHei UI", 9))
+        self.secondary.grid(row=0, column=0, padx=(0, self._s(8)))
+        self.secondary.bind("<Button-3>", self._snooze_menu)
+        self.primary = PillButton(
+            footer, text="", command=self._ack, bg=self.accent, fg=primary_fg,
+            hover=primary_hover, pressed=primary_hover, padx=16, pady=6,
+            dpi=self._dpi, font=("Microsoft YaHei UI", 9, "bold"))
         self.primary.grid(row=0, column=1)
         corner = self.ORB_KEY if self._orb_transparent else self.card
         self.handle_frame = tk.Canvas(
-            self.window, width=self.HANDLE_WIDTH, height=self.HANDLE_HEIGHT,
+            self.window, width=self._handle_w, height=self._handle_h,
             bg=corner, highlightthickness=0, bd=0, cursor="hand2")
         self.handle_frame.bind("<ButtonPress-1>", self._handle_press)
         self.handle_frame.bind("<B1-Motion>", self._handle_drag)
@@ -391,7 +661,12 @@ class AlarmAlertWindow:
         self._build_orb_photo()
         self.handle_frame.create_image(0, 0, image=self._orb_photo, anchor="nw")
         self._set_stage(stage, target)
-        self.window.bind("<Escape>", lambda _event: self._ack())
+        self.window.bind("<Escape>", self._dismiss_view)
+        # 闹钟弹框上最常按的两个动作：Enter = 主按钮，S = 稍后提醒。
+        self.window.bind("<Return>", lambda _event: self._invoke_primary())
+        self.window.bind("<KP_Enter>", lambda _event: self._invoke_primary())
+        self.window.bind("<s>", lambda _event: self._snooze_from_key())
+        self.window.bind("<S>", lambda _event: self._snooze_from_key())
         self._enable_drag()
         if start_collapsed:
             self.full_frame.pack_forget()
@@ -405,29 +680,41 @@ class AlarmAlertWindow:
         if stage == "alarm":
             self.window.focus_force()
 
+    def _detect_dpi(self):
+        """与 history_panel 同一口径的 DPI 探测。"""
+        return detect_dpi(self.window)
+
+    def _s(self, value):
+        """逻辑像素 → 当前 DPI 下的物理像素。"""
+        return int(round(value * self._dpi))
+
+    def _monitor_work_area(self):
+        """鼠标所在显示器的工作区（实现见模块级 monitor_work_area）。"""
+        return monitor_work_area(self.window)
+
     def _place_top_right(self):
         """Size to content, park off-screen, then slide in below the corner."""
         self.window.update_idletasks()
+        mx, my, mw, _mh = self._monitor_work_area()
         if self.collapsed:
-            width, height = self.HANDLE_WIDTH, self.HANDLE_HEIGHT
-            self._current_x = self.window.winfo_screenwidth() + 8
-            self._target_y = self.MARGIN
+            width, height = self._handle_w, self._handle_h
+            self._current_x = mx + mw + 8
+            self._target_y = my + self._s(self.MARGIN)
             self.window.geometry(
                 f"{width}x{height}+{self._current_x}+{self._target_y}")
             self.window.deiconify()
             self.window.lift()
             self._animate_x(max(
-                0, self.window.winfo_screenwidth() - width - self.ORB_MARGIN))
+                mx, mx + mw - width - self._s(self.ORB_MARGIN)))
             return
-        width = max(self.WIDTH, self.window.winfo_reqwidth())
+        width = max(self._s(self.WIDTH), self.window.winfo_reqwidth())
         height = self.window.winfo_reqheight()
-        self._current_x = self.window.winfo_screenwidth() + 8
-        self._target_y = self.MARGIN
+        self._current_x = mx + mw + 8
+        self._target_y = my + self._s(self.MARGIN)
         self.window.geometry(f"{width}x{height}+{self._current_x}+{self._target_y}")
         self.window.deiconify()
         self.window.lift()
-        self._animate_x(
-            max(0, self.window.winfo_screenwidth() - width - self.MARGIN))
+        self._animate_x(max(mx, mx + mw - width - self._s(self.MARGIN)))
 
     def _set_stage(self, stage, target):
         self.stage = stage
@@ -446,7 +733,7 @@ class AlarmAlertWindow:
                     side="right", before=self.clock_label, padx=(0, 10))
         if stage == "snoozed":
             label = self.config.get("alarm_label", "闹钟")
-            self.label_caption.configure(text=label)
+            self.label_caption.configure(text=self._fit_caption(label))
             self.title_label.configure(text="稍后提醒", fg=self.fg)
             self.detail_label.configure(text=f"{target:%H:%M:%S} 再次响铃")
             self.primary.configure(text="知道了", command=self._ack)
@@ -472,7 +759,7 @@ class AlarmAlertWindow:
         label = self.config.get("alarm_label", "闹钟")
         weekday = self.WEEKDAYS[target.weekday()]
         titles = {"scheduled": "闹钟已设置", "early": "即将开始", "alarm": "时间到了"}
-        self.label_caption.configure(text=label)
+        self.label_caption.configure(text=self._fit_caption(label))
         self.title_label.configure(
             text=titles.get(stage, "闹钟"),
             fg=self.ALERT_ACCENT if stage == "alarm" else self.fg)
@@ -480,7 +767,8 @@ class AlarmAlertWindow:
             text=f"响铃 {target.year}年{target.month}月{target.day}日 周{weekday}")
         if stage == "alarm":
             self.primary.configure(text="停止")
-            self.secondary.configure(text="5 分钟后提醒")
+            self.secondary.configure(
+                text=f"{self.snooze_minutes()} 分钟后提醒")
             self.secondary.grid()
             self._cancel_countdown()
             if self.config.get("alarm_sound", True) and self._sound_job is None:
@@ -488,7 +776,8 @@ class AlarmAlertWindow:
         else:
             self.primary.configure(text="知道了")
             if stage == "early":
-                self.secondary.configure(text="5 分钟后提醒")
+                self.secondary.configure(
+                    text=f"{self.snooze_minutes()} 分钟后提醒")
                 self.secondary.grid()
             else:
                 self.secondary.grid_remove()
@@ -498,9 +787,10 @@ class AlarmAlertWindow:
         self._update_animation_speed()
 
     def _apply_alert_style(self):
+        alert_fg = blend_color(self.ALERT_ACCENT, "#000000", 0.80)
         self.primary.configure(
             bg=self.ALERT_ACCENT, activebackground=self.ALERT_ACCENT,
-            fg="#2A1512", activeforeground="#2A1512")
+            fg=alert_fg, activeforeground=alert_fg)
         self.header_dot.itemconfigure(self.header_dot_item,
                                       fill=self.ALERT_ACCENT)
         self.full_frame.configure(bg=self.alert_border)
@@ -508,7 +798,7 @@ class AlarmAlertWindow:
     def _restore_style(self):
         self.primary.configure(
             bg=self.accent, activebackground=self.accent,
-            fg="#171521", activeforeground="#171521")
+            fg=self._primary_fg, activeforeground=self._primary_fg)
         self.header_dot.itemconfigure(self.header_dot_item, fill=self.accent)
         self.full_frame.configure(bg=self.border)
 
@@ -621,40 +911,40 @@ class AlarmAlertWindow:
         if clock != self._clock_text:
             self._clock_text = clock
             self.clock_label.configure(text=clock)
-        cx, cy = self.CANVAS_WIDTH / 2, 86
+        cx, cy = self._canvas_w / 2, self._canvas_h / 2
         self._phase = (self._phase + self._speed) % 1.0
         for index in range(3):
             phase = (self._phase + index / 3.0) % 1.0
-            radius = 44 + phase * 40
+            # 半径 36–66：圆心在 72，最大 66 让环直径到 132（原来只有 92）。
+            radius = self._s(36 + phase * 30)
             weight = max(0.08, 0.56 * (1.0 - phase))
             outline = blend_color(self.card, self._stage_accent(), weight)
             canvas.create_oval(cx - radius, cy - radius, cx + radius,
                                cy + radius, outline=outline, width=2)
-        canvas.create_oval(cx - 42, cy - 42, cx + 42, cy + 42,
+        canvas.create_oval(cx - self._s(32), cy - self._s(32),
+                           cx + self._s(32), cy + self._s(32),
                            fill=self._stage_accent(), outline="")
         if self.target is None:
             text = "休息"
             font = ("Segoe UI", 12, "bold")
-            bottom = f"{now:%H:%M:%S}"
         else:
             remaining = max(0, int((self.target - now).total_seconds()))
             text = format_seconds(remaining)
-            size = 20
+            size = 18
             if len(text) >= 4:
-                size = 18
-            if len(text) >= 5:
                 size = 16
+            if len(text) >= 5:
+                size = 15
             if len(text) >= 6:
-                size = 14
+                size = 13
             if len(text) >= 7:
                 size = 12
             if len(text) >= 8:
-                size = 10
+                size = 11
             font = ("Consolas", size, "bold")
-            bottom = f"{self.target:%H:%M:%S}"
+        # 目标时间在详情行（"响铃 2026年11月18日 周三"），当前时间在头部时钟，
+        # 画布底部原来那行两者都不是，纯占高度，压高度时先删掉。
         canvas.create_text(cx, cy, text=text, fill=self.bg, font=font)
-        canvas.create_text(cx, 184, text=bottom, fill=self.fg,
-                           font=("Segoe UI", 13, "bold"))
         self._animation_job = self.window.after(self._interval, self._animate)
 
     def apply(self, stage, target, collapsed=False):
@@ -707,17 +997,17 @@ class AlarmAlertWindow:
         if self._custom_position:
             x, y = self._clamp_to_screen(
                 self._current_x, self._target_y,
-                self.HANDLE_WIDTH, self.HANDLE_HEIGHT)
+                self._handle_w, self._handle_h)
             self._current_x, self._target_y = x, y
             self.window.geometry(
-                f"{self.HANDLE_WIDTH}x{self.HANDLE_HEIGHT}+{x}+{y}")
+                f"{self._handle_w}x{self._handle_h}+{x}+{y}")
         else:
             self.window.geometry(
-                f"{self.HANDLE_WIDTH}x{self.HANDLE_HEIGHT}+"
+                f"{self._handle_w}x{self._handle_h}+"
                 f"{self._current_x}+{self._target_y}")
+            mx, _my, mw, _mh = self._monitor_work_area()
             self._animate_x(
-                max(0, self.window.winfo_screenwidth() - self.HANDLE_WIDTH
-                    - self.ORB_MARGIN))
+                max(mx, mx + mw - self._handle_w - self._s(self.ORB_MARGIN)))
 
     def expand(self):
         """Restore the full card and slide it back to the top-right margin."""
@@ -734,7 +1024,7 @@ class AlarmAlertWindow:
         self.collapsed = False
         self._handle_hover = False
         self.window.update_idletasks()
-        width = max(self.WIDTH, self.window.winfo_reqwidth())
+        width = max(self._s(self.WIDTH), self.window.winfo_reqwidth())
         height = self.window.winfo_reqheight()
         if self._custom_position:
             x, y = self._clamp_to_screen(
@@ -744,23 +1034,25 @@ class AlarmAlertWindow:
         else:
             self.window.geometry(
                 f"{width}x{height}+{self._current_x}+{self._target_y}")
+            mx, _my, mw, _mh = self._monitor_work_area()
             self._animate_x(
-                max(0, self.window.winfo_screenwidth() - width - self.MARGIN))
+                max(mx, mx + mw - width - self._s(self.MARGIN)))
         self._start_animation()
 
     def _resize_to_content(self):
         if self._closed or self.collapsed:
             return
         self.window.update_idletasks()
-        width = max(self.WIDTH, self.window.winfo_reqwidth())
+        width = max(self._s(self.WIDTH), self.window.winfo_reqwidth())
         height = self.window.winfo_reqheight()
         if self._custom_position:
             x, y = self._clamp_to_screen(
                 self._current_x, self._target_y, width, height)
             self._current_x, self._target_y = x, y
         else:
+            mx, _my, mw, _mh = self._monitor_work_area()
             self._current_x = max(
-                0, self.window.winfo_screenwidth() - width - self.MARGIN)
+                mx, mx + mw - width - self._s(self.MARGIN))
         self.window.geometry(f"{width}x{height}+{self._current_x}+{self._target_y}")
 
     def _animate_x(self, target_x):
@@ -800,8 +1092,8 @@ class AlarmAlertWindow:
     def _build_orb_photo(self):
         from PIL import Image, ImageTk
 
-        size = self.HANDLE_WIDTH
-        radius = self.ORB_RADIUS
+        size = self._handle_w
+        radius = self._s(self.ORB_RADIUS)
         center = size / 2
         corner = self.ORB_KEY if self._orb_transparent else self.card
         image = Image.new("RGB", (size, size), corner)
@@ -828,12 +1120,12 @@ class AlarmAlertWindow:
     def _render_handle(self):
         canvas = self.handle_frame
         canvas.delete("overlay")
-        center = self.HANDLE_WIDTH / 2
+        center = self._handle_w / 2
         base = self.accent if self._handle_hover else blend_color(
             self.accent, self.card, 0.55)
         for index in range(3):
             phase = (self._tab_phase + index / 3.0) % 1.0
-            radius = 34 + phase * 15
+            radius = self._s(34 + phase * 15)
             color = blend_color(base, self.card, 0.12 + phase * 0.55)
             canvas.create_oval(
                 center - radius, center - radius, center + radius,
@@ -934,10 +1226,10 @@ class AlarmAlertWindow:
         if not self._handle_dragged:
             return "break"
         x, y = self._clamp_to_screen(
-            x, y, self.HANDLE_WIDTH, self.HANDLE_HEIGHT)
+            x, y, self._handle_w, self._handle_h)
         self._current_x, self._target_y = x, y
         self.window.geometry(
-            f"{self.HANDLE_WIDTH}x{self.HANDLE_HEIGHT}+{x}+{y}")
+            f"{self._handle_w}x{self._handle_h}+{x}+{y}")
         return "break"
 
     def _handle_release(self, _event=None):
@@ -955,10 +1247,9 @@ class AlarmAlertWindow:
         return "break"
 
     def _clamp_to_screen(self, x, y, width, height):
-        screen_w = self.window.winfo_screenwidth()
-        screen_h = self.window.winfo_screenheight()
-        return (min(max(0, int(x)), max(0, screen_w - width)),
-                min(max(0, int(y)), max(0, screen_h - height)))
+        mx, my, mw, mh = self._monitor_work_area()
+        return (min(max(mx, int(x)), max(mx, mx + mw - width)),
+                min(max(my, int(y)), max(my, my + mh - height)))
 
     def _enable_drag(self):
         self.window.bind("<Button-1>", self._drag_start)
@@ -1004,6 +1295,71 @@ class AlarmAlertWindow:
             pass
         if self.persistent and not self.collapsed:
             self.collapse()
+        return "break"
+
+    def snooze_minutes(self):
+        """稍后提醒的分钟数：读配置并夹到 1–60。"""
+        try:
+            value = int(self.config.get("alarm_snooze_minutes",
+                                         self.SNOOZE_DEFAULT))
+        except (TypeError, ValueError):
+            value = self.SNOOZE_DEFAULT
+        return max(1, min(60, value))
+
+    def _fit_caption(self, text):
+        """标题栏闹钟名最长 CAPTION_MAX 个字符，超出加省略号。"""
+        text = str(text or "")
+        if len(text) <= self.CAPTION_MAX:
+            return text
+        return text[: self.CAPTION_MAX - 1] + "…"
+
+    def _dismiss_view(self, _event=None):
+        """``×`` 与 Esc：收起弹框，而不是把闹钟永久确认掉。
+
+        ``alarm`` 阶段按「稍后提醒」处理——原来这里直接走 ``_ack``，一次误点
+        这次闹钟就再也不会响了。其余阶段收起即可，与原先行为一致。
+        """
+        if self._closed:
+            return "break"
+        if not self.persistent:
+            self._ack()
+            return "break"
+        if self.stage == "alarm":
+            self._snooze(self.snooze_minutes())
+            return "break"
+        self.collapse()
+        return "break"
+
+    def _invoke_primary(self):
+        try:
+            self.primary.invoke()
+        except Exception:
+            pass
+        return "break"
+
+    def _snooze_from_key(self):
+        if self.stage in ("alarm", "early"):
+            self._snooze(self.snooze_minutes())
+        return "break"
+
+    def _menu_theme(self):
+        """FlatMenu 的配色：与设置页共用 menu_theme。"""
+        return menu_theme((self.bg, self.card, self.accent, self.fg))
+
+    def _snooze_menu(self, event):
+        """右键稍后提醒按钮：直接选 1/3/5/10/15/30 分钟。"""
+        if self._closed:
+            return "break"
+        try:
+            from .panel_menu import FlatMenu
+            items = [(f"{minutes} 分钟后提醒",
+                      (lambda value=minutes: self._snooze(value)))
+                     for minutes in SNOOZE_MINUTES]
+            menu = FlatMenu(self.tk, self.window, items,
+                            theme=self._menu_theme())
+            menu.popup(event.x_root, event.y_root)
+        except Exception:
+            traceback.print_exc()
         return "break"
 
     def _ack(self):
@@ -1369,7 +1725,6 @@ class AlarmSettingsWindow:
 
     def __init__(self, parent, config, on_save):
         import tkinter as tk
-        from tkinter import ttk
 
         self.tk = tk
         self.parent = parent
@@ -1378,7 +1733,9 @@ class AlarmSettingsWindow:
         self._closed = False
         self.window = tk.Toplevel(parent)
         self.window.title("Lumina · 闹钟设置")
-        self.window.geometry("520x470")
+        self._dpi = detect_dpi(self.window)
+        self.window.geometry(f"{int(round(520 * self._dpi))}x"
+                             f"{int(round(500 * self._dpi))}")
         self.window.resizable(False, False)
         try:
             if parent.winfo_viewable():
@@ -1391,15 +1748,23 @@ class AlarmSettingsWindow:
             config.get("alarm_style", "neon"), PALETTES["neon"])
         self.bg, self.card, self.accent, self.fg = bg, card, accent, fg
         self.window.configure(bg=bg)
+        # 颜色一律从 palette 派生，切 neon / soft / minimal 都不跑偏。
+        self.muted = blend_color(fg, bg, 0.45)
+        self.field_bg = blend_color(card, "#000000", 0.45)
+        self.hairline = blend_color(card, accent, 0.30)
+        self.warn = AlarmAlertWindow.ALERT_ACCENT
+        self._dirty = False
+        self._preview = None
         outer = tk.Frame(self.window, bg=bg)
-        outer.pack(fill="both", expand=True, padx=20, pady=18)
+        outer.pack(fill="both", expand=True, padx=self._s(20), pady=self._s(18))
         tk.Label(outer, text="⏰  闹钟", bg=bg, fg=fg,
-                 font=("Segoe UI", 20, "bold")).pack(anchor="w")
+                 font=("Microsoft YaHei UI", 20, "bold")).pack(anchor="w")
         tk.Label(outer, text="提前准备，准时提醒。设置将保存在本机。",
-                 bg=bg, fg="#aaa6bd", font=("Segoe UI", 10)).pack(
-                     anchor="w", pady=(4, 15))
+                 bg=bg, fg=self.muted,
+                 font=("Microsoft YaHei UI", 10)).pack(
+                     anchor="w", pady=(self._s(4), self._s(15)))
         card_frame = tk.Frame(outer, bg=card, highlightthickness=1,
-                              highlightbackground="#39344f")
+                              highlightbackground=self.hairline)
         card_frame.pack(fill="x")
         self.enabled_var = tk.BooleanVar(
             master=parent, value=bool(config.get("alarm_enabled", False)))
@@ -1420,24 +1785,29 @@ class AlarmSettingsWindow:
                 config.get("alarm_style", "neon"), "霓虹光环"))
         self.sound_var = tk.BooleanVar(
             master=parent, value=bool(config.get("alarm_sound", True)))
+        self.snooze_var = tk.StringVar(
+            master=parent, value=str(config.get(
+                "alarm_snooze_minutes", AlarmAlertWindow.SNOOZE_DEFAULT)))
 
         def row(label, widget_factory):
             line = tk.Frame(card_frame, bg=card)
-            line.pack(fill="x", padx=16, pady=8)
+            line.pack(fill="x", padx=self._s(16), pady=self._s(8))
             tk.Label(line, text=label, width=13, anchor="w", bg=card,
-                     fg="#c5c1d4", font=("Segoe UI", 10)).pack(side="left")
+                     fg=blend_color(fg, card, 0.30),
+                     font=("Microsoft YaHei UI", 10)).pack(side="left")
             widget = widget_factory(line)
             widget.pack(side="left", fill="x", expand=True)
             return widget
 
         def make_entry(var):
             return lambda _line: tk.Entry(
-                _line, textvariable=var, relief="flat", bd=0, bg="#171625",
-                fg=fg, insertbackground=fg, highlightthickness=1,
-                highlightbackground="#45405c", highlightcolor=accent,
-                font=("Segoe UI", 10))
+                _line, textvariable=var, relief="flat", bd=0,
+                bg=self.field_bg, fg=fg, insertbackground=fg,
+                highlightthickness=1,
+                highlightbackground=blend_color(card, accent, 0.35),
+                highlightcolor=accent, font=("Microsoft YaHei UI", 10))
 
-        row("闹钟名称", make_entry(self.label_var))
+        self.label_entry = row("闹钟名称", make_entry(self.label_var))
         self.datetime_picker = None
 
         def make_picker(line):
@@ -1447,60 +1817,80 @@ class AlarmSettingsWindow:
 
         row("日期与时间", make_picker)
         self.date_entry = self.datetime_picker.entry
-        row("重复", lambda line: ttk.Combobox(
-            line, textvariable=self.repeat_var, values=tuple(REPEAT_VALUES),
-            state="readonly", width=14))
-        row("提前提醒（分钟）", lambda line: ttk.Combobox(
-            line, textvariable=self.lead_var,
-            values=tuple(str(v) for v in LEAD_MINUTES), state="readonly",
-            width=10))
-        row("桌面效果", lambda line: ttk.Combobox(
-            line, textvariable=self.style_var, values=tuple(STYLE_VALUES),
-            state="readonly", width=14))
+        palette = (bg, card, accent, fg)
+        row("重复", lambda line: PickField(
+            line, self.repeat_var, tuple(REPEAT_VALUES), palette,
+            width=14, dpi=self._dpi))
+        row("提前提醒（分钟）", lambda line: PickField(
+            line, self.lead_var,
+            tuple(str(v) for v in LEAD_MINUTES), palette, width=10, dpi=self._dpi))
+        row("稍后提醒（分钟）", lambda line: PickField(
+            line, self.snooze_var,
+            tuple(str(v) for v in SNOOZE_MINUTES), palette, width=10, dpi=self._dpi))
+        row("桌面效果", lambda line: PickField(
+            line, self.style_var, tuple(STYLE_VALUES), palette, width=14, dpi=self._dpi))
         self.repeat_var.trace_add("write", self._repeat_changed)
         self._repeat_changed()
         sound_line = tk.Frame(outer, bg=bg)
-        sound_line.pack(fill="x", pady=(12, 4))
-        tk.Checkbutton(
-            sound_line, text="到点播放提示音", variable=self.sound_var,
-            bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
-            selectcolor=card, highlightthickness=0, font=("Segoe UI", 10)
-        ).pack(side="left")
-        tk.Checkbutton(
-            sound_line, text="启用闹钟", variable=self.enabled_var,
-            bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
-            selectcolor=card, highlightthickness=0, font=("Segoe UI", 10)
-        ).pack(side="right")
-        self.status = tk.Label(outer, text="", bg=bg, fg="#aaa6bd",
-                               anchor="w", font=("Segoe UI", 9))
-        self.status.pack(fill="x", pady=(3, 10))
+        sound_line.pack(fill="x", pady=(self._s(12), self._s(4)))
+        check_style = {"bg": bg, "fg": fg, "activebackground": bg,
+                       "activeforeground": fg, "selectcolor": card,
+                       "highlightthickness": 0,
+                       "font": ("Microsoft YaHei UI", 10)}
+        tk.Checkbutton(sound_line, text="到点播放提示音",
+                       variable=self.sound_var, **check_style).pack(side="left")
+        tk.Checkbutton(sound_line, text="启用闹钟",
+                       variable=self.enabled_var, **check_style).pack(side="right")
+        self.status = tk.Label(outer, text="", bg=bg, fg=self.muted,
+                               anchor="w", font=("Microsoft YaHei UI", 9))
+        self.status.pack(fill="x", pady=(self._s(3), self._s(10)))
         buttons = tk.Frame(outer, bg=bg)
         buttons.pack(fill="x", side="bottom")
-        tk.Button(buttons, text="预览提醒", command=self.preview,
-                  relief="flat", bd=0, bg=card, fg=fg, padx=14, pady=8,
-                  cursor="hand2", activebackground="#39344f",
-                  activeforeground=fg).pack(side="left")
-        tk.Button(buttons, text="保存设置", command=self.save,
-                  relief="flat", bd=0, bg=accent, fg="#171521",
-                  padx=20, pady=8, cursor="hand2",
-                  activebackground=accent, activeforeground="#171521",
-                  font=("Segoe UI", 10, "bold")).pack(side="right")
+        self.preview_button = PillButton(
+            buttons, text="预览提醒", command=self.preview, bg=card, fg=fg,
+            hover=blend_color(card, accent, 0.25),
+            pressed=blend_color(card, accent, 0.35), padx=16, pady=8,
+            dpi=self._dpi, font=("Microsoft YaHei UI", 10))
+        self.preview_button.pack(side="left")
+        self.save_button = PillButton(
+            buttons, text="保存设置", command=self.save, bg=accent,
+            fg=blend_color(card, "#000000", 0.82),
+            hover=blend_color(accent, "#ffffff", 0.18),
+            pressed=blend_color(accent, "#000000", 0.10), padx=20, pady=8,
+            dpi=self._dpi, font=("Microsoft YaHei UI", 10, "bold"))
+        self.save_button.pack(side="right")
+        for var in (self.label_var, self.date_var, self.time_var,
+                    self.lead_var, self.repeat_var, self.style_var,
+                    self.sound_var, self.snooze_var, self.enabled_var):
+            var.trace_add("write", self._on_form_changed)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.window.bind("<Escape>", lambda _event: self.close())
+        self.window.bind("<Return>", lambda _event: self.save())
         self.window.update_idletasks()
-        width, height = 520, 470
+        mx, my, mw, mh = monitor_work_area(self.window)
+        width = min(max(int(round(520 * self._dpi)),
+                        self.window.winfo_reqwidth()), mw)
+        height = min(max(int(round(500 * self._dpi)),
+                         self.window.winfo_reqheight()), mh)
         if parent.winfo_viewable():
-            x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
-            y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 2)
+            x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+            y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
         else:
-            x = (self.window.winfo_screenwidth() - width) // 2
-            y = (self.window.winfo_screenheight() - height) // 2
-        x = min(max(0, x), max(0, self.window.winfo_screenwidth() - width))
-        y = min(max(0, y), max(0, self.window.winfo_screenheight() - height))
+            x = mx + (mw - width) // 2
+            y = my + (mh - height) // 2
+        x = min(max(mx, x), mx + mw - width)
+        y = min(max(my, y), my + mh - height)
+        self._target_geometry = (x, y, width, height)
         self.window.geometry(f"{width}x{height}+{x}+{y}")
         self.window.lift()
         self.window.focus_force()
+        # 打开即把光标放进第一个输入框，改名字不用先点一下。
+        self.label_entry.focus_set()
         self._update_status()
+
+    def _s(self, value):
+        """逻辑像素 → 当前 DPI 下的物理像素。"""
+        return int(round(value * self._dpi))
 
     def _repeat_changed(self, *_args):
         repeat = REPEAT_VALUES.get(self.repeat_var.get(), "once")
@@ -1512,13 +1902,26 @@ class AlarmSettingsWindow:
         except Exception:
             pass
 
+    def _snooze_value(self):
+        try:
+            value = int(self.snooze_var.get())
+        except (TypeError, ValueError):
+            return AlarmAlertWindow.SNOOZE_DEFAULT
+        if value not in SNOOZE_MINUTES:
+            return AlarmAlertWindow.SNOOZE_DEFAULT
+        return value
+
     def _values(self):
+        """表单 → config 字典；非法值抛带中文原因的 ValueError。"""
         label = self.label_var.get().strip() or "闹钟"
         try:
             moment = self.datetime_picker.value()
         except (TypeError, ValueError) as exc:
             raise ValueError("请选择有效的日期与时间") from exc
-        lead = int(self.lead_var.get())
+        try:
+            lead = int(self.lead_var.get())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("提前提醒必须是一个整数分钟") from exc
         if lead not in LEAD_MINUTES:
             raise ValueError("提前提醒时间不在可选范围内")
         repeat = REPEAT_VALUES.get(self.repeat_var.get())
@@ -1534,59 +1937,90 @@ class AlarmSettingsWindow:
             "alarm_repeat": repeat,
             "alarm_style": style,
             "alarm_sound": bool(self.sound_var.get()),
+            "alarm_snooze_minutes": self._snooze_value(),
         }
         if values["alarm_enabled"] and next_alarm_occurrence(values) is None:
             raise ValueError("闹钟时间已过去，请选择未来时间")
         return values
 
-    def _update_status(self):
-        target = next_alarm_occurrence(self.config)
-        if not self.config.get("alarm_enabled"):
-            text = "当前闹钟已关闭"
-        elif target is None:
-            text = "时间无效或已过期，请调整后保存"
-        else:
-            text = f"已启用 · 下次提醒 {target:%Y-%m-%d %H:%M:%S}"
-        self.status.configure(text=text)
+    def _on_form_changed(self, *_args):
+        self._dirty = True
+        self._update_status()
 
-    def save(self):
-        from tkinter import messagebox
+    def _update_status(self):
+        """状态行跟着**表单当前值**走（原来读的是已保存的 config）。"""
+        suffix = " · 未保存" if self._dirty else ""
         try:
             values = self._values()
-            self.on_save(values)
         except (ValueError, TypeError, OSError) as exc:
-            messagebox.showerror("闹钟设置无效", str(exc), parent=self.window)
+            self.status.configure(text=f"设置无效：{exc}", fg=self.warn)
+            return
+        if not values["alarm_enabled"]:
+            text = "闹钟已关闭"
+        else:
+            target = next_alarm_occurrence(values)
+            if target is None:
+                self.status.configure(text="时间无效或已过期，请调整后保存",
+                                      fg=self.warn)
+                return
+            text = f"下次提醒 {target:%Y-%m-%d %H:%M:%S}"
+        self.status.configure(text=text + suffix, fg=self.muted)
+
+    def save(self):
+        try:
+            values = self._values()
+        except (ValueError, TypeError, OSError) as exc:
+            self.status.configure(text=f"设置无效：{exc}", fg=self.warn)
+            return False
+        try:
+            self.on_save(values)
+        except Exception as exc:  # 回调失败也要说人话，不弹英文堆栈
+            self.status.configure(text=f"保存失败：{exc}", fg=self.warn)
             return False
         self.config.update(values)
+        self._dirty = False
         self._update_status()
         return True
 
+    def _close_preview(self):
+        preview, self._preview = self._preview, None
+        if preview is not None:
+            try:
+                preview.destroy_without_callback()
+            except Exception:
+                pass
+
     def preview(self):
+        """预览卡片同一时间只留一张（原来连点会叠出好几张）。"""
+        self._close_preview()
         preview_config = {
             "alarm_label": self.label_var.get().strip() or "闹钟预览",
             "alarm_style": STYLE_VALUES.get(self.style_var.get(), "neon"),
             "alarm_sound": False,
         }
         if not self.enabled_var.get():
-            AlarmAlertWindow(self.parent, preview_config, "idle", None,
-                             on_acknowledge=lambda _stage: None,
-                             on_snooze=lambda _stage, _minutes: None,
-                             on_open_settings=self.summon)
+            self._preview = AlarmAlertWindow(
+                self.parent, preview_config, "idle", None,
+                on_acknowledge=lambda _stage: None,
+                on_snooze=lambda _stage, _minutes: None,
+                on_open_settings=self.summon)
             return
         try:
             moment = self.datetime_picker.value()
         except (TypeError, ValueError):
-            moment = (datetime.now() + timedelta(minutes=5)).replace(microsecond=0)
+            moment = (datetime.now() + timedelta(minutes=5)).replace(
+                microsecond=0)
         target = next_alarm_occurrence({
             "alarm_enabled": True,
             "alarm_time": moment.strftime("%H:%M:%S"),
             "alarm_date": moment.strftime(DATE_FORMAT),
             "alarm_repeat": REPEAT_VALUES.get(self.repeat_var.get(), "once"),
         }) or moment
-        AlarmAlertWindow(self.parent, preview_config, "early", target,
-                         on_acknowledge=lambda _stage: None,
-                         on_snooze=lambda _stage, _minutes: None,
-                         on_open_settings=self.summon)
+        self._preview = AlarmAlertWindow(
+            self.parent, preview_config, "early", target,
+            on_acknowledge=lambda _stage: None,
+            on_snooze=lambda _stage, _minutes: None,
+            on_open_settings=self.summon)
 
     def summon(self):
         if self._closed:
@@ -1602,6 +2036,7 @@ class AlarmSettingsWindow:
         if self._closed:
             return
         self._closed = True
+        self._close_preview()
         try:
             self.window.destroy()
         except Exception:
