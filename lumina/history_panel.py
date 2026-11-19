@@ -2838,7 +2838,29 @@ class HistoryPanel:
         return self.db.get(row["id"]) if row else None
 
     def _on_enter(self, _event=None):
-        """搜索框内按 Enter = 回贴当前选中项（拦截，避免与刷新重复触发）。"""
+        """搜索框内按 Enter：提交搜索并把焦点交给列表，**不**直接回贴。
+
+        原来这里直接 ``paste_back()``，而它会 ``hide()`` 面板——用户想确认
+        搜索结果，按下回车却发现整个剪贴板消失了。现在第一次 Enter 只做
+        「收尾搜索 + 选中第一条匹配 + 焦点移到列表」，再按 Enter（焦点已在
+        列表上）才回贴。
+        """
+        self.refresh()
+        rows = self._rows_displayed
+        if not rows:
+            self.status_var.set("没有匹配记录")
+            return "break"
+        first = str(rows[0]["id"])
+        self._select(first)
+        try:
+            self._ensure_visible(first)
+        except Exception:
+            pass
+        self.cards_canvas.focus_set()
+        return "break"
+
+    def _on_enter_paste(self, _event=None):
+        """搜索框内 Ctrl+Enter：跳过“提交搜索”，直接回贴当前选中项。"""
         self.paste_back()
         return "break"
 
@@ -3161,6 +3183,7 @@ class HistoryPanel:
                                        highlightthickness=0, font=self._font(11))
         self.search_entry_c.bind("<KeyRelease>", self._on_search_key)
         self.search_entry_c.bind("<Return>", self._on_enter)
+        self.search_entry_c.bind("<Control-Return>", self._on_enter_paste)
         self.search_entry_c.bind("<Escape>", self._search_esc)
         self.search_entry_c.bind("<FocusOut>", self._on_search_focus_out)
         self._search_pill_photo = None

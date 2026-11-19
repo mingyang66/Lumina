@@ -30,7 +30,7 @@
     "wrap_nonce": "5SQDIJ8bWrFfChCO",
     "wrapped_key": "Ar3vhp0oLVKICi8FpYG4ylgxb9AXquh4ZXTrJgdvAds+IELFvH4MmILxTSNhKSc8"
   },
-  "alarm_enabled": true,
+  "alarm_enabled": false,
   "alarm_label": "闹钟",
   "alarm_date": "2026-11-18",
   "alarm_time": "19:58:15",
